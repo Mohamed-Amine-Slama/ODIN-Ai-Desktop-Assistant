@@ -1,0 +1,18 @@
+# Secrets - never commit your API key
+.env
+
+# Local state: notes, reminders, conversation history
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Downloaded model weights (Whisper, openWakeWord)
+models/
+*.onnx
+*.tflite
