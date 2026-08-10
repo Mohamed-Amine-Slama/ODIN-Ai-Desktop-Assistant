@@ -16,3 +16,6 @@ venv/
 models/
 *.onnx
 *.tflite
+
+# Brainstorming visual companion scratch
+.superpowers/
