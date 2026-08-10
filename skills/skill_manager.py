@@ -19,6 +19,8 @@ from .utility_skills import (
     TimeDateSkill,
     NoteSkill,
     ReminderSkill,
+    ListRemindersSkill,
+    MemorySkill,
     CalculatorSkill,
     ClipboardSkill,
 )
@@ -36,6 +38,8 @@ SKILL_CLASSES = [
     TimeDateSkill,
     NoteSkill,
     ReminderSkill,
+    ListRemindersSkill,
+    MemorySkill,
     CalculatorSkill,
     ClipboardSkill,
 ]
@@ -65,6 +69,20 @@ class SkillManager:
         rendered tool block stays byte-identical across requests, which is what
         keeps the prompt cache warm."""
         return [s.to_tool_definition() for s in self.skills.values()] + list(SERVER_TOOLS)
+
+    def openai_tool_definitions(self) -> list[dict]:
+        """Expose local skills formatted as OpenAI tools."""
+        tools = []
+        for s in self.skills.values():
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": s.name,
+                    "description": s.description,
+                    "parameters": s.input_schema,
+                },
+            })
+        return tools
 
     def is_local(self, tool_name: str) -> bool:
         return tool_name in self.skills

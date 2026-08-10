@@ -84,19 +84,72 @@ class FakeClient:
         self.messages = FakeMessages(script)
 
 
+# -- OpenAI-compatible fakes (DashScope / Qwen path) -----------------------
+
+
+def openai_chunk(content: str | None = None, tool_call=None, finish_reason=None):
+    """Build one streamed chat.completions chunk.
+
+    tool_call is (name, json_arguments) and is emitted as a single delta.
+    """
+    tool_calls = None
+    if tool_call is not None:
+        name, arguments = tool_call
+        tool_calls = [
+            SimpleNamespace(
+                index=0,
+                id="call_1",
+                function=SimpleNamespace(name=name, arguments=arguments),
+            )
+        ]
+        finish_reason = finish_reason or "tool_calls"
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason or ("stop" if content is not None else None),
+                delta=SimpleNamespace(content=content, tool_calls=tool_calls),
+            )
+        ]
+    )
+
+
+class _FakeCompletions:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.script:
+            raise AssertionError("FakeOpenAIClient ran out of scripted responses")
+        return iter(self.script.pop(0))
+
+
+class FakeOpenAIClient:
+    """Mimics openai.OpenAI closely enough for Brain to take the OpenAI path.
+
+    Brain detects that path via `hasattr(client, "chat")`.
+    """
+
+    def __init__(self, script):
+        self.chat = SimpleNamespace(completions=_FakeCompletions(script))
+
+
 @pytest.fixture
 def make_brain(monkeypatch):
     """Build a Brain wired to a scripted fake client."""
     import config
 
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "test-key", raising=False)
     monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test-key", raising=False)
     monkeypatch.setattr(config, "DEBUG", False, raising=False)
 
     from core.brain import Brain
 
-    def _make(script, confirm=None, on_text=None):
+    def _make(script, confirm=None, on_text=None, store=None):
         client = FakeClient(script)
-        brain = Brain(client=client, confirm=confirm, on_text=on_text)
+        brain = Brain(client=client, confirm=confirm, on_text=on_text, store=store)
         brain.client = client
         return brain
 

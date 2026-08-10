@@ -1,15 +1,12 @@
 """General utility skills."""
-import datetime
-import threading
 import ast
+import datetime
 import operator
-from .base_skill import BaseSkill
-import config
+import time
 
-try:
-    from plyer import notification
-except Exception:
-    notification = None
+from core.store import get_store
+
+from .base_skill import BaseSkill
 
 
 class TimeDateSkill(BaseSkill):
@@ -35,30 +32,34 @@ class NoteSkill(BaseSkill):
     }
 
     def run(self, action: str, text: str = "") -> str:
-        config.ensure_dirs()
+        store = get_store()
         if action == "add":
             if not text.strip():
                 return "There's nothing to save — what should the note say?"
-            with open(config.NOTES_FILE, "a", encoding="utf-8") as f:
-                stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                f.write(f"[{stamp}] {text}\n")
+            store.add_note(text.strip())
             return "Note saved."
         if action == "read":
-            try:
-                with open(config.NOTES_FILE, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                return content if content else "You have no saved notes."
-            except FileNotFoundError:
+            rows = store.list_notes()
+            if not rows:
                 return "You have no saved notes."
+            lines = [
+                f"[{datetime.datetime.fromtimestamp(r['ts']):%Y-%m-%d %H:%M}] {r['text']}"
+                for r in rows
+            ]
+            return "\n".join(lines)
         if action == "clear":
-            open(config.NOTES_FILE, "w").close()
+            store.clear_notes()
             return "All notes cleared."
         return "Unknown note action."
 
 
 class ReminderSkill(BaseSkill):
     name = "set_reminder"
-    description = "Set a one-off reminder that pops up a desktop notification after N minutes."
+    description = (
+        "Set a one-off reminder that pops up a desktop notification after N "
+        "minutes. Reminders are saved to disk, so they survive a restart and "
+        "still fire if Jarvis was closed when they came due."
+    )
     input_schema = {
         "type": "object",
         "properties": {
@@ -69,18 +70,89 @@ class ReminderSkill(BaseSkill):
     }
 
     def run(self, message: str, minutes: float) -> str:
-        def fire():
-            if notification:
-                notification.notify(
-                    title=f"{config.ASSISTANT_NAME} reminder", message=message, timeout=15
-                )
-            else:
-                print(f"\n[REMINDER] {message}\n")
+        if not message.strip():
+            return "What should I remind you about?"
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            return "I need a number of minutes for the reminder."
+        if minutes < 0:
+            return "I can't set a reminder in the past."
 
-        timer = threading.Timer(minutes * 60, fire)
-        timer.daemon = True
-        timer.start()
-        return f"Reminder set for {minutes} minute(s) from now."
+        # Persisted, not a daemon threading.Timer — the old version lost every
+        # pending reminder the moment the process exited, without saying so.
+        get_store().add_reminder(message.strip(), time.time() + minutes * 60)
+        when = "now" if minutes < 1 else f"in {minutes:g} minute(s)"
+        return f"Reminder set for {when}."
+
+
+class ListRemindersSkill(BaseSkill):
+    name = "list_reminders"
+    description = "List the user's reminders that haven't fired yet."
+    input_schema = {"type": "object", "properties": {}, "required": []}
+
+    def run(self) -> str:
+        rows = get_store().pending_reminders()
+        if not rows:
+            return "You have no pending reminders."
+        lines = [
+            f"{datetime.datetime.fromtimestamp(r['fire_at']):%a %H:%M} — {r['message']}"
+            for r in rows
+        ]
+        return "Pending reminders:\n" + "\n".join(lines)
+
+
+class MemorySkill(BaseSkill):
+    name = "memory"
+    description = (
+        "Store or look up durable facts about the user that should persist "
+        "across sessions — preferences, hardware, names, recurring context. "
+        "Use 'remember' when the user tells you something worth keeping "
+        "('my monitor is a Dell U2720Q', 'I prefer metric'). Use 'recall' when "
+        "answering would benefit from something you were told previously."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["remember", "recall", "forget"]},
+            "text": {
+                "type": "string",
+                "description": (
+                    "The fact to remember, or a search term for recall/forget. "
+                    "Omit on recall to list everything."
+                ),
+            },
+        },
+        "required": ["action"],
+    }
+
+    def run(self, action: str, text: str = "") -> str:
+        store = get_store()
+
+        if action == "remember":
+            if not text.strip():
+                return "What should I remember?"
+            if store.remember(text.strip()):
+                return "Noted — I'll remember that."
+            return "I already knew that."
+
+        if action == "recall":
+            facts = store.recall(text.strip())
+            if not facts:
+                return (
+                    f"I don't have anything stored about '{text}'."
+                    if text.strip()
+                    else "I haven't been told anything to remember yet."
+                )
+            return "Here's what I remember:\n" + "\n".join(f"- {f}" for f in facts)
+
+        if action == "forget":
+            if not text.strip():
+                return "What should I forget? I won't clear everything without a specific request."
+            removed = store.forget(text.strip())
+            return f"Forgot {removed} item(s)." if removed else "I had nothing matching that."
+
+        return "Unknown memory action."
 
 
 # Safe arithmetic evaluator (no eval()) for the calculator skill

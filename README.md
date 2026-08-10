@@ -1,27 +1,30 @@
 # Jarvis — Personal AI Desktop Assistant (Windows)
 
-A modular Jarvis-style assistant: talk or type to it, and it uses Claude to
+A modular Jarvis-style assistant: talk or type to it, and it uses an LLM to
 understand you and calls real "skills" to control your PC — opening apps,
-checking system stats, web search, weather, volume, power controls, notes,
-reminders, and a calculator. Built to be extended indefinitely.
+checking system stats, reading your screen, searching the web, volume, power
+controls, notes, reminders, and durable memory.
+
+Works with **Anthropic (Claude)** or any **OpenAI-compatible endpoint**
+(Alibaba Cloud DashScope / Qwen, OpenRouter, OpenAI itself).
 
 ## 1. Install
 
-Requires **Python 3.10+** on Windows.
+Requires **Python 3.10+** on Windows. Run from a Windows shell, not WSL —
+`os.startfile`, `pycaw`, and the audio devices don't exist there.
 
 ```bat
-cd jarvis
+cd Jarvis
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Notes on tricky Windows installs:
-- **PyAudio**: if `pip install pyaudio` fails, install the prebuilt wheel:
-  `pip install pipwin && pipwin install pyaudio`
-- **pycaw / comtypes** (volume control): pure Python, should install cleanly.
-- **pywin32**: after installing, you may need to run
-  `python venv\Scripts\pywin32_postinstall.py -install` once.
+Hands-free voice is optional and pulls ~1GB of ML wheels:
+
+```bat
+pip install -r requirements-voice.txt
+```
 
 ## 2. Configure
 
@@ -29,9 +32,29 @@ Notes on tricky Windows installs:
 copy .env.example .env
 ```
 
-Edit `.env` and set `ANTHROPIC_API_KEY` to your key from
-https://console.anthropic.com/. Optionally change `DEFAULT_MODE` to `text`
-if you'd rather not use voice at first.
+Edit `.env` and set your provider. The two common setups:
+
+```ini
+# Alibaba Cloud DashScope / Qwen
+DASHSCOPE_API_KEY=sk-...
+DASHSCOPE_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_MODEL=qwen-max
+LLM_PROVIDER=openai
+```
+
+```ini
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_MODEL=claude-opus-5
+LLM_PROVIDER=anthropic
+```
+
+**Provider differences worth knowing:** web search and web fetch run on
+Anthropic's servers, so they're only available on the Anthropic path. On an
+OpenAI-compatible endpoint Jarvis knows it has no web access and says so
+instead of guessing. Prompt caching and adaptive thinking are likewise
+Claude-only. Everything else — all local skills, vision, memory, voice — works
+identically on both.
 
 ## 3. Run
 
@@ -39,82 +62,110 @@ if you'd rather not use voice at first.
 python main.py
 ```
 
-- **Text mode**: just type and hit Enter.
-- **Voice mode**: press Enter, then speak when you see "Listening...".
-  (True hands-free "Hey Jarvis" wake-word detection isn't included yet —
-  see Roadmap below for how to add it.)
+- **Text mode**: type and hit Enter.
+- **Voice mode**: `/mode voice`, then just say **"Hey Jarvis"** — no key press.
+  Falls back to press-Enter-to-talk if the wake-word model isn't available.
 
-Commands you can type any time: `/mode voice`, `/mode text`, `/reset`, `/quit`
+Commands: `/mode voice`, `/mode text`, `/reset`, `/help`, `/quit`
 
 ## 4. Project layout
 
 ```
-jarvis/
-  main.py               orchestrates the voice/text loop
-  config.py              loads .env settings
+Jarvis/
+  main.py                 run loop, voice state machine, confirmation prompts
+  config.py               loads .env settings
   core/
-    brain.py             talks to Claude, runs the tool-use loop
-    speech_input.py       microphone -> text
-    speech_output.py      text -> speech (offline, Windows SAPI voices)
+    brain.py              talks to the LLM, runs the tool-use loop
+    store.py              SQLite: conversation, notes, reminders, memories
+    scheduler.py          durable reminders (survive restarts)
+    audio.py              shared 16 kHz microphone stream
+    wake.py               "Hey Jarvis" wake word (openWakeWord)
+    speech_input.py       microphone -> text (faster-whisper, local)
+    speech_output.py      text -> speech (edge-tts, SAPI fallback)
   skills/
     base_skill.py         base class every skill implements
-    skill_manager.py       registers skills, exposes them to Claude as tools
-    system_skills.py       open/close apps, volume, power, system info
-    web_skills.py           web search, open website, weather
-    utility_skills.py       time/date, notes, reminders, calculator
+    skill_manager.py      registers skills, exposes them as tools
+    system_skills.py      open/close apps, volume, power, system info
+    web_skills.py         open website, browser search, weather
+    vision_skills.py      screenshot -> the model can see your screen
+    utility_skills.py     time/date, notes, reminders, memory, clipboard, calculator
+  tests/                  pytest suite (runs without voice deps, and on Linux)
 ```
 
-## 5. Adding a new skill (this is the whole point — build it incrementally)
+## 5. Safety
 
-1. Open (or create) a file in `skills/`.
-2. Subclass `BaseSkill`:
+Destructive actions ask first. `power_control` (shutdown/restart) and
+`close_app` require confirmation before they run — spoken in voice mode,
+y/N at the prompt in text mode. **Anything other than a clear yes is treated
+as no**, because speech-to-text mishears and a misrecognised "shut down"
+should not power off your machine. `lock` and `sleep` aren't gated; they're
+reversible.
+
+`close_app` matches process names exactly and refuses to touch critical
+Windows processes (`lsass`, `csrss`, `winlogon`, …). It used to substring-match,
+which meant `close_app("s")` would terminate every process with an "s" in its
+name.
+
+Set `CONFIRM_DESTRUCTIVE=0` in `.env` to disable the gate. Don't.
+
+## 6. Adding a new skill
+
+1. Subclass `BaseSkill` in a file under `skills/`:
 
 ```python
 from .base_skill import BaseSkill
 
 class MyNewSkill(BaseSkill):
     name = "my_new_skill"
-    description = "One sentence Claude uses to decide when to call this."
+    description = "One sentence the model uses to decide when to call this."
     input_schema = {
         "type": "object",
         "properties": {"param": {"type": "string"}},
         "required": ["param"],
     }
 
+    # Optional: gate it behind a confirmation prompt
+    requires_confirmation = False
+
     def run(self, param: str) -> str:
-        # do the thing
         return "Result to speak back to the user."
 ```
 
-3. Register it in `skills/skill_manager.py` (import + add to `SKILL_CLASSES`).
+2. Register it in `skills/skill_manager.py` (import + add to `SKILL_CLASSES`).
 
-That's it — no changes needed anywhere else. Claude will automatically start
-calling it whenever a user's request matches the description.
+That's it. A skill can also return image content blocks instead of a string —
+see `vision_skills.py` — and they're converted correctly for both providers.
 
-## 6. Roadmap ideas (pick what you want next)
+## 7. Tests
 
-- **Wake word ("Hey Jarvis")**: add [Porcupine](https://github.com/Picovoice/porcupine)
-  or `openwakeword` for always-listening hands-free activation instead of
-  press-Enter-to-talk.
-- **Better STT**: swap `speech_recognition`'s Google backend for local
-  **Whisper** (`openai-whisper` or `faster-whisper`) for offline, more
-  accurate recognition.
-- **Nicer TTS**: swap `pyttsx3` for `edge-tts` (free, much more natural
-  voices, still no API key) or ElevenLabs for premium voice cloning.
-- **GUI / overlay**: wrap it in a simple system-tray app or a transparent
-  always-on-top HUD (PyQt/customtkinter).
-- **Smart home**: add skills that hit your Home Assistant / Philips Hue /
-  Govee APIs.
-- **Screen awareness**: add a skill that screenshots and sends the image to
-  Claude so it can answer "what's on my screen?" or help debug an error.
-- **Email/calendar**: add skills using Microsoft Graph API or Google APIs.
-- **Persistent memory**: currently conversation history resets when you
-  restart the app (`/reset` also clears it) — swap in a simple SQLite log if
-  you want it to remember things across sessions.
+```bat
+python -m pytest tests/ -v
+```
 
-## Notes on scope
+104 tests, no API key and no microphone needed. They also run on Linux/WSL,
+which is useful because the voice stack won't.
 
-"Every feature Jarvis has" (from Iron Man) isn't a real spec — real building
-blocks are: speech in/out, an LLM brain, and a growing set of tool "skills."
-This gives you that foundation working end-to-end today, structured so you
-can bolt on anything above without touching the core loop.
+## 8. Configuration reference
+
+| Variable | Default | What it does |
+|---|---|---|
+| `EFFORT` | `low` | Reasoning depth (Claude only). `low` keeps voice snappy |
+| `MAX_TOKENS` | `8192` | Ceiling on thinking + reply, not a target length |
+| `MAX_TOOL_ITERATIONS` | `10` | Tool round-trips before giving up on a turn |
+| `CONFIRM_DESTRUCTIVE` | `1` | Ask before shutdown / restart / killing processes |
+| `WAKE_WORD` | `hey_jarvis` | Set `off` for push-to-talk |
+| `WAKE_THRESHOLD` | `0.5` | Lower = more sensitive, more false wakes |
+| `STT_MODEL` | `base.en` | Whisper size. `small.en` is better if your CPU allows |
+| `TTS_ENGINE` | `auto` | `edge` (natural, needs net), `sapi` (offline), `off` |
+| `TTS_VOICE` | `en-GB-RyanNeural` | Any edge-tts voice |
+| `VAD_SILENCE_SECONDS` | `0.8` | Silence before Jarvis stops recording |
+| `DEBUG` | `0` | Print token usage and cache hit rates |
+
+## 9. Roadmap ideas
+
+- **GUI / overlay**: system-tray app or a transparent always-on-top HUD.
+- **Smart home**: skills hitting Home Assistant / Hue / Govee APIs.
+- **Email/calendar**: Microsoft Graph or Google APIs.
+- **Barge-in**: interrupt Jarvis mid-sentence by speaking over it.
+- **Semantic memory**: swap the `LIKE` recall for embeddings once the
+  memories table gets large.

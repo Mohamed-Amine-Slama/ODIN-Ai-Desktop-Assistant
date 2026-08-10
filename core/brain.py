@@ -1,18 +1,19 @@
-"""The 'brain': sends user input to Claude, lets it call skills as tools,
-and returns a final spoken/printed reply.
+"""The 'brain': sends user input to LLM providers (Anthropic or OpenAI-compatible like Alibaba Cloud DashScope / Qwen),
+lets it call skills as tools, and returns a final spoken/printed reply.
 
 Key invariant: `self.history` is only ever replaced by a *well-formed*
 conversation. Every turn is built in a local working copy and committed only
-on success. If anything throws mid-turn, the working copy is discarded — so we
-can never end up with an assistant `tool_use` block that has no matching
-`tool_result`, which would 400 every subsequent request forever.
+on success. If anything throws mid-turn, the working copy is discarded.
 """
+import json
+from types import SimpleNamespace
 import anthropic
+import openai
 
 import config
 from skills.skill_manager import SkillManager
 
-SYSTEM_PROMPT = f"""You are {config.ASSISTANT_NAME}, a helpful, witty, efficient AI assistant
+_BASE_PROMPT = f"""You are {config.ASSISTANT_NAME}, a helpful, witty, efficient AI assistant
 running locally on the user's Windows PC, in the style of Iron Man's J.A.R.V.I.S.
 
 Keep spoken replies concise — 1 to 3 sentences — since they may be read aloud.
@@ -22,25 +23,61 @@ would do next. Skip preamble and skip recapping what you just did.
 Use the available tools to actually take actions on the PC (open apps, check
 system info, control volume, set reminders, do math, etc.) whenever the user's
 request calls for it, rather than just describing what you would do. If a
-request doesn't need a tool, just answer directly.
+request doesn't need a tool, just answer directly."""
 
-Reach for these when they apply:
-- web_search when the answer depends on current information — recent events,
-  today's prices, release notes, anything that changed after your training data.
-  Search rather than answering from memory, and don't ask a scoping question
-  first unless the request is genuinely ambiguous.
-- see_screen when the user refers to something on their display ("this error",
-  "what am I looking at", "read this"). Look before you guess.
-- clipboard to read what they just copied, or to hand back a result they want
-  to paste somewhere.
+# Guidance for tools that are not always present. The tool set differs by
+# provider — the Anthropic-hosted web tools don't exist on an OpenAI-compatible
+# endpoint — and a prompt that tells the model to call a tool it wasn't given
+# just produces confusion or a hallucinated call.
+_TOOL_GUIDANCE = {
+    "web_search": (
+        "- web_search when the answer depends on current information — recent\n"
+        "  events, today's prices, release notes, anything that changed after\n"
+        "  your training data. Search rather than answering from memory, and\n"
+        "  don't ask a scoping question first unless the request is genuinely\n"
+        "  ambiguous."
+    ),
+    "see_screen": (
+        "- see_screen when the user refers to something on their display\n"
+        '  ("this error", "what am I looking at", "read this"). Look before\n'
+        "  you guess."
+    ),
+    "clipboard": (
+        "- clipboard to read what they just copied, or to hand back a result\n"
+        "  they want to paste somewhere."
+    ),
+    "memory": (
+        "- memory to remember durable facts the user tells you (preferences,\n"
+        "  hardware, names) and to recall them in later sessions."
+    ),
+}
 
-Deliver what the user asked for at the scope they intended. Make routine
+_CLOSING = """Deliver what the user asked for at the scope they intended. Make routine
 judgment calls yourself; check in only when different readings would lead to
 materially different actions. If you think the request is mistaken, say so in
 one sentence and carry on with what was asked — don't quietly widen it.
 
 Some actions require the user's confirmation before they run. If a tool result
 says the user declined, acknowledge it briefly and move on — do not retry."""
+
+
+def build_system_prompt(available_tools: set[str]) -> str:
+    """Assemble the system prompt from the tools this provider actually has."""
+    parts = [_BASE_PROMPT]
+
+    guidance = [_TOOL_GUIDANCE[n] for n in _TOOL_GUIDANCE if n in available_tools]
+    if guidance:
+        parts.append("Reach for these when they apply:\n" + "\n".join(guidance))
+
+    if "web_search" not in available_tools:
+        parts.append(
+            "You have no web access. When a question depends on current "
+            "information, answer from what you know and say plainly that you "
+            "couldn't check for anything more recent."
+        )
+
+    parts.append(_CLOSING)
+    return "\n\n".join(parts)
 
 
 class BrainError(Exception):
@@ -54,21 +91,52 @@ def _confirm_always(skill, tool_input) -> bool:  # noqa: ARG001
 
 
 class Brain:
-    def __init__(self, client=None, confirm=None, on_text=None):
+    def __init__(self, client=None, confirm=None, on_text=None, store=None):
         """
-        client:  an anthropic.Anthropic (injected for testing)
+        client:  an anthropic.Anthropic or openai.OpenAI (injected for testing)
         confirm: callable(skill, tool_input) -> bool, asks the user to approve
                  a destructive action
         on_text: callable(str), called with each complete sentence as it
                  streams in, so speech can start before generation finishes
+        store:   a core.store.Store for conversation persistence, or None to
+                 keep the conversation in memory only
         """
-        self.client = client or anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        if client is not None:
+            self.client = client
+            self.is_openai = hasattr(client, "chat")
+        elif config.LLM_PROVIDER == "openai":
+            self.client = openai.OpenAI(
+                api_key=config.API_KEY,
+                base_url=config.BASE_URL or None,
+            )
+            self.is_openai = True
+        else:
+            self.client = anthropic.Anthropic(
+                api_key=config.API_KEY,
+                base_url=config.BASE_URL or None,
+            )
+            self.is_openai = False
+
         self.skills = SkillManager()
         self.confirm = confirm or _confirm_always
         self.on_text = on_text
+        self.store = store
+
+        # Built once from the tools this provider actually exposes, and frozen
+        # thereafter — a system prompt that changes between turns invalidates
+        # the entire cached prefix on every request.
+        self.system_prompt = build_system_prompt(self._available_tool_names())
+
         self.history: list[dict] = []
         self.last_usage = None
         self.spoke_during_last_turn = False
+
+    def _available_tool_names(self) -> set[str]:
+        """Tool names this provider will actually be given. The Anthropic-hosted
+        server tools are absent on an OpenAI-compatible endpoint."""
+        if self.is_openai:
+            return {t["function"]["name"] for t in self.skills.openai_tool_definitions()}
+        return {t["name"] for t in self.skills.tool_definitions()}
 
     # -- public API --------------------------------------------------------
 
@@ -76,6 +144,7 @@ class Brain:
         """Run one full turn. self.history is left untouched if this raises."""
         self.spoke_during_last_turn = False
 
+        before = len(self.history)
         working = list(self.history)
         working.append({"role": "user", "content": user_text})
 
@@ -84,10 +153,33 @@ class Brain:
         reply, working = self._run_turn(working)
 
         self.history = working
+        self._persist(working[before:])
         return reply
+
+    def load_history(self, limit: int = 20) -> int:
+        """Restore the tail of the previous session. Returns messages loaded."""
+        if self.store is None:
+            return 0
+        self.history = self.store.recent_messages(limit)
+        return len(self.history)
 
     def reset(self) -> None:
         self.history = []
+        if self.store is not None:
+            self.store.clear_messages()
+
+    # -- persistence -------------------------------------------------------
+
+    def _persist(self, messages: list[dict]) -> None:
+        """Write a completed turn to disk. Only called after the turn committed,
+        so what lands on disk is always a well-formed conversation."""
+        if self.store is None:
+            return
+        try:
+            for msg in messages:
+                self.store.append_message(msg["role"], msg["content"])
+        except Exception as e:  # persistence must never break the assistant
+            print(f"[store] couldn't save conversation: {e}")
 
     # -- internals ---------------------------------------------------------
 
@@ -137,22 +229,21 @@ class Brain:
         return fallback, working
 
     def _call_model(self, working: list[dict]):
-        """One streamed request. Streaming gives us timeout protection on long
-        turns and lets us speak sentences as they arrive."""
+        if self.is_openai:
+            return self._call_openai_model(working)
+        return self._call_anthropic_model(working)
+
+    def _call_anthropic_model(self, working: list[dict]):
         kwargs = dict(
-            model=config.CLAUDE_MODEL,
+            model=config.MODEL,
             max_tokens=config.MAX_TOKENS,
-            # Adaptive thinking stays ON deliberately. Disabling it on Opus 5
-            # makes the model occasionally write a tool call into its visible
-            # text instead of emitting a tool_use block — the turn "succeeds",
-            # the tool silently never runs, and nothing raises. Low effort is
-            # the cheap lever; disabled thinking is not.
-            thinking={"type": "adaptive"},
-            output_config={"effort": config.EFFORT},
             system=self._system_blocks(),
             tools=self.skills.tool_definitions(),
             messages=self._cached(working),
         )
+        if "claude" in config.MODEL.lower():
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": config.EFFORT}
 
         with self.client.messages.stream(**kwargs) as stream:
             if self.on_text is not None:
@@ -173,33 +264,166 @@ class Brain:
             u = response.usage
             print(
                 f"[usage] in={u.input_tokens} out={u.output_tokens} "
-                f"cache_read={getattr(u, 'cache_read_input_tokens', 0)} "
-                f"cache_write={getattr(u, 'cache_creation_input_tokens', 0)} "
                 f"stop={response.stop_reason}"
             )
         return response
 
-    @staticmethod
-    def _system_blocks() -> list[dict]:
+    def _call_openai_model(self, working: list[dict]):
+        messages = [{"role": "system", "content": self.system_prompt}]
+        for msg in working:
+            role = msg["role"]
+            content = msg["content"]
+            if isinstance(content, str):
+                messages.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                text_parts = []
+                tool_calls_objs = []
+                tool_results_objs = []
+                for b in content:
+                    if isinstance(b, dict):
+                        b_type = b.get("type")
+                        if b_type == "text":
+                            text_parts.append(b.get("text", ""))
+                        elif b_type == "tool_use":
+                            tool_calls_objs.append({
+                                "id": b.get("id", "call_1"),
+                                "type": "function",
+                                "function": {
+                                    "name": b.get("name"),
+                                    "arguments": json.dumps(b.get("input", {}))
+                                }
+                            })
+                        elif b_type == "tool_result":
+                            tool_results_objs.append(b)
+                    elif getattr(b, "type", None) == "text":
+                        text_parts.append(getattr(b, "text", ""))
+                    elif getattr(b, "type", None) == "tool_use":
+                        tool_calls_objs.append({
+                            "id": getattr(b, "id", "call_1"),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(b, "name"),
+                                "arguments": json.dumps(getattr(b, "input", {}))
+                            }
+                        })
+
+                if tool_results_objs:
+                    for tr in tool_results_objs:
+                        text, images = _split_tool_result(tr.get("content", ""))
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tr.get("tool_use_id", ""),
+                            "content": text
+                        })
+                        # The OpenAI schema has no place for an image inside a
+                        # tool message, so images ride in a following user turn
+                        # using the multimodal content-part format.
+                        if images:
+                            messages.append({"role": "user", "content": images})
+                elif tool_calls_objs:
+                    messages.append({
+                        "role": "assistant",
+                        "content": "\n".join(text_parts) if text_parts else None,
+                        "tool_calls": tool_calls_objs
+                    })
+                elif text_parts:
+                    messages.append({"role": role, "content": "\n".join(text_parts)})
+
+        tools = self.skills.openai_tool_definitions()
+
+        kwargs = {
+            "model": config.MODEL,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": config.MAX_TOKENS,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        response_stream = self.client.chat.completions.create(**kwargs)
+
+        full_content = ""
+        tool_calls_acc = {}
+        finish_reason = None
+
+        buffer = ""
+        for chunk in response_stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+            if delta.content:
+                full_content += delta.content
+                buffer += delta.content
+                buffer, done = _drain_sentences(buffer)
+                for sentence in done:
+                    self.spoke_during_last_turn = True
+                    if self.on_text:
+                        self.on_text(sentence)
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": tc.id or f"call_{idx}", "name": "", "arguments": ""}
+                    if tc.id:
+                        tool_calls_acc[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_acc[idx]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_acc[idx]["arguments"] += tc.function.arguments
+
+        if buffer.strip():
+            self.spoke_during_last_turn = True
+            if self.on_text:
+                self.on_text(buffer.strip())
+
+        content_blocks = []
+        if full_content:
+            content_blocks.append(SimpleNamespace(type="text", text=full_content))
+
+        if tool_calls_acc:
+            for idx in sorted(tool_calls_acc.keys()):
+                tc = tool_calls_acc[idx]
+                try:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except Exception:
+                    args = {}
+                content_blocks.append(SimpleNamespace(
+                    type="tool_use",
+                    id=tc["id"],
+                    name=tc["name"],
+                    input=args
+                ))
+
+        stop_reason = "tool_use" if tool_calls_acc else ("end_turn" if finish_reason in ("stop", None) else finish_reason)
+
+        return SimpleNamespace(
+            content=content_blocks,
+            stop_reason=stop_reason,
+            usage=SimpleNamespace(input_tokens=0, output_tokens=0)
+        )
+
+    def _system_blocks(self) -> list[dict]:
         """Render order is tools -> system -> messages, so a breakpoint on the
         last system block caches the tool schemas AND the system prompt.
 
-        SYSTEM_PROMPT must stay byte-frozen — no timestamps, no session IDs.
-        Anything volatile here invalidates the whole cached prefix every turn.
+        self.system_prompt is built once in __init__ and never mutated — a
+        prompt that changes between turns invalidates the whole cached prefix.
         """
         return [
             {
                 "type": "text",
-                "text": SYSTEM_PROMPT,
+                "text": self.system_prompt,
                 "cache_control": {"type": "ephemeral"},
             }
         ]
 
     @staticmethod
     def _cached(working: list[dict]) -> list[dict]:
-        """Add a second cache breakpoint on the newest turn so multi-turn
-        conversations accrue cache hits incrementally instead of only ever
-        reading the tools+system prefix."""
         if not working:
             return working
 
@@ -216,16 +440,12 @@ class Brain:
             blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
             last["content"] = blocks
         else:
-            # SDK content objects (from a previous response) — leave alone.
             return out
 
         out[-1] = last
         return out
 
     def _run_tools(self, response) -> list[dict]:
-        """Execute every tool_use block in this response and return ALL results
-        in one list. They must go back as a single user message — splitting them
-        across messages trains the model out of making parallel tool calls."""
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -262,6 +482,47 @@ class Brain:
         return text or "Done."
 
 
+def _split_tool_result(content) -> tuple[str, list[dict]]:
+    """Convert an Anthropic tool_result payload for an OpenAI-shaped request.
+
+    Returns (text for the tool message, image content-parts for a follow-up
+    user message). Without this, a skill returning image blocks — see_screen —
+    gets str()'d into a multi-hundred-KB base64 literal that is both useless to
+    the model and ruinous to the context window.
+    """
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return str(content), []
+
+    texts: list[str] = []
+    images: list[dict] = []
+    for block in content:
+        if not isinstance(block, dict):
+            texts.append(str(block))
+            continue
+        if block.get("type") == "text":
+            texts.append(block.get("text", ""))
+        elif block.get("type") == "image":
+            source = block.get("source", {})
+            if source.get("type") == "base64":
+                media = source.get("media_type", "image/png")
+                images.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media};base64,{source.get('data', '')}"},
+                    }
+                )
+            elif source.get("type") == "url":
+                images.append({"type": "image_url", "image_url": {"url": source.get("url", "")}})
+        else:
+            texts.append(str(block))
+
+    if images and not texts:
+        texts.append("(image attached below)")
+    return "\n".join(t for t in texts if t), images
+
+
 def _tool_result(tool_use_id: str, content, is_error: bool) -> dict:
     block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
     if is_error:
@@ -273,17 +534,11 @@ _SENTENCE_ENDS = ".!?\n"
 
 
 def _drain_sentences(buffer: str) -> tuple[str, list[str]]:
-    """Split a streaming buffer into complete sentences plus the remainder.
-
-    Returns (remaining_buffer, [complete sentences]). Used so speech can start
-    before the model finishes generating.
-    """
     out = []
     start = 0
     for i, ch in enumerate(buffer):
         if ch not in _SENTENCE_ENDS:
             continue
-        # Don't split "3.14" or "e.g." mid-number/abbreviation.
         if ch == "." and i + 1 < len(buffer) and buffer[i + 1].isdigit():
             continue
         if i + 1 < len(buffer) and buffer[i + 1] not in " \n\t":
@@ -296,21 +551,16 @@ def _drain_sentences(buffer: str) -> tuple[str, list[str]]:
 
 
 def friendly_error(exc: Exception) -> str:
-    """Map an SDK exception to something worth saying out loud.
-
-    Ordered most-specific first — a single broad `except APIStatusError` would
-    lose the retryable/non-retryable distinction.
-    """
-    if isinstance(exc, anthropic.AuthenticationError):
-        return "My API key was rejected. Check ANTHROPIC_API_KEY in your .env file."
-    if isinstance(exc, anthropic.NotFoundError):
-        return f"The model '{config.CLAUDE_MODEL}' wasn't found. Check CLAUDE_MODEL in .env."
-    if isinstance(exc, anthropic.RateLimitError):
+    if isinstance(exc, (anthropic.AuthenticationError, openai.AuthenticationError)):
+        return "My API key was rejected. Please check your API key in the .env file."
+    if isinstance(exc, (anthropic.NotFoundError, openai.NotFoundError)):
+        return f"The model '{config.MODEL}' was not found. Check MODEL in .env."
+    if isinstance(exc, (anthropic.RateLimitError, openai.RateLimitError)):
         return "I'm being rate limited. Give me a moment and try again."
-    if isinstance(exc, anthropic.APIStatusError):
-        if exc.status_code >= 500:
-            return "Anthropic's API is having trouble. Try again in a moment."
-        return f"The API rejected that request: {exc.message}"
-    if isinstance(exc, anthropic.APIConnectionError):
+    if isinstance(exc, (anthropic.APIStatusError, openai.APIStatusError)):
+        if getattr(exc, "status_code", 0) >= 500:
+            return "The API provider is having trouble. Try again in a moment."
+        return f"The API rejected that request: {exc}"
+    if isinstance(exc, (anthropic.APIConnectionError, openai.APIConnectionError)):
         return "I can't reach the network right now."
     return f"Something went wrong: {exc}"

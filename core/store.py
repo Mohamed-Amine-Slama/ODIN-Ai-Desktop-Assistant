@@ -197,6 +197,31 @@ class Store:
             pass  # not worth failing startup over
 
 
+_STORE: Store | None = None
+_STORE_LOCK = threading.Lock()
+
+
+def get_store() -> Store:
+    """Process-wide Store, created on first use.
+
+    Skills reach for this rather than taking a constructor argument, so
+    SkillManager stays a zero-argument registry. Tests override it with
+    set_store(Store(":memory:")).
+    """
+    global _STORE
+    with _STORE_LOCK:
+        if _STORE is None:
+            _STORE = Store()
+        return _STORE
+
+
+def set_store(store: Store | None) -> None:
+    """Replace the process-wide Store (used by tests)."""
+    global _STORE
+    with _STORE_LOCK:
+        _STORE = store
+
+
 def _encode_block(obj):
     """JSON encoder for SDK content blocks (Pydantic models) stored verbatim."""
     for attr in ("model_dump", "dict"):
