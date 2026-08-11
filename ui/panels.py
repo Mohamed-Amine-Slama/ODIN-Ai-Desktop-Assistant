@@ -28,10 +28,10 @@ from core.store import get_store
 
 _PANEL_STYLESHEET = """
 QDialog {
-    background-color: #070d1c;
+    background-color: #05090f;
 }
 QWidget {
-    color: #dbeafe;
+    color: #d6f5f3;
     font-family: 'Segoe UI', 'Inter', -apple-system, sans-serif;
     font-size: 13px;
 }
@@ -40,18 +40,18 @@ QLabel#panelTitle {
     font-size: 16px;
     font-weight: 700;
     letter-spacing: 3px;
-    color: #e0f2fe;
+    color: #cffafe;
 }
 QLabel#sectionHead {
     font-family: 'Consolas', monospace;
     font-size: 11px;
     letter-spacing: 2px;
-    color: #7dd3fc;
+    color: #67e8f9;
 }
 QFrame#row {
-    background-color: rgba(148, 163, 184, 0.06);
-    border: 1px solid rgba(148, 197, 255, 0.14);
-    border-radius: 10px;
+    background-color: rgba(9, 16, 28, 0.55);
+    border: 1px solid rgba(34, 211, 238, 0.20);
+    border-radius: 3px;
 }
 QListWidget {
     background: transparent;
@@ -62,29 +62,40 @@ QListWidget::item {
     border-bottom: 1px solid rgba(148, 163, 184, 0.10);
 }
 QLineEdit {
-    background: rgba(15, 23, 42, 0.6);
-    border: 1px solid rgba(148, 197, 255, 0.25);
-    border-radius: 8px;
+    background: rgba(9, 16, 28, 0.6);
+    border: 1px solid rgba(34, 211, 238, 0.30);
+    border-radius: 3px;
     padding: 6px 10px;
-    color: #f0f9ff;
+    color: #ecfeff;
 }
 QPushButton {
     background-color: rgba(148, 163, 184, 0.10);
-    border: 1px solid rgba(148, 197, 255, 0.22);
-    border-radius: 10px;
-    color: #bae6fd;
+    border: 1px solid rgba(34, 211, 238, 0.25);
+    border-radius: 3px;
+    color: #a5f3fc;
     padding: 7px 16px;
 }
 QPushButton:hover {
-    background-color: rgba(56, 189, 248, 0.20);
-    border: 1px solid rgba(56, 189, 248, 0.60);
-    color: #f0f9ff;
+    background-color: rgba(34, 211, 238, 0.20);
+    border: 1px solid rgba(34, 211, 238, 0.65);
+    color: #ecfeff;
 }
 QPushButton:disabled {
     color: #475569;
     border: 1px solid rgba(148, 163, 184, 0.12);
 }
 QCheckBox { spacing: 8px; }
+QCheckBox::indicator {
+    width: 15px;
+    height: 15px;
+    border: 1px solid rgba(34, 211, 238, 0.45);
+    border-radius: 3px;
+    background: rgba(9, 16, 28, 0.6);
+}
+QCheckBox::indicator:checked {
+    background: rgba(34, 211, 238, 0.85);
+    border: 1px solid rgba(34, 211, 238, 0.9);
+}
 """
 
 

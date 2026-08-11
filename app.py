@@ -117,6 +117,7 @@ def main() -> None:
         hud.append_jarvis_message(f"Press {config.HUD_HOTKEY} any time to summon me.")
 
     def shutdown():
+        hud._stop_voice_loop()
         bridge.release()  # let a worker parked on a confirmation fall through
         scheduler.stop()
         session.shutdown()

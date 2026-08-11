@@ -27,7 +27,7 @@ STATE_STYLE = {
 }
 
 STATE_COLOR = {
-    "idle": QColor(56, 189, 248),
+    "idle": QColor(34, 211, 238),
     "listening": QColor(52, 211, 153),
     "thinking": QColor(251, 191, 36),
     "acting": QColor(248, 113, 113),

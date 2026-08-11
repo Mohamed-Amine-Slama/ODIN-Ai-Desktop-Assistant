@@ -9,19 +9,27 @@ Two windows, as designed:
               the full-screen cinematic HUD — orb, conversation, input, and the
               confirmation and undo affordances the tiered risk model needs.
 
-The visual language is glass over a dark translucent backdrop: panels are
-semi-opaque fills with a single hairline border, and the only saturated colour
-in the frame is whatever the orb is currently doing. Confirmation is the one
-exception — it is meant to interrupt, so it is allowed to shout in amber.
+The visual language is an instrument panel, not a chat app with a coat of
+paint: dark glass, chamfered (cut-corner) panels rather than rounded
+rectangles, corner-tick brackets framing each one, and a cyan/teal glow as
+the resting accent colour — the orb's state colour is the one thing allowed
+to diverge from it, since that is the one signal meant to grab the eye.
+Confirmation is the other exception — it is meant to interrupt, so it is
+allowed to shout in amber.
 """
+import threading
+
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
     QColor,
+    QFont,
+    QFontMetrics,
     QIcon,
     QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
 )
@@ -46,7 +54,97 @@ import config
 from core.undo import get_journal
 from ui.orb import STATE_COLOR, ReactorOrb
 from ui.panels import KnowledgeDialog, SettingsDialog
-from ui.workers import BrainWorker
+from ui.workers import BrainWorker, VoiceListenWorker, VoiceSetupWorker
+
+# The resting accent — everywhere except the orb, which speaks for itself.
+HUD_ACCENT = QColor(34, 211, 238)
+
+
+def _corner_ticks(
+    painter: QPainter, rect, accent: QColor, span: int = 14, inset: int = 8,
+    alpha: int = 200, width: float = 1.4,
+) -> None:
+    """Small L-bracket ticks inset from each corner — the instrument-panel
+    signature common to all three reference HUDs. Used for the screen edges
+    (subtle, on _Backdrop) and reused per-panel (more visible, on HudFrame)."""
+    pen = QPen(QColor(accent.red(), accent.green(), accent.blue(), alpha), width)
+    painter.setPen(pen)
+    for x, y, dx, dy in (
+        (rect.left() + inset, rect.top() + inset, 1, 1),
+        (rect.right() - inset, rect.top() + inset, -1, 1),
+        (rect.left() + inset, rect.bottom() - inset, 1, -1),
+        (rect.right() - inset, rect.bottom() - inset, -1, -1),
+    ):
+        painter.drawLine(int(x), int(y), int(x + span * dx), int(y))
+        painter.drawLine(int(x), int(y), int(x), int(y + span * dy))
+
+
+class HudFrame(QFrame):
+    """A glass panel with chamfered corners instead of a rounded rectangle,
+    plus corner-tick brackets — in place of plain 'QFrame#glass' rounded
+    rects. Paints its own fill/border/brackets, so any layout can still be
+    installed on it normally; content margins just need to clear the chamfer.
+    """
+
+    def __init__(self, parent=None, chamfer: int = 16, accent: QColor | None = None, fill_alpha: int = 140):
+        super().__init__(parent)
+        self._chamfer = chamfer
+        self._accent = accent or HUD_ACCENT
+        self._fill_alpha = fill_alpha
+
+    def _panel_path(self) -> QPainterPath:
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        c = self._chamfer
+        path = QPainterPath()
+        path.moveTo(rect.left() + c, rect.top())
+        path.lineTo(rect.right() - c, rect.top())
+        path.lineTo(rect.right(), rect.top() + c)
+        path.lineTo(rect.right(), rect.bottom() - c)
+        path.lineTo(rect.right() - c, rect.bottom())
+        path.lineTo(rect.left() + c, rect.bottom())
+        path.lineTo(rect.left(), rect.bottom() - c)
+        path.lineTo(rect.left(), rect.top() + c)
+        path.closeSubpath()
+        return path
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path = self._panel_path()
+
+        painter.fillPath(path, QColor(9, 16, 28, self._fill_alpha))
+        a = self._accent
+        painter.setPen(QPen(QColor(a.red(), a.green(), a.blue(), 110), 1))
+        painter.drawPath(path)
+
+        _corner_ticks(painter, self.rect(), a)
+        painter.end()
+
+
+class _TickStrip(QWidget):
+    """A thin row of dashes — pure ornament, echoing the dotted technical
+    rows in the reference HUD imagery without adding real information
+    density to a chat interface that doesn't have any to show."""
+
+    def __init__(self, parent=None, accent: QColor | None = None):
+        super().__init__(parent)
+        self._accent = accent or HUD_ACCENT
+        self.setFixedHeight(6)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        a = self._accent
+        pen = QPen(QColor(a.red(), a.green(), a.blue(), 70), 2)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(pen)
+        y = self.height() // 2
+        dash, gap = 5, 5
+        x = 0
+        while x < self.width():
+            painter.drawLine(x, y, min(x + dash, self.width()), y)
+            x += dash + gap
+        painter.end()
+
 
 STATUS_FOR_STATE = {
     "idle": "STANDING BY",
@@ -59,7 +157,7 @@ STATUS_FOR_STATE = {
 
 HUD_STYLESHEET = """
 QWidget {
-    color: #dbeafe;
+    color: #d6f5f3;
     font-family: 'Segoe UI', 'Inter', -apple-system, sans-serif;
     font-size: 14px;
 }
@@ -68,7 +166,7 @@ QLabel#wordmark {
     font-size: 22px;
     font-weight: 700;
     letter-spacing: 9px;
-    color: #e0f2fe;
+    color: #cffafe;
 }
 QLabel#chrome {
     font-family: 'Consolas', 'JetBrains Mono', monospace;
@@ -80,12 +178,7 @@ QLabel#statusText {
     font-family: 'Consolas', 'JetBrains Mono', monospace;
     font-size: 12px;
     letter-spacing: 3px;
-    color: #7dd3fc;
-}
-QFrame#glass {
-    background-color: rgba(15, 23, 42, 0.55);
-    border: 1px solid rgba(148, 197, 255, 0.18);
-    border-radius: 18px;
+    color: #67e8f9;
 }
 QScrollArea, QWidget#feed {
     background: transparent;
@@ -95,54 +188,54 @@ QScrollBar:vertical {
     background: transparent; width: 6px; margin: 6px 2px 6px 0;
 }
 QScrollBar::handle:vertical {
-    background: rgba(125, 211, 252, 0.35); border-radius: 3px; min-height: 30px;
+    background: rgba(34, 211, 238, 0.35); border-radius: 3px; min-height: 30px;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QFrame#userBubble {
-    background-color: rgba(56, 189, 248, 0.16);
-    border: 1px solid rgba(56, 189, 248, 0.40);
-    border-radius: 14px;
+    background-color: rgba(34, 211, 238, 0.14);
+    border: 1px solid rgba(34, 211, 238, 0.40);
+    border-radius: 3px;
 }
 QFrame#jarvisBubble {
     background-color: rgba(148, 163, 184, 0.10);
     border: 1px solid rgba(148, 163, 184, 0.22);
-    border-radius: 14px;
+    border-radius: 3px;
 }
 QFrame#actionCard {
-    background-color: rgba(56, 189, 248, 0.07);
-    border: 1px solid rgba(56, 189, 248, 0.28);
-    border-radius: 12px;
+    background-color: rgba(34, 211, 238, 0.07);
+    border: 1px solid rgba(34, 211, 238, 0.28);
+    border-radius: 3px;
 }
 QFrame#activityLog {
-    background-color: rgba(15, 23, 42, 0.38);
+    background-color: rgba(9, 16, 28, 0.38);
     border-left: 2px solid rgba(248, 113, 113, 0.55);
-    border-radius: 6px;
+    border-radius: 3px;
 }
 QFrame#confirmBanner {
     background-color: rgba(251, 146, 60, 0.13);
     border: 1px solid rgba(251, 146, 60, 0.65);
-    border-radius: 14px;
+    border-radius: 3px;
 }
 QLineEdit#inputField {
     background: transparent;
     border: none;
     font-size: 16px;
-    color: #f0f9ff;
+    color: #ecfeff;
     padding: 6px 2px;
 }
 QPushButton {
     background-color: rgba(148, 163, 184, 0.10);
-    border: 1px solid rgba(148, 197, 255, 0.22);
-    border-radius: 14px;
-    color: #bae6fd;
+    border: 1px solid rgba(34, 211, 238, 0.25);
+    border-radius: 3px;
+    color: #a5f3fc;
     font-size: 12px;
     letter-spacing: 1px;
     padding: 7px 16px;
 }
 QPushButton:hover {
-    background-color: rgba(56, 189, 248, 0.20);
-    border: 1px solid rgba(56, 189, 248, 0.60);
-    color: #f0f9ff;
+    background-color: rgba(34, 211, 238, 0.20);
+    border: 1px solid rgba(34, 211, 238, 0.65);
+    color: #ecfeff;
 }
 QPushButton#approveBtn {
     background-color: rgba(251, 146, 60, 0.22);
@@ -159,6 +252,46 @@ QPushButton#declineBtn {
 """
 
 
+_BUBBLE_MIN_WIDTH = 48
+_BUBBLE_MAX_WIDTH = 680
+_BUBBLE_MARGINS = (16, 11, 16, 11)
+
+# Matches HUD_STYLESHEET's QWidget rule. A freshly built bubble isn't parented
+# into the styled window yet — it's plain QFrame()/QLabel() until _insert()
+# adds it to the layout — so its own .fontMetrics() still reflects Qt's
+# platform default font, not the 14px this stylesheet actually renders it in.
+# Measuring against that explicit font instead sidesteps the timing entirely.
+_BUBBLE_FONT = QFont("Segoe UI")
+_BUBBLE_FONT.setPixelSize(14)
+
+
+def _bubble_width_for(text: str) -> int:
+    """Content-hugging bubble width: measured directly from the text and
+    clamped between a sensible floor and the wrap width long messages need,
+    rather than a share of the row's width — a stretch-based width made a
+    two-letter reply ("hi") stretch to match a paragraph's box, leaving most
+    of it empty. A word-wrapped QLabel's sizeHint() alone isn't a usable
+    substitute (it reports close to its narrowest word with no stretch)."""
+    metrics = QFontMetrics(_BUBBLE_FONT)
+    longest_line = max((metrics.horizontalAdvance(line) for line in text.splitlines()), default=0)
+    padding = _BUBBLE_MARGINS[0] + _BUBBLE_MARGINS[2]
+    return max(_BUBBLE_MIN_WIDTH, min(longest_line + padding + 8, _BUBBLE_MAX_WIDTH))
+
+
+def _resize_bubble(label: QLabel, text: str) -> None:
+    """Re-fit a bubble already on screen to new text.
+
+    A streamed reply or a placeholder ("…") swapped for an error message both
+    call QLabel.setText() on a bubble that was already sized for its ORIGINAL
+    text at creation — without this, the frame stays pinned to whatever width
+    fit the placeholder, and real content wraps into a column one word-
+    fragment wide instead of resizing to fit.
+    """
+    frame = label.parentWidget()
+    if frame is not None:
+        frame.setFixedWidth(_bubble_width_for(text))
+
+
 def _bubble(text: str, object_name: str, rich: bool) -> QFrame:
     """One chat bubble. Model output is rendered as plain text on purpose —
     anything Jarvis reads off the user's disk could otherwise inject markup."""
@@ -169,14 +302,14 @@ def _bubble(text: str, object_name: str, rich: bool) -> QFrame:
     label.setWordWrap(True)
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(16, 11, 16, 11)
+    layout.setContentsMargins(*_BUBBLE_MARGINS)
     layout.addWidget(label)
     frame.label = label
-    frame.setMaximumWidth(680)
+    frame.setFixedWidth(_bubble_width_for(text))
     return frame
 
 
-_ACTIVITY_PENDING_STYLE = "color: #7dd3fc; font-family: 'Consolas', monospace; font-size: 11px;"
+_ACTIVITY_PENDING_STYLE = "color: #67e8f9; font-family: 'Consolas', monospace; font-size: 11px;"
 _ACTIVITY_DONE_STYLE = "color: #64748b; font-family: 'Consolas', monospace; font-size: 11px;"
 _ACTIVITY_ERROR_STYLE = "color: #fca5a5; font-family: 'Consolas', monospace; font-size: 11px;"
 
@@ -230,7 +363,7 @@ class ActionCardWidget(QFrame):
         label = QLabel(caption, self)
         label.setTextFormat(Qt.TextFormat.PlainText)
         label.setWordWrap(True)
-        label.setStyleSheet("color: #7dd3fc; font-family: 'Consolas', monospace; font-size: 12px;")
+        label.setStyleSheet("color: #67e8f9; font-family: 'Consolas', monospace; font-size: 12px;")
         layout.addWidget(label, 1)
 
         if token:
@@ -297,22 +430,13 @@ class _Backdrop(QWidget):
         wash.setColorAt(1.0, QColor(3, 6, 14, 242))
         painter.fillRect(rect, QBrush(wash))
 
-        painter.setPen(QPen(QColor(56, 189, 248, 14), 1))
+        painter.setPen(QPen(QColor(34, 211, 238, 14), 1))
         for x in range(0, rect.width(), 64):
             painter.drawLine(x, 0, x, rect.height())
         for y in range(0, rect.height(), 64):
             painter.drawLine(0, y, rect.width(), y)
 
-        painter.setPen(QPen(QColor(125, 211, 252, 110), 2))
-        span, inset = 46, 22
-        for x, y, dx, dy in (
-            (inset, inset, 1, 1),
-            (rect.width() - inset, inset, -1, 1),
-            (inset, rect.height() - inset, 1, -1),
-            (rect.width() - inset, rect.height() - inset, -1, -1),
-        ):
-            painter.drawLine(x, y, x + span * dx, y)
-            painter.drawLine(x, y, x, y + span * dy)
+        _corner_ticks(painter, rect, HUD_ACCENT, span=46, inset=22, alpha=110, width=2)
         painter.end()
 
 
@@ -373,8 +497,10 @@ class JarvisMainWindow(QMainWindow):
         self._live_text: list[str] = []
         self._activity_widget: ActivityLogWidget | None = None
         self._pending_activity_row: QLabel | None = None
+        self._voice_setup_worker: VoiceSetupWorker | None = None
+        self._voice_loop_worker: VoiceListenWorker | None = None
 
-        self.setWindowTitle("Jarvis — Personal AI Desktop Assistant")
+        self.setWindowTitle(f"{config.ASSISTANT_NAME} — Personal AI Desktop Assistant")
         self.resize(1180, 760)
         self.setMinimumSize(720, 520)
         self.setWindowFlags(
@@ -408,6 +534,7 @@ class JarvisMainWindow(QMainWindow):
         outer.setSpacing(18)
 
         outer.addLayout(self._build_header())
+        outer.addWidget(_TickStrip(central))
 
         body = QHBoxLayout()
         body.setSpacing(24)
@@ -427,6 +554,13 @@ class JarvisMainWindow(QMainWindow):
         subtitle.setObjectName("chrome")
         header.addWidget(subtitle, 0)
         header.addStretch(1)
+
+        # Live session telemetry — token usage from the last turn. Purely
+        # informational chrome, echoing the small live readouts in the
+        # reference HUD imagery; empty until the first turn completes.
+        self.telemetry_label = QLabel("", self)
+        self.telemetry_label.setObjectName("chrome")
+        header.addWidget(self.telemetry_label, 0)
 
         # The live status lives under the orb, where the eye already is. Up here
         # goes the thing that doesn't change per turn: how you're talking to it.
@@ -478,11 +612,10 @@ class JarvisMainWindow(QMainWindow):
         column = QVBoxLayout()
         column.setSpacing(14)
 
-        panel = QFrame(self)
-        panel.setObjectName("glass")
+        panel = HudFrame(self, chamfer=18)
         self._apply_depth(panel)
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_layout.setContentsMargins(14, 14, 14, 14)
 
         self.scroll_area = QScrollArea(panel)
         self.scroll_area.setWidgetResizable(True)
@@ -501,15 +634,14 @@ class JarvisMainWindow(QMainWindow):
         self.confirm_container.setSpacing(8)
         column.addLayout(self.confirm_container, 0)
 
-        input_panel = QFrame(self)
-        input_panel.setObjectName("glass")
+        input_panel = HudFrame(self, chamfer=12)
         self._apply_depth(input_panel)
         input_layout = QHBoxLayout(input_panel)
         input_layout.setContentsMargins(20, 8, 12, 8)
         input_layout.setSpacing(10)
 
         prompt = QLabel("▸", input_panel)
-        prompt.setStyleSheet("color: #38bdf8; font-size: 17px;")
+        prompt.setStyleSheet("color: #22d3ee; font-size: 17px;")
         input_layout.addWidget(prompt, 0)
 
         self.input_field = QLineEdit(input_panel)
@@ -533,9 +665,9 @@ class JarvisMainWindow(QMainWindow):
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(QPen(QColor(56, 189, 248), 3))
+        painter.setPen(QPen(QColor(34, 211, 238), 3))
         painter.drawEllipse(QRectF(4, 4, 24, 24))
-        painter.setBrush(QColor(224, 242, 254))
+        painter.setBrush(QColor(207, 250, 254))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QRectF(12, 12, 8, 8))
         painter.end()
@@ -661,12 +793,16 @@ class JarvisMainWindow(QMainWindow):
 
     def append_user_message(self, text: str) -> QLabel:
         bubble = _bubble(text, "userBubble", rich=False)
-        self._insert(bubble, align_right=True)
+        # share=0: the bubble is already fixed-width (see _bubble); giving a
+        # fixed-size widget a nonzero stretch factor alongside a
+        # heightForWidth (word-wrapped) child is what was producing the
+        # corrupted, overlapping row heights.
+        self._insert(bubble, align_right=True, share=0)
         return bubble.label
 
     def append_jarvis_message(self, text: str, rich: bool = False) -> QLabel:
         bubble = _bubble(text, "jarvisBubble", rich=rich)
-        self._insert(bubble, align_right=False)
+        self._insert(bubble, align_right=False, share=0)
         return bubble.label
 
     # Kept so older call sites and tests keep working.
@@ -716,11 +852,9 @@ class JarvisMainWindow(QMainWindow):
         elif command == "/help":
             self.trigger_help()
         elif command == "/mode voice":
-            self.append_jarvis_message(self.session.set_mode("voice"))
-            self._sync_mode_button()
+            self._switch_to_voice()
         elif command == "/mode text":
-            self.append_jarvis_message(self.session.set_mode("text"))
-            self._sync_mode_button()
+            self._switch_to_text()
         elif command in ("/quit", "/exit"):
             QApplication.instance().quit()
         else:
@@ -762,9 +896,68 @@ class JarvisMainWindow(QMainWindow):
         KnowledgeDialog(self).exec()
 
     def _toggle_mode(self) -> None:
-        target = "voice" if self.session.mode == "text" else "text"
-        self.append_jarvis_message(self.session.set_mode(target))
+        if self.session.mode == "voice":
+            self._switch_to_text()
+        else:
+            self._switch_to_voice()
+
+    def _switch_to_text(self) -> None:
+        self._stop_voice_loop()
+        self.append_jarvis_message(self.session.set_mode("text"))
         self._sync_mode_button()
+
+    def _switch_to_voice(self) -> None:
+        # set_mode("voice") can mean loading STT/wake-word models for the
+        # first time — seconds to real, network-bound minutes. Doing that on
+        # the GUI thread is what used to freeze the whole HUD.
+        if self._voice_setup_worker is not None:
+            return
+        self.mode_btn.setEnabled(False)
+        self.append_jarvis_message("Starting microphone and loading speech models…")
+
+        worker = VoiceSetupWorker(self.session, self)
+        self._voice_setup_worker = worker
+        worker.finished_ok.connect(self._on_voice_ready)
+        worker.failed.connect(self._on_voice_setup_failed)
+        worker.start()
+
+    def _on_voice_ready(self, message: str) -> None:
+        self._voice_setup_worker = None
+        self.mode_btn.setEnabled(True)
+        self.append_jarvis_message(message)
+        self._sync_mode_button()
+        self._start_voice_loop()
+
+    def _on_voice_setup_failed(self, message: str) -> None:
+        self._voice_setup_worker = None
+        self.mode_btn.setEnabled(True)
+        self.append_jarvis_message(message)
+        self._sync_mode_button()
+
+    def _start_voice_loop(self) -> None:
+        worker = VoiceListenWorker(self.session, self)
+        self._voice_loop_worker = worker
+        worker.heard.connect(self._on_voice_heard)
+        worker.state_changed.connect(self._on_voice_state)
+        worker.start()
+
+    def _stop_voice_loop(self) -> None:
+        if self._voice_loop_worker is not None:
+            self._voice_loop_worker.stop()
+            self._voice_loop_worker.wait(2000)
+            self._voice_loop_worker = None
+
+    def _on_voice_state(self, state: str) -> None:
+        # A turn already drives the orb's status once something was heard;
+        # this only reflects the idle wait-for-wake-word / recording cycle.
+        if self.session.mode == "voice" and self.current_worker is None:
+            self.set_status(state)
+
+    def _on_voice_heard(self, text: str) -> None:
+        if self.session.mode != "voice":
+            return
+        self.append_user_message(text)
+        self._process_user_turn(text)
 
     def _sync_mode_button(self) -> None:
         voice = self.session.mode == "voice"
@@ -799,7 +992,9 @@ class JarvisMainWindow(QMainWindow):
             self._live_label = self.append_jarvis_message("")
         self.set_status("speaking")
         self._live_text.append(sentence)
-        self._live_label.setText(" ".join(self._live_text))
+        full_text = " ".join(self._live_text)
+        self._live_label.setText(full_text)
+        _resize_bubble(self._live_label, full_text)
         self._scroll_to_bottom()
 
     def _on_tool_started(self, skill_name: str, args_brief: str) -> None:
@@ -845,11 +1040,13 @@ class JarvisMainWindow(QMainWindow):
     def _on_turn_finished(self, reply: str) -> None:
         if reply and not self._live_text and self._live_label is not None:
             self._live_label.setText(reply)
+            _resize_bubble(self._live_label, reply)
         self._finish_turn()
 
     def _on_turn_error(self, message: str) -> None:
         if self._live_label is not None:
             self._live_label.setText(message)
+            _resize_bubble(self._live_label, message)
         self._finish_turn()
 
     def _finish_turn(self) -> None:
@@ -858,6 +1055,36 @@ class JarvisMainWindow(QMainWindow):
         self.set_status("idle")
         self._set_input_enabled(True)
         self.input_field.setFocus()
+        self._update_telemetry()
+        if self._voice_loop_worker is not None:
+            # Resume listening only once playback finishes — otherwise the
+            # open mic hears the reply through the speakers and treats it as
+            # the next thing said. speaker.wait() blocks, so it runs off the
+            # GUI thread; it only touches thread-safe Events past this point.
+            threading.Thread(target=self._resume_voice_after_speech, daemon=True).start()
+
+    def _resume_voice_after_speech(self) -> None:
+        self.session.speaker.wait(timeout=60)
+        if self._voice_loop_worker is not None:
+            self._voice_loop_worker.resume()
+
+    def _update_telemetry(self) -> None:
+        """Reflect the last turn's token usage in the header chrome. brain
+        may be a test double whose .last_usage is a bare MagicMock rather
+        than a real usage object — the isinstance checks are what keep that
+        harmless instead of a crash on an unformattable value."""
+        usage = getattr(self.brain, "last_usage", None)
+        if usage is None:
+            return
+        total = getattr(usage, "total_tokens", None)
+        if not isinstance(total, (int, float)):
+            inp = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None)
+            out = getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None)
+            if isinstance(inp, (int, float)) and isinstance(out, (int, float)):
+                total = inp + out
+            else:
+                return
+        self.telemetry_label.setText(f"◈ {int(total):,} TOK")
 
 
 # The project was briefly called ODIN; keep the old name importable.

@@ -312,7 +312,7 @@ class WebFetchSkill(BaseSkill):
                 timeout=15,
                 stream=True,
                 allow_redirects=False,
-                headers={"User-Agent": "Jarvis/1.0 (personal assistant)"},
+                headers={"User-Agent": f"{config.ASSISTANT_NAME}/1.0 (personal assistant)"},
             )
         except requests.Timeout:
             return "That page did not respond in time."

@@ -80,7 +80,9 @@ def test_confirmation_banner_emits_both_answers(qapp):
 
 
 def test_hud_builds_and_renders_messages(window):
-    assert window.windowTitle() == "Jarvis — Personal AI Desktop Assistant"
+    import config
+
+    assert window.windowTitle() == f"{config.ASSISTANT_NAME} — Personal AI Desktop Assistant"
 
     before = window.chat_layout.count()
     window.append_user_message("Test user query")

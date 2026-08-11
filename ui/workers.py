@@ -104,6 +104,94 @@ class UiBridge(QObject):
         self._answered.set()
 
 
+class VoiceSetupWorker(QThread):
+    """Loads the microphone, speech-to-text, and wake-word models off the GUI
+    thread.
+
+    session.set_mode("voice") can mean a first-run model download
+    (openWakeWord, faster-whisper) or slow audio device negotiation — anywhere
+    from a couple of seconds to a real network-bound wait. Doing that inline
+    in a button click handler, as the HUD used to, freezes the whole window
+    for the entire duration with no way to cancel short of killing the
+    process. This just moves the same call off the GUI thread.
+    """
+
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+
+    def run(self) -> None:
+        try:
+            message = self.session.set_mode("voice")
+        except Exception as e:  # noqa: BLE001 - a failed setup must not kill the HUD
+            self.failed.emit(f"Couldn't start voice mode: {e}")
+            return
+        if self.session.mode == "voice":
+            self.finished_ok.emit(message)
+        else:
+            # set_mode() never raises — a setup failure is reported by
+            # falling back to text mode and returning an explanation instead.
+            self.failed.emit(message)
+
+
+class VoiceListenWorker(QThread):
+    """Runs wait-for-wake-word -> record -> transcribe in a loop, off the GUI
+    thread, until stop() is called.
+
+    Paused (not stopped) while a turn is being handled and spoken back —
+    otherwise the open mic would pick up the assistant's own reply through
+    the speakers and treat it as the next thing the user said.
+    """
+
+    heard = pyqtSignal(str)
+    state_changed = pyqtSignal(str)  # "idle" (waiting) or "listening" (recording)
+    error = pyqtSignal(str)
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self._stop_event = threading.Event()
+        self._pause = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def pause(self) -> None:
+        self._pause.set()
+
+    def resume(self) -> None:
+        self._pause.clear()
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            if self._pause.is_set():
+                self._stop_event.wait(0.2)
+                continue
+            try:
+                if self.session.wake is not None:
+                    self.state_changed.emit("idle")
+                    if not self.session.wake.wait(stop_event=self._stop_event):
+                        continue
+                if self._stop_event.is_set():
+                    break
+                self.state_changed.emit("listening")
+                text = self.session.listener.listen()
+            except Exception as e:  # noqa: BLE001 - one bad cycle must not kill the loop
+                self.error.emit(str(e))
+                self._stop_event.wait(1.0)
+                continue
+
+            if text:
+                # Stop capturing the moment something was heard — resumed by
+                # the GUI once the resulting turn has finished playing back.
+                self._pause.set()
+                self.heard.emit(text)
+        self.state_changed.emit("idle")
+
+
 class BrainWorker(QThread):
     """Runs exactly one turn.
 
