@@ -9,6 +9,38 @@ from core.store import get_store
 from .base_skill import BaseSkill
 
 
+_MAX_WAIT_SECONDS = 15.0
+
+
+class WaitSkill(BaseSkill):
+    name = "wait"
+    description = (
+        "Pause briefly before the next action. Use between steps of a "
+        "multi-step task that need a moment to catch up — after opening an "
+        "app or navigating to a page and before taking a screenshot of it, "
+        "or after a click that triggers something to load."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "seconds": {
+                "type": "number",
+                "description": f"How long to wait, in seconds (max {_MAX_WAIT_SECONDS:g}).",
+            }
+        },
+        "required": ["seconds"],
+    }
+
+    def run(self, seconds: float) -> str:
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return "I need a number of seconds to wait."
+        seconds = max(0.0, min(_MAX_WAIT_SECONDS, seconds))
+        time.sleep(seconds)
+        return f"Waited {seconds:g} seconds."
+
+
 class TimeDateSkill(BaseSkill):
     name = "get_time_date"
     description = "Get the current time and/or date."

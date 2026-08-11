@@ -153,6 +153,10 @@ class Session:
         except EOFError:
             return False
 
+    def on_tool_activity(self, phase, skill_name, tool_input, outcome=None) -> None:  # noqa: ARG002
+        if phase == "start":
+            print(f"  [>] {skill_name}")
+
     def announce(self, skill, tool_input, outcome) -> None:
         """Report a completed MODERATE action. Only offers undo when the action
         genuinely recorded one, so the prompt never promises what it can't do."""
@@ -216,6 +220,7 @@ def main() -> None:
         on_text=speaker.say,
         store=store,
         on_action=session.announce,
+        on_tool_activity=session.on_tool_activity,
     )
     restored = brain.load_history()
 

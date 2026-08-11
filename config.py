@@ -47,13 +47,20 @@ EFFORT = os.getenv("EFFORT", "low")
 # Brevity comes from the system prompt.
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
-# How many tool-use round trips before we give up on a single turn.
-MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "10"))
+# How many tool-use round trips before we give up on a single turn. A compound
+# request ("open X, find Y, message them") can easily chain a dozen-plus calls
+# — open/navigate, several wait+see_screen+click cycles, type, send — so this
+# needs real headroom, not just enough for a couple of simple lookups.
+MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "25"))
 
 # Bound active conversation context in long-running sessions. Persistent
 # history remains in SQLite; only the request working set is trimmed.
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "80"))
 MEMORY_CONTEXT_LIMIT = int(os.getenv("MEMORY_CONTEXT_LIMIT", "5"))
+
+# How many deep_learn notes chunks to surface per turn. 0 disables retrieval
+# without needing chromadb/sentence-transformers installed at all.
+KNOWLEDGE_CONTEXT_RESULTS = int(os.getenv("KNOWLEDGE_CONTEXT_RESULTS", "4"))
 
 # --- Behaviour ------------------------------------------------------------
 ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "ODIN")

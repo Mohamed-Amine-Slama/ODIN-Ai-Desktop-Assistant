@@ -39,6 +39,7 @@ from .utility_skills import (
     MemorySkill,
     CalculatorSkill,
     ClipboardSkill,
+    WaitSkill,
 )
 
 SKILL_CLASSES = [
@@ -69,6 +70,7 @@ SKILL_CLASSES = [
     MemorySkill,
     CalculatorSkill,
     ClipboardSkill,
+    WaitSkill,
 ]
 
 # Reading a page needs no credentials, so it is always available. Search does,
@@ -77,6 +79,17 @@ SKILL_CLASSES = [
 SKILL_CLASSES.append(WebFetchSkill)
 if google_search_key():
     SKILL_CLASSES.append(WebSearchSkill)
+
+    # deep_learn hard-requires the same grounded search WebSearchSkill uses,
+    # so it is gated identically. list_learned_topics only reads what's
+    # already stored locally and stays available either way.
+    from .knowledge_skills import DeepLearnSkill
+
+    SKILL_CLASSES.append(DeepLearnSkill)
+
+from .knowledge_skills import ListLearnedTopicsSkill
+
+SKILL_CLASSES.append(ListLearnedTopicsSkill)
 
 if getattr(config, "ENABLE_SHELL", True):
     from .shell_skills import RunCommandSkill

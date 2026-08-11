@@ -18,12 +18,35 @@ from core.brain import friendly_error
 from core.undo import get_journal
 
 
+def _brief_args(tool_input: dict) -> str:
+    """First couple of kwargs, truncated — enough to recognise the call at a
+    glance without dumping a full argument list into the activity feed."""
+    if not tool_input:
+        return ""
+    parts = []
+    for key, value in list(tool_input.items())[:2]:
+        text = str(value)
+        if len(text) > 40:
+            text = text[:40] + "…"
+        parts.append(f"{key}={text}")
+    return ", ".join(parts)
+
+
+def _brief_result(content) -> str:
+    if isinstance(content, list):
+        return "(image)"
+    text = str(content)
+    return text if len(text) <= 90 else text[:90] + "…"
+
+
 class UiBridge(QObject):
     """Brain callbacks in, Qt signals out."""
 
     text_chunk = pyqtSignal(str)
     action_reported = pyqtSignal(str, str, str)  # skill name, undo token, description
     confirm_requested = pyqtSignal(str)          # the question to put to the user
+    tool_started = pyqtSignal(str, str)          # skill name, brief args
+    tool_finished = pyqtSignal(str, bool, str)   # skill name, is_error, brief result
 
     def __init__(self, speaker=None, parent=None):
         super().__init__(parent)
@@ -47,6 +70,17 @@ class UiBridge(QObject):
             entry = get_journal().latest()
             description = entry.description if entry is not None else ""
         self.action_reported.emit(skill.name, token, description)
+
+    def on_tool_activity(self, phase, skill_name, tool_input, outcome=None) -> None:
+        """Every tool call, start and end — the live trace of a multi-step
+        turn. Unlike on_action, this fires regardless of risk tier or whether
+        the call produced anything undoable."""
+        if phase == "start":
+            self.tool_started.emit(skill_name, _brief_args(tool_input))
+        else:
+            is_error = bool(outcome.is_error) if outcome is not None else False
+            content = outcome.content if outcome is not None else ""
+            self.tool_finished.emit(skill_name, is_error, _brief_result(content))
 
     def confirm(self, skill, tool_input) -> bool:
         """Block the worker until the HUD answers. Defaults to no."""

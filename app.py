@@ -88,6 +88,7 @@ def main() -> None:
         on_text=bridge.on_text,
         store=store,
         on_action=bridge.on_action,
+        on_tool_activity=bridge.on_tool_activity,
     )
     restored = brain.load_history()
 

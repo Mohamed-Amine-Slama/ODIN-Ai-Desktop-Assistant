@@ -14,7 +14,7 @@ semi-opaque fills with a single hairline border, and the only saturated colour
 in the frame is whatever the orb is currently doing. Confirmation is the one
 exception — it is meant to interrupt, so it is allowed to shout in amber.
 """
-from PyQt6.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
@@ -28,6 +28,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -43,12 +45,14 @@ from PyQt6.QtWidgets import (
 import config
 from core.undo import get_journal
 from ui.orb import STATE_COLOR, ReactorOrb
+from ui.panels import KnowledgeDialog, SettingsDialog
 from ui.workers import BrainWorker
 
 STATUS_FOR_STATE = {
     "idle": "STANDING BY",
     "listening": "LISTENING",
     "thinking": "WORKING",
+    "acting": "EXECUTING",
     "speaking": "SPEAKING",
     "confirm": "AWAITING AUTHORISATION",
 }
@@ -109,6 +113,11 @@ QFrame#actionCard {
     border: 1px solid rgba(56, 189, 248, 0.28);
     border-radius: 12px;
 }
+QFrame#activityLog {
+    background-color: rgba(15, 23, 42, 0.38);
+    border-left: 2px solid rgba(248, 113, 113, 0.55);
+    border-radius: 6px;
+}
 QFrame#confirmBanner {
     background-color: rgba(251, 146, 60, 0.13);
     border: 1px solid rgba(251, 146, 60, 0.65);
@@ -165,6 +174,37 @@ def _bubble(text: str, object_name: str, rich: bool) -> QFrame:
     frame.label = label
     frame.setMaximumWidth(680)
     return frame
+
+
+_ACTIVITY_PENDING_STYLE = "color: #7dd3fc; font-family: 'Consolas', monospace; font-size: 11px;"
+_ACTIVITY_DONE_STYLE = "color: #64748b; font-family: 'Consolas', monospace; font-size: 11px;"
+_ACTIVITY_ERROR_STYLE = "color: #fca5a5; font-family: 'Consolas', monospace; font-size: 11px;"
+
+
+class ActivityLogWidget(QFrame):
+    """Live trace of the tool calls made during one turn.
+
+    A compound request ('open X, find Y, message them') can take a dozen-plus
+    tool calls to finish. Without this, that whole stretch is a silent
+    spinner; with it, each call appears the moment it starts and resolves in
+    place once it finishes — the multi-step chain is visible as it happens,
+    not just summarised afterward.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("activityLog")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(14, 8, 14, 8)
+        self._layout.setSpacing(3)
+
+    def add_row(self, text: str) -> QLabel:
+        label = QLabel(text, self)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setWordWrap(True)
+        label.setStyleSheet(_ACTIVITY_PENDING_STYLE)
+        self._layout.addWidget(label)
+        return label
 
 
 class ActionCardWidget(QFrame):
@@ -331,6 +371,8 @@ class JarvisMainWindow(QMainWindow):
         self._banner = None
         self._live_label = None
         self._live_text: list[str] = []
+        self._activity_widget: ActivityLogWidget | None = None
+        self._pending_activity_row: QLabel | None = None
 
         self.setWindowTitle("Jarvis — Personal AI Desktop Assistant")
         self.resize(1180, 760)
@@ -348,6 +390,8 @@ class JarvisMainWindow(QMainWindow):
             self.bridge.text_chunk.connect(self._on_chunk)
             self.bridge.action_reported.connect(self.append_action_card)
             self.bridge.confirm_requested.connect(self._on_confirm_requested)
+            self.bridge.tool_started.connect(self._on_tool_started)
+            self.bridge.tool_finished.connect(self._on_tool_finished)
 
         self.append_jarvis_message(
             f"{config.ASSISTANT_NAME} online. I have the run of this machine — "
@@ -415,6 +459,8 @@ class JarvisMainWindow(QMainWindow):
             ("UNDO", self.trigger_undo, "Reverse the last undoable action"),
             ("RESET", self.trigger_reset, "Clear conversation memory"),
             ("VOICE", self._toggle_mode, "Switch between voice and text"),
+            ("KNOWLEDGE", self.open_knowledge_panel, "Browse or grow what I've deep-learned"),
+            ("SETTINGS", self.open_settings_panel, "Registered skills and behaviour toggles"),
             ("HELP", self.trigger_help, "List the commands"),
         ):
             button = QPushButton(label, self)
@@ -434,6 +480,7 @@ class JarvisMainWindow(QMainWindow):
 
         panel = QFrame(self)
         panel.setObjectName("glass")
+        self._apply_depth(panel)
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(10, 10, 10, 10)
 
@@ -456,6 +503,7 @@ class JarvisMainWindow(QMainWindow):
 
         input_panel = QFrame(self)
         input_panel.setObjectName("glass")
+        self._apply_depth(input_panel)
         input_layout = QHBoxLayout(input_panel)
         input_layout.setContentsMargins(20, 8, 12, 8)
         input_layout.setSpacing(10)
@@ -583,7 +631,33 @@ class JarvisMainWindow(QMainWindow):
             row.addWidget(widget, share)
             row.addStretch(6 - share)
         self.chat_layout.insertLayout(self.chat_layout.count() - 1, row)
+        self._fade_in(widget)
         self._scroll_to_bottom()
+
+    @staticmethod
+    def _fade_in(widget: QWidget) -> None:
+        """New feed entries ease in rather than snapping into place — a small
+        touch, but it's what tells a fast-scrolling activity trace apart from
+        a static log dump."""
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(220)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        widget._fade_anim = anim  # keep a reference alive until it finishes
+        anim.start()
+
+    @staticmethod
+    def _apply_depth(widget: QWidget) -> None:
+        """A soft drop shadow behind the glass panels, so they read as
+        floating over the backdrop rather than flat-painted onto it."""
+        shadow = QGraphicsDropShadowEffect(widget)
+        shadow.setBlurRadius(36)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(2, 6, 16, 160))
+        widget.setGraphicsEffect(shadow)
 
     def append_user_message(self, text: str) -> QLabel:
         bubble = _bubble(text, "userBubble", rich=False)
@@ -681,6 +755,12 @@ class JarvisMainWindow(QMainWindow):
             rich=True,
         )
 
+    def open_settings_panel(self) -> None:
+        SettingsDialog(self.brain, self).exec()
+
+    def open_knowledge_panel(self) -> None:
+        KnowledgeDialog(self).exec()
+
     def _toggle_mode(self) -> None:
         target = "voice" if self.session.mode == "text" else "text"
         self.append_jarvis_message(self.session.set_mode(target))
@@ -699,6 +779,8 @@ class JarvisMainWindow(QMainWindow):
 
         self._live_text = []
         self._live_label = self.append_jarvis_message("…")
+        self._activity_widget = None
+        self._pending_activity_row = None
 
         worker = BrainWorker(self.brain, text, parent=self)
         self.current_worker = worker
@@ -719,6 +801,28 @@ class JarvisMainWindow(QMainWindow):
         self._live_text.append(sentence)
         self._live_label.setText(" ".join(self._live_text))
         self._scroll_to_bottom()
+
+    def _on_tool_started(self, skill_name: str, args_brief: str) -> None:
+        if self._activity_widget is None:
+            self._activity_widget = ActivityLogWidget(self)
+            self._insert(self._activity_widget, align_right=False, share=5)
+        label = f"→ {skill_name}({args_brief})" if args_brief else f"→ {skill_name}"
+        self._pending_activity_row = self._activity_widget.add_row(label)
+        self._scroll_to_bottom()
+        self.set_status("acting")
+
+    def _on_tool_finished(self, skill_name: str, is_error: bool, result_brief: str) -> None:
+        if self._pending_activity_row is not None:
+            mark = "✗" if is_error else "✓"
+            text = f"{mark} {skill_name}"
+            if result_brief:
+                text += f" — {result_brief}"
+            self._pending_activity_row.setText(text)
+            self._pending_activity_row.setStyleSheet(
+                _ACTIVITY_ERROR_STYLE if is_error else _ACTIVITY_DONE_STYLE
+            )
+            self._pending_activity_row = None
+        self.set_status("thinking")
 
     def _on_confirm_requested(self, question: str) -> None:
         self.set_status("confirm")

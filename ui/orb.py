@@ -19,6 +19,10 @@ STATE_STYLE = {
     "idle": {"band": (0.74, 0.86), "speed": 0.35, "glow": 0.55, "jitter": 0.10},
     "listening": {"band": (0.60, 0.94), "speed": 0.85, "glow": 0.80, "jitter": 0.35},
     "thinking": {"band": (0.42, 1.18), "speed": 1.90, "glow": 1.00, "jitter": 0.85},
+    # A hands-on-the-machine state, distinct from "thinking" (waiting on the
+    # model) — the tightest, fastest band of the set, so a tool call reads as
+    # a sharp burst of activity rather than more of the same churn.
+    "acting": {"band": (0.35, 0.98), "speed": 2.6, "glow": 1.00, "jitter": 1.10},
     "speaking": {"band": (0.55, 1.05), "speed": 1.25, "glow": 0.95, "jitter": 0.55},
 }
 
@@ -26,6 +30,7 @@ STATE_COLOR = {
     "idle": QColor(56, 189, 248),
     "listening": QColor(52, 211, 153),
     "thinking": QColor(251, 191, 36),
+    "acting": QColor(248, 113, 113),
     "speaking": QColor(167, 139, 250),
 }
 

@@ -10,7 +10,10 @@ What stays local is anything that has to happen on *this* machine.
 """
 import os
 import re
+import shutil
 import socket
+import subprocess
+import sys
 import urllib.parse
 import webbrowser
 from html.parser import HTMLParser
@@ -20,6 +23,9 @@ import requests
 
 import config
 from .base_skill import BaseSkill
+from .system_skills import _resolve_windows_app_executable
+
+IS_WINDOWS = sys.platform == "win32"
 
 # Matches a leading URI scheme, e.g. "https:", "file:", "javascript:".
 # A bare "localhost:8080" also matches, so the port case is excluded below.
@@ -76,11 +82,70 @@ def _to_web_url(raw: str) -> str | None:
     return parsed.geturl()
 
 
+_BROWSER_EXE_NAMES = {
+    "chrome": "chrome.exe",
+    "google chrome": "chrome.exe",
+    "edge": "msedge.exe",
+    "microsoft edge": "msedge.exe",
+    "firefox": "firefox.exe",
+    "opera": "opera.exe",
+    "opera gx": "opera.exe",
+    "operagx": "opera.exe",
+    "brave": "brave.exe",
+}
+
+
+def _registry_app_path(exe_name: str) -> str | None:
+    """Look up an executable's install path via the Windows 'App Paths' key,
+    which browser installers register regardless of install location."""
+    if not IS_WINDOWS:
+        return None
+    import winreg
+
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                path, _ = winreg.QueryValueEx(key, "")
+        except OSError:
+            continue
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def _resolve_browser_executable(name: str) -> str | None:
+    """Find a specific browser's executable so a URL can be handed to it as an
+    argument. os.startfile can launch a browser by name but takes no
+    arguments, so opening a page in a NON-default browser needs the real path.
+
+    Checked in order: known non-default install locations (Opera/Opera GX/
+    Brave aren't always on PATH or registered), the registry, then PATH.
+    """
+    key = name.strip().lower()
+
+    resolved = _resolve_windows_app_executable(key)
+    if resolved:
+        return resolved
+
+    exe = _BROWSER_EXE_NAMES.get(key)
+    if not exe:
+        return None
+
+    resolved = _registry_app_path(exe)
+    if resolved:
+        return resolved
+
+    return shutil.which(exe)
+
+
 class OpenWebsiteSkill(BaseSkill):
     name = "open_website"
     description = (
         "Open a website in the user's browser on their PC. Use for 'open "
-        "YouTube', 'pull up GitHub', or to show the user a specific page. "
+        "YouTube', 'pull up GitHub', or to show the user a specific page. Pass "
+        "'browser' to open it in a specific browser instead of the system "
+        "default — needed for requests like 'open Instagram in Opera GX'. "
         "This only opens the page — it does not read it. To answer a question "
         "using the web, use web_search instead."
     )
@@ -90,7 +155,14 @@ class OpenWebsiteSkill(BaseSkill):
             "site": {
                 "type": "string",
                 "description": "URL or well-known site name, e.g. 'youtube' or 'https://news.ycombinator.com'.",
-            }
+            },
+            "browser": {
+                "type": "string",
+                "description": (
+                    "Optional. Open in this browser instead of the default, "
+                    "e.g. 'chrome', 'opera gx', 'firefox', 'edge', 'brave'."
+                ),
+            },
         },
         "required": ["site"],
     }
@@ -106,9 +178,15 @@ class OpenWebsiteSkill(BaseSkill):
         "maps": "https://maps.google.com",
         "drive": "https://drive.google.com",
         "calendar": "https://calendar.google.com",
+        "instagram": "https://instagram.com",
+        "facebook": "https://facebook.com",
+        "whatsapp": "https://web.whatsapp.com",
+        "discord": "https://discord.com/app",
+        "linkedin": "https://linkedin.com",
+        "tiktok": "https://tiktok.com",
     }
 
-    def run(self, site: str) -> str:
+    def run(self, site: str, browser: str = "") -> str:
         key = site.strip().lower()
         raw = self.KNOWN.get(key, site.strip())
 
@@ -117,6 +195,20 @@ class OpenWebsiteSkill(BaseSkill):
         url = _to_web_url(raw)
         if url is None:
             return f"'{site}' isn't a web address I can open."
+
+        if browser:
+            exe = _resolve_browser_executable(browser)
+            if exe:
+                try:
+                    subprocess.Popen([exe, url], shell=False)
+                    return f"Opening {urllib.parse.urlparse(url).netloc} in {browser}."
+                except OSError as e:
+                    return f"Found {browser} but couldn't launch it: {e}"
+            webbrowser.open(url)
+            return (
+                f"I couldn't find '{browser}' installed, so I opened "
+                f"{urllib.parse.urlparse(url).netloc} in your default browser instead."
+            )
 
         webbrowser.open(url)
         return f"Opening {urllib.parse.urlparse(url).netloc}."
@@ -178,33 +270,16 @@ class WebSearchSkill(BaseSkill):
                 "or point BASE_URL at Gemini."
             )
 
-        payload = {
-            "model": config.MODEL,
-            "input": (
+        try:
+            answer = gemini_generate(
                 "Answer the following question accurately using Google Search. "
                 "Be concise and retain the source citations in your answer.\n\n"
-                + query
-            ),
-            "tools": [{"type": "google_search"}],
-        }
-        try:
-            response = requests.post(
-                f"https://{GEMINI_HOST}/v1beta/interactions",
-                headers={"x-goog-api-key": key},
-                json=payload,
-                timeout=30,
+                + query,
+                key,
+                grounded=True,
             )
-        except requests.Timeout:
-            return "Google Search did not respond in time."
-        except requests.RequestException as exc:
-            return f"I couldn't reach Google Search: {exc}"
-
-        if response.status_code != 200:
-            return f"Google Search could not complete that request (status {response.status_code})."
-        try:
-            answer = _grounded_answer(response.json())
-        except ValueError as exc:
-            return f"Google Search returned an unreadable response: {exc}"
+        except RuntimeError as exc:
+            return str(exc)
         return answer or "Google Search returned no usable answer."
 
 
@@ -298,6 +373,49 @@ class WeatherSkill(BaseSkill):
         if resp.status_code == 200:
             return resp.text.strip()
         return f"I couldn't fetch the weather for {city} (status {resp.status_code})."
+
+
+# Only used when the caller passes no explicit model — e.g. an explicit
+# GOOGLE_API_KEY set alongside a non-Gemini primary provider, where
+# config.MODEL names a model this endpoint has never heard of.
+_DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+
+
+def _gemini_model() -> str:
+    return config.MODEL if "gemini" in config.MODEL.lower() else _DEFAULT_GEMINI_MODEL
+
+
+def gemini_generate(prompt: str, key: str, grounded: bool = True, model: str | None = None) -> str:
+    """Call Gemini, optionally with Google Search grounding, and return the
+    text answer. Raises RuntimeError with a user-facing message on failure.
+
+    Shared by WebSearchSkill and the deep_learn research pipeline (core.research)
+    so both speak to the same endpoint the same way — deep_learn's plain
+    (non-grounded) calls for topic decomposition and self-checking reuse this
+    rather than standing up a second HTTP client.
+    """
+    payload = {"model": model or _gemini_model(), "input": prompt}
+    if grounded:
+        payload["tools"] = [{"type": "google_search"}]
+
+    try:
+        response = requests.post(
+            f"https://{GEMINI_HOST}/v1beta/interactions",
+            headers={"x-goog-api-key": key},
+            json=payload,
+            timeout=30,
+        )
+    except requests.Timeout:
+        raise RuntimeError("Google did not respond in time.")
+    except requests.RequestException as exc:
+        raise RuntimeError(f"I couldn't reach Google: {exc}")
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Google could not complete that request (status {response.status_code}).")
+    try:
+        return _grounded_answer(response.json())
+    except ValueError as exc:
+        raise RuntimeError(f"Google returned an unreadable response: {exc}")
 
 
 def _grounded_answer(payload: dict) -> str:

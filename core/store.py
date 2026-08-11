@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS memories (
     ts    REAL NOT NULL,
     text  TEXT NOT NULL UNIQUE
 );
+
+CREATE TABLE IF NOT EXISTS knowledge_topics (
+    topic       TEXT PRIMARY KEY,
+    subtopics   TEXT NOT NULL,          -- JSON list of strings
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL NOT NULL
+);
 """
 
 
@@ -179,6 +186,37 @@ class Store:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # -- knowledge (deep_learn manifest) ------------------------------------
+
+    def record_knowledge_topic(self, topic: str, subtopics: list[str], chunk_count: int) -> None:
+        """Upsert a topic's manifest row. chunk_count is the running total
+        stored in the vector DB, not just what this call added."""
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO knowledge_topics (topic, subtopics, chunk_count, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(topic) DO UPDATE SET
+                       subtopics = excluded.subtopics,
+                       chunk_count = excluded.chunk_count,
+                       updated_at = excluded.updated_at""",
+                (topic, json.dumps(subtopics), chunk_count, time.time()),
+            )
+            self._conn.commit()
+
+    def list_knowledge_topics(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT topic, subtopics, chunk_count, updated_at FROM knowledge_topics "
+                "ORDER BY updated_at DESC"
+            ).fetchall()
+
+    def get_knowledge_topic(self, topic: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT topic, subtopics, chunk_count, updated_at FROM knowledge_topics WHERE topic = ?",
+                (topic,),
+            ).fetchone()
 
     # -- migration ---------------------------------------------------------
 
