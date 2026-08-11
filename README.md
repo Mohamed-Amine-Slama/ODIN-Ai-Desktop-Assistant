@@ -5,8 +5,7 @@ understand you and calls real "skills" to control your PC — opening apps,
 checking system stats, reading your screen, searching the web, volume, power
 controls, notes, reminders, and durable memory.
 
-Works with **Anthropic (Claude)** or any **OpenAI-compatible endpoint**
-(Alibaba Cloud DashScope / Qwen, OpenRouter, OpenAI itself).
+Works with **Google Gemini API** (via OpenAI-compatible endpoint).
 
 ## 1. Install
 
@@ -32,29 +31,14 @@ pip install -r requirements-voice.txt
 copy .env.example .env
 ```
 
-Edit `.env` and set your provider. The two common setups:
+Edit `.env` and set your Google Gemini API key:
 
 ```ini
-# Alibaba Cloud DashScope / Qwen
-DASHSCOPE_API_KEY=sk-...
-DASHSCOPE_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-DASHSCOPE_MODEL=qwen-max
-LLM_PROVIDER=openai
+# Google Gemini API
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+GEMINI_MODEL=gemini-3.6-flash
 ```
-
-```ini
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-CLAUDE_MODEL=claude-opus-5
-LLM_PROVIDER=anthropic
-```
-
-**Provider differences worth knowing:** web search and web fetch run on
-Anthropic's servers, so they're only available on the Anthropic path. On an
-OpenAI-compatible endpoint Jarvis knows it has no web access and says so
-instead of guessing. Prompt caching and adaptive thinking are likewise
-Claude-only. Everything else — all local skills, vision, memory, voice — works
-identically on both.
 
 ## 3. Run
 

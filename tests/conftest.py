@@ -114,6 +114,9 @@ def openai_chunk(content: str | None = None, tool_call=None, finish_reason=None)
     )
 
 
+import json
+
+
 class _FakeCompletions:
     def __init__(self, script):
         self.script = list(script)
@@ -123,14 +126,46 @@ class _FakeCompletions:
         self.calls.append(kwargs)
         if not self.script:
             raise AssertionError("FakeOpenAIClient ran out of scripted responses")
-        return iter(self.script.pop(0))
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, list):
+            return iter(item)
+
+        chunks = []
+        stop_reason = getattr(item, "stop_reason", "end_turn")
+        finish_reason = "stop" if stop_reason == "end_turn" else stop_reason
+
+        content = getattr(item, "content", [])
+        if not content:
+            chunks.append(openai_chunk(finish_reason=finish_reason))
+        else:
+            for b in content:
+                b_type = getattr(b, "type", None)
+                if b_type == "text":
+                    chunks.append(openai_chunk(content=getattr(b, "text", ""), finish_reason=finish_reason))
+                elif b_type == "tool_use":
+                    name = getattr(b, "name", "")
+                    tool_input = getattr(b, "input", {})
+                    b_id = getattr(b, "id", "call_1")
+                    tc = SimpleNamespace(
+                        index=0,
+                        id=b_id,
+                        function=SimpleNamespace(name=name, arguments=json.dumps(tool_input))
+                    )
+                    chunks.append(SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                finish_reason="tool_calls",
+                                delta=SimpleNamespace(content=None, tool_calls=[tc])
+                            )
+                        ]
+                    ))
+        return iter(chunks)
 
 
 class FakeOpenAIClient:
-    """Mimics openai.OpenAI closely enough for Brain to take the OpenAI path.
-
-    Brain detects that path via `hasattr(client, "chat")`.
-    """
+    """Mimics openai.OpenAI closely enough for Brain to take the OpenAI path."""
 
     def __init__(self, script):
         self.chat = SimpleNamespace(completions=_FakeCompletions(script))
@@ -141,16 +176,14 @@ def make_brain(monkeypatch):
     """Build a Brain wired to a scripted fake client."""
     import config
 
-    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "test-key", raising=False)
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test-key", raising=False)
+    monkeypatch.setattr(config, "API_KEY", "test-key", raising=False)
     monkeypatch.setattr(config, "DEBUG", False, raising=False)
 
     from core.brain import Brain
 
     def _make(script, confirm=None, on_text=None, store=None):
-        client = FakeClient(script)
+        client = FakeOpenAIClient(script)
         brain = Brain(client=client, confirm=confirm, on_text=on_text, store=store)
-        brain.client = client
         return brain
 
     return _make

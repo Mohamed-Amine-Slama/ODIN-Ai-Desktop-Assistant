@@ -173,17 +173,17 @@ def test_conversation_is_saved_and_restored(store, make_brain):
 def test_only_committed_turns_are_persisted(store, make_brain):
     """A turn that blew up mid-flight must not leave a broken conversation on
     disk any more than it does in memory."""
-    import anthropic
+    import openai
 
     brain = make_brain(
         [
             response([tool_use_block("get_time_date", {})], stop_reason="tool_use"),
-            anthropic.APIConnectionError(request=None),
+            openai.APIConnectionError(request=None),
         ],
         store=store,
     )
 
-    with pytest.raises(anthropic.APIConnectionError):
+    with pytest.raises(openai.APIConnectionError):
         brain.ask("what time is it")
 
     assert store.recent_messages() == []

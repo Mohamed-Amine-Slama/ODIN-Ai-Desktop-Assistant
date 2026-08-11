@@ -4,7 +4,7 @@ The headline test is test_history_survives_midturn_failure — that's the
 regression guard for the bug where an exception between a tool_use block and
 its tool_result left history permanently invalid, 400ing every later request.
 """
-import anthropic
+import openai
 import pytest
 
 from conftest import response, text_block, tool_use_block
@@ -48,7 +48,7 @@ def test_history_survives_midturn_failure(make_brain):
     brain = make_brain(
         [
             response([tool_use_block("get_time_date", {})], stop_reason="tool_use"),
-            anthropic.APIConnectionError(request=None),
+            openai.APIConnectionError(request=None),
             response([text_block("Recovered fine.")]),
         ]
     )
@@ -59,7 +59,7 @@ def test_history_survives_midturn_failure(make_brain):
     ]
     snapshot = list(brain.history)
 
-    with pytest.raises(anthropic.APIConnectionError):
+    with pytest.raises(openai.APIConnectionError):
         brain.ask("what time is it")
 
     # History is byte-identical to before the failed turn.
@@ -152,7 +152,7 @@ def test_pause_turn_resumes_without_extra_message(make_brain):
     )
 
     assert brain.ask("search the web") == "Found it."
-    second_call = brain.client.messages.calls[1]
+    second_call = brain.client.chat.completions.calls[1]
     assert second_call["messages"][-1]["role"] == "assistant"
 
 

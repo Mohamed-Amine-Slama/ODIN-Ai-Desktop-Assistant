@@ -11,47 +11,22 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# --- LLM Provider Settings ------------------------------------------------
+# --- LLM Provider Settings (Gemini API) -----------------------------------
 API_KEY = (
-    os.getenv("API_KEY")
-    or os.getenv("DASHSCOPE_API_KEY")
-    or os.getenv("OPENAI_API_KEY")
-    or os.getenv("OPENROUTER_API_KEY")
-    or os.getenv("ANTHROPIC_API_KEY", "")
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("API_KEY", "")
 )
 
 BASE_URL = (
-    os.getenv("BASE_URL")
-    or os.getenv("DASHSCOPE_BASE_URL")
-    or os.getenv("OPENAI_BASE_URL")
-    or os.getenv("OPENROUTER_BASE_URL", "")
+    os.getenv("GEMINI_BASE_URL")
+    or os.getenv("BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 )
 
 MODEL = (
-    os.getenv("MODEL")
-    or os.getenv("DASHSCOPE_MODEL")
-    or os.getenv("OPENAI_MODEL")
-    or os.getenv("OPENROUTER_MODEL")
-    or os.getenv("CLAUDE_MODEL", "qwen-max")
+    os.getenv("GEMINI_MODEL")
+    or os.getenv("MODEL", "gemini-3.6-flash")
 )
 
-_provider_env = os.getenv("LLM_PROVIDER", "").lower()
-if _provider_env in ("openai", "dashscope", "alibaba", "qwen"):
-    LLM_PROVIDER = "openai"
-elif _provider_env in ("anthropic", "claude"):
-    LLM_PROVIDER = "anthropic"
-elif "compatible-mode" in BASE_URL or "aliyuncs.com" in BASE_URL or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY"):
-    LLM_PROVIDER = "openai"
-elif "openrouter.ai" in BASE_URL and os.getenv("OPENROUTER_API_KEY"):
-    LLM_PROVIDER = "anthropic"
-else:
-    LLM_PROVIDER = "openai" if BASE_URL else "anthropic"
-
-# Backward compatibility aliases
-OPENROUTER_API_KEY = API_KEY
-ANTHROPIC_API_KEY = API_KEY
-OPENROUTER_BASE_URL = BASE_URL
-CLAUDE_MODEL = MODEL
 
 # low | medium | high | xhigh | max. "low" keeps a voice assistant snappy:
 # fewer, more consolidated tool calls and terser replies.

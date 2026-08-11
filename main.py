@@ -16,8 +16,6 @@ Commands (work in either mode):
 """
 import sys
 
-import anthropic
-
 import config
 from core.brain import Brain, friendly_error
 from core.scheduler import ReminderScheduler
@@ -229,9 +227,6 @@ def main() -> None:
             reply = brain.ask(text)
         except KeyboardInterrupt:
             print("\n[interrupted]")
-            continue
-        except anthropic.APIError as e:
-            speaker.say(friendly_error(e))
             continue
         except Exception as e:  # noqa: BLE001 - never kill the loop
             speaker.say(friendly_error(e))

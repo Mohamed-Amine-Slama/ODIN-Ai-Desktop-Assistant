@@ -1,4 +1,4 @@
-"""The 'brain': sends user input to LLM providers (Anthropic or OpenAI-compatible like Alibaba Cloud DashScope / Qwen),
+"""The 'brain': sends user input to Google Gemini API (via OpenAI-compatible endpoint),
 lets it call skills as tools, and returns a final spoken/printed reply.
 
 Key invariant: `self.history` is only ever replaced by a *well-formed*
@@ -7,7 +7,6 @@ on success. If anything throws mid-turn, the working copy is discarded.
 """
 import json
 from types import SimpleNamespace
-import anthropic
 import openai
 
 import config
@@ -93,7 +92,7 @@ def _confirm_always(skill, tool_input) -> bool:  # noqa: ARG001
 class Brain:
     def __init__(self, client=None, confirm=None, on_text=None, store=None):
         """
-        client:  an anthropic.Anthropic or openai.OpenAI (injected for testing)
+        client:  an openai.OpenAI or mock client (injected for testing)
         confirm: callable(skill, tool_input) -> bool, asks the user to approve
                  a destructive action
         on_text: callable(str), called with each complete sentence as it
@@ -103,19 +102,12 @@ class Brain:
         """
         if client is not None:
             self.client = client
-            self.is_openai = hasattr(client, "chat")
-        elif config.LLM_PROVIDER == "openai":
+        else:
             self.client = openai.OpenAI(
                 api_key=config.API_KEY,
                 base_url=config.BASE_URL or None,
             )
-            self.is_openai = True
-        else:
-            self.client = anthropic.Anthropic(
-                api_key=config.API_KEY,
-                base_url=config.BASE_URL or None,
-            )
-            self.is_openai = False
+        self.is_openai = True
 
         self.skills = SkillManager()
         self.confirm = confirm or _confirm_always
@@ -132,11 +124,8 @@ class Brain:
         self.spoke_during_last_turn = False
 
     def _available_tool_names(self) -> set[str]:
-        """Tool names this provider will actually be given. The Anthropic-hosted
-        server tools are absent on an OpenAI-compatible endpoint."""
-        if self.is_openai:
-            return {t["function"]["name"] for t in self.skills.openai_tool_definitions()}
-        return {t["name"] for t in self.skills.tool_definitions()}
+        """Tool names given to the model."""
+        return {t["function"]["name"] for t in self.skills.openai_tool_definitions()}
 
     # -- public API --------------------------------------------------------
 
@@ -229,44 +218,7 @@ class Brain:
         return fallback, working
 
     def _call_model(self, working: list[dict]):
-        if self.is_openai:
-            return self._call_openai_model(working)
-        return self._call_anthropic_model(working)
-
-    def _call_anthropic_model(self, working: list[dict]):
-        kwargs = dict(
-            model=config.MODEL,
-            max_tokens=config.MAX_TOKENS,
-            system=self._system_blocks(),
-            tools=self.skills.tool_definitions(),
-            messages=self._cached(working),
-        )
-        if "claude" in config.MODEL.lower():
-            kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["output_config"] = {"effort": config.EFFORT}
-
-        with self.client.messages.stream(**kwargs) as stream:
-            if self.on_text is not None:
-                buffer = ""
-                for chunk in stream.text_stream:
-                    buffer += chunk
-                    buffer, done = _drain_sentences(buffer)
-                    for sentence in done:
-                        self.spoke_during_last_turn = True
-                        self.on_text(sentence)
-                if buffer.strip():
-                    self.spoke_during_last_turn = True
-                    self.on_text(buffer.strip())
-            response = stream.get_final_message()
-
-        self.last_usage = response.usage
-        if config.DEBUG:
-            u = response.usage
-            print(
-                f"[usage] in={u.input_tokens} out={u.output_tokens} "
-                f"stop={response.stop_reason}"
-            )
-        return response
+        return self._call_openai_model(working)
 
     def _call_openai_model(self, working: list[dict]):
         messages = [{"role": "system", "content": self.system_prompt}]
@@ -407,44 +359,6 @@ class Brain:
             usage=SimpleNamespace(input_tokens=0, output_tokens=0)
         )
 
-    def _system_blocks(self) -> list[dict]:
-        """Render order is tools -> system -> messages, so a breakpoint on the
-        last system block caches the tool schemas AND the system prompt.
-
-        self.system_prompt is built once in __init__ and never mutated — a
-        prompt that changes between turns invalidates the whole cached prefix.
-        """
-        return [
-            {
-                "type": "text",
-                "text": self.system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-
-    @staticmethod
-    def _cached(working: list[dict]) -> list[dict]:
-        if not working:
-            return working
-
-        out = list(working)
-        last = dict(out[-1])
-        content = last.get("content")
-
-        if isinstance(content, str):
-            last["content"] = [
-                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-            ]
-        elif isinstance(content, list) and content and isinstance(content[-1], dict):
-            blocks = [dict(b) if isinstance(b, dict) else b for b in content]
-            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
-            last["content"] = blocks
-        else:
-            return out
-
-        out[-1] = last
-        return out
-
     def _run_tools(self, response) -> list[dict]:
         results = []
         for block in response.content:
@@ -551,16 +465,16 @@ def _drain_sentences(buffer: str) -> tuple[str, list[str]]:
 
 
 def friendly_error(exc: Exception) -> str:
-    if isinstance(exc, (anthropic.AuthenticationError, openai.AuthenticationError)):
+    if isinstance(exc, openai.AuthenticationError):
         return "My API key was rejected. Please check your API key in the .env file."
-    if isinstance(exc, (anthropic.NotFoundError, openai.NotFoundError)):
+    if isinstance(exc, openai.NotFoundError):
         return f"The model '{config.MODEL}' was not found. Check MODEL in .env."
-    if isinstance(exc, (anthropic.RateLimitError, openai.RateLimitError)):
+    if isinstance(exc, openai.RateLimitError):
         return "I'm being rate limited. Give me a moment and try again."
-    if isinstance(exc, (anthropic.APIStatusError, openai.APIStatusError)):
+    if isinstance(exc, openai.APIStatusError):
         if getattr(exc, "status_code", 0) >= 500:
             return "The API provider is having trouble. Try again in a moment."
         return f"The API rejected that request: {exc}"
-    if isinstance(exc, (anthropic.APIConnectionError, openai.APIConnectionError)):
+    if isinstance(exc, openai.APIConnectionError):
         return "I can't reach the network right now."
     return f"Something went wrong: {exc}"
