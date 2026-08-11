@@ -21,10 +21,12 @@ from core.brain import Brain, friendly_error
 from core.scheduler import ReminderScheduler
 from core.speech_output import SpeechOutput
 from core.store import get_store
+from core.undo import get_journal, prune_trash
 
 COMMANDS = """Commands:
   /mode voice   switch to voice mode
   /mode text    switch to text mode
+  /undo         reverse the last undoable action
   /reset        clear conversation memory (including saved history)
   /forget       same as /reset
   /help         show this list
@@ -130,7 +132,7 @@ class Session:
         """Ask before running a destructive skill. Defaults to NO — a misheard
         'shut down' should never take the machine down on silence or on an
         answer we couldn't parse."""
-        question = skill.confirmation_prompt(**tool_input)
+        question = skill.consequence(**tool_input)
         self.speaker.say(question)
         self.speaker.wait(timeout=20)
 
@@ -151,6 +153,16 @@ class Session:
         except EOFError:
             return False
 
+    def announce(self, skill, tool_input, outcome) -> None:
+        """Report a completed MODERATE action. Only offers undo when the action
+        genuinely recorded one, so the prompt never promises what it can't do."""
+        if outcome.undo_token:
+            entry = get_journal().latest()
+            what = entry.description if entry else "that"
+            print(f"  [done] {skill.name} — /undo to reverse: {what}")
+        else:
+            print(f"  [done] {skill.name} (cannot be undone)")
+
 
 def handle_command(cmd: str, brain: Brain, session: Session) -> None:
     cmd = cmd.strip().lower()
@@ -158,6 +170,16 @@ def handle_command(cmd: str, brain: Brain, session: Session) -> None:
         print("Goodbye.")
         session.shutdown()
         sys.exit(0)
+    if cmd == "/undo":
+        entry = get_journal().latest()
+        if entry is None:
+            print("There's nothing to undo.")
+            return
+        try:
+            print(get_journal().undo(entry.token))
+        except Exception as e:
+            print(f"I couldn't undo that: {e}")
+        return
     if cmd in ("/reset", "/forget"):
         brain.reset()
         print("Conversation memory cleared (notes and reminders kept).")
@@ -176,6 +198,7 @@ def handle_command(cmd: str, brain: Brain, session: Session) -> None:
 
 def main() -> None:
     config.ensure_dirs()
+    prune_trash()
 
     problem = config.missing_key_message()
     if problem:
@@ -188,7 +211,12 @@ def main() -> None:
 
     # Speech is driven by the brain's streaming callback, so sentences are
     # spoken as they generate rather than after the whole reply lands.
-    brain = Brain(confirm=session.confirm, on_text=speaker.say, store=store)
+    brain = Brain(
+        confirm=session.confirm,
+        on_text=speaker.say,
+        store=store,
+        on_action=session.announce,
+    )
     restored = brain.load_history()
 
     # Fire anything that came due while Jarvis was closed, then keep polling.
@@ -240,4 +268,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--gui" in sys.argv:
+        from app import main as gui_main
+        gui_main()
+    else:
+        main()

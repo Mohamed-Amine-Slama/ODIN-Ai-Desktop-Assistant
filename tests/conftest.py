@@ -181,9 +181,9 @@ def make_brain(monkeypatch):
 
     from core.brain import Brain
 
-    def _make(script, confirm=None, on_text=None, store=None):
+    def _make(script, confirm=None, on_text=None, store=None, on_action=None):
         client = FakeOpenAIClient(script)
-        brain = Brain(client=client, confirm=confirm, on_text=on_text, store=store)
+        brain = Brain(client=client, confirm=confirm, on_text=on_text, store=store, on_action=on_action)
         return brain
 
     return _make

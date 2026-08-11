@@ -5,6 +5,8 @@ import sys
 
 import psutil
 
+import config
+from core.risk import Risk
 from .base_skill import BaseSkill
 
 IS_WINDOWS = sys.platform == "win32"
@@ -14,6 +16,13 @@ IS_WINDOWS = sys.platform == "win32"
 APP_ALIASES = {
     "chrome": "chrome",
     "google chrome": "chrome",
+    "opera": "opera",
+    "opera gx": "opera gx",
+    "operagx": "opera gx",
+    "brave": "brave",
+    "edge": "msedge",
+    "microsoft edge": "msedge",
+    "firefox": "firefox",
     "notepad": "notepad",
     "calculator": "calc",
     "word": "winword",
@@ -52,18 +61,51 @@ def _stem(process_name: str) -> str:
     return os.path.splitext(process_name or "")[0].strip().lower()
 
 
+def _resolve_windows_app_executable(app_key: str) -> str | None:
+    """Check common Windows install paths for applications like Opera GX, Opera, Brave."""
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+    app_data = os.environ.get("APPDATA", "")
+
+    search_candidates = []
+    if "opera gx" in app_key or "operagx" in app_key:
+        search_candidates.extend([
+            os.path.join(local_app_data, "Programs", "Opera GX", "launcher.exe"),
+            os.path.join(program_files, "Opera GX", "launcher.exe"),
+            os.path.join(program_files_x86, "Opera GX", "launcher.exe"),
+            os.path.join(app_data, "Microsoft", "Windows", "Start Menu", "Programs", "Opera GX Browser.lnk"),
+        ])
+    elif "opera" in app_key:
+        search_candidates.extend([
+            os.path.join(local_app_data, "Programs", "Opera", "launcher.exe"),
+            os.path.join(program_files, "Opera", "launcher.exe"),
+            os.path.join(program_files_x86, "Opera", "launcher.exe"),
+        ])
+    elif "brave" in app_key:
+        search_candidates.extend([
+            os.path.join(program_files, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        ])
+
+    for path in search_candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
 class OpenAppSkill(BaseSkill):
     name = "open_app"
     description = (
         "Open/launch an application on the user's Windows PC, e.g. Chrome, "
-        "Notepad, Spotify, Word, Calculator, File Explorer, Task Manager."
+        "Opera GX, Notepad, Spotify, Word, Calculator, File Explorer, Task Manager."
     )
     input_schema = {
         "type": "object",
         "properties": {
             "app_name": {
                 "type": "string",
-                "description": "Name of the application to open, e.g. 'chrome' or 'notepad'.",
+                "description": "Name of the application to open, e.g. 'chrome', 'opera gx', 'notepad'.",
             }
         },
         "required": ["app_name"],
@@ -92,13 +134,31 @@ class OpenAppSkill(BaseSkill):
         except OSError:
             pass
 
-        # Fallback for executables on PATH that ShellExecute won't resolve.
-        # shell=False with an argument list: no shell, no injection.
+        # Fallback for executables on PATH that ShellExecute won't resolve directly.
         try:
             subprocess.Popen([target], shell=False)
             return f"Opening {app_name}."
-        except Exception as e:
-            return f"I couldn't open {app_name}: {e}"
+        except Exception:
+            pass
+
+        # Check known path resolution (Opera GX, Opera, Brave, etc.)
+        resolved = _resolve_windows_app_executable(key)
+        if resolved:
+            try:
+                os.startfile(resolved)
+                return f"Opening {app_name}."
+            except Exception:
+                try:
+                    subprocess.Popen([resolved], shell=False)
+                    return f"Opening {app_name}."
+                except Exception as e:
+                    return f"Found {app_name} at {resolved} but couldn't launch it: {e}"
+
+        return (
+            f"Could not launch '{app_name}'. If this is a web browser task, use "
+            f"`open_website` to open the URL directly in the default browser."
+        )
+
 
 
 class CloseAppSkill(BaseSkill):
@@ -120,9 +180,9 @@ class CloseAppSkill(BaseSkill):
         },
         "required": ["app_name"],
     }
-    requires_confirmation = True
+    risk = Risk.DANGEROUS
 
-    def confirmation_prompt(self, app_name: str = "", **_) -> str:
+    def consequence(self, app_name: str = "", **_) -> str:
         return f"Close all '{app_name}' processes?"
 
     def run(self, app_name: str) -> str:
@@ -258,10 +318,12 @@ class PowerControlSkill(BaseSkill):
         "lock": ["rundll32.exe", "user32.dll,LockWorkStation"],
     }
 
-    def needs_confirmation(self, action: str = "", **_) -> bool:
-        return action in self.DESTRUCTIVE
+    def risk_for(self, action: str = "", **_) -> Risk:
+        # Only the irreversible ones. Gating 'lock' and 'sleep' would just be
+        # annoying — they cost the user nothing.
+        return Risk.DANGEROUS if action in self.DESTRUCTIVE else Risk.MODERATE
 
-    def confirmation_prompt(self, action: str = "", **_) -> str:
+    def consequence(self, action: str = "", **_) -> str:
         return f"Really {action} the PC?"
 
     def run(self, action: str) -> str:

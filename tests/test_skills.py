@@ -2,6 +2,8 @@
 import pytest
 
 from conftest import response, text_block, tool_use_block
+from core.risk import Risk
+from skills.base_skill import SkillOutcome
 from skills.skill_manager import SKILL_CLASSES, SkillManager
 from skills.system_skills import CloseAppSkill, PowerControlSkill
 from skills.utility_skills import CalculatorSkill
@@ -50,27 +52,54 @@ def test_tool_names_are_unique():
 
 def test_execute_reports_errors():
     manager = SkillManager()
-    content, is_error = manager.execute("nope", {})
-    assert is_error is True
-    assert "Unknown skill" in content
+    outcome = manager.execute("nope", {})
+    assert outcome.is_error is True
+    assert "Unknown skill" in outcome.content
 
 
 def test_execute_reports_bad_arguments():
     manager = SkillManager()
-    content, is_error = manager.execute("calculate", {"wrong_arg": 1})
-    assert is_error is True
-    assert "Invalid arguments" in content
+    outcome = manager.execute("calculate", {"wrong_arg": 1})
+    assert outcome.is_error is True
+    assert "Invalid arguments" in outcome.content
 
 
-# -- confirmation gate -----------------------------------------------------
+# -- risk & confirmation gate -----------------------------------------------
 
-def test_shutdown_requires_confirmation():
+def test_power_control_risk_by_action():
     skill = PowerControlSkill()
-    assert skill.needs_confirmation(action="shutdown") is True
-    assert skill.needs_confirmation(action="restart") is True
+    assert skill.risk_for(action="shutdown") == Risk.DANGEROUS
+    assert skill.risk_for(action="restart") == Risk.DANGEROUS
     # Reversible actions shouldn't nag.
-    assert skill.needs_confirmation(action="lock") is False
-    assert skill.needs_confirmation(action="sleep") is False
+    assert skill.risk_for(action="lock") == Risk.MODERATE
+    assert skill.risk_for(action="sleep") == Risk.MODERATE
+
+
+def test_close_app_is_dangerous():
+    assert CloseAppSkill().risk_for(app_name="chrome") == Risk.DANGEROUS
+
+
+def test_default_skill_risk_is_safe():
+    assert CalculatorSkill().risk_for(expression="1+1") == Risk.SAFE
+
+
+def test_consequence_is_human_readable():
+    text = PowerControlSkill().consequence(action="shutdown")
+    assert "shutdown" in text.lower()
+
+
+def test_execute_returns_a_skill_outcome():
+    outcome = SkillManager().execute("calculate", {"expression": "2+2"})
+    assert isinstance(outcome, SkillOutcome)
+    assert "4" in outcome.content
+    assert outcome.is_error is False
+    assert outcome.undo_token is None
+
+
+def test_execute_reports_errors_on_the_outcome():
+    outcome = SkillManager().execute("nope", {})
+    assert outcome.is_error is True
+    assert "Unknown skill" in outcome.content
 
 
 def test_declining_shutdown_does_not_execute(make_brain, monkeypatch):
@@ -121,10 +150,6 @@ def test_approving_shutdown_executes(make_brain, monkeypatch):
     brain.ask("shut down the pc")
 
     assert ran == [["shutdown", "/s", "/t", "5"]]
-
-
-def test_close_app_requires_confirmation():
-    assert CloseAppSkill().needs_confirmation(app_name="chrome") is True
 
 
 # -- close_app matching ----------------------------------------------------
@@ -186,3 +211,48 @@ def test_calculator_rejects_code_execution():
 
 def test_calculator_handles_divide_by_zero():
     assert "divides by zero" in CalculatorSkill().run(expression="1 / 0")
+
+
+"""The undo-honesty check.
+
+Every skill either can reverse itself and says so, or cannot and stays silent.
+A skill that gains or loses undo support without its description being updated
+is exactly the drift this test exists to catch.
+"""
+REVERSIBLE_SKILLS = {
+    "write_file",
+    "make_dir",
+    "move_file",
+    "delete_file",
+    "focus_window",
+    "set_window_state",
+}
+
+NEVER_REVERSIBLE = {
+    "run_command",
+    "type_text",
+    "press_keys",
+    "click",
+    "close_window",
+    "power_control",
+    "close_app",
+}
+
+
+def test_reversible_and_irreversible_sets_are_disjoint():
+    assert REVERSIBLE_SKILLS.isdisjoint(NEVER_REVERSIBLE)
+
+
+def test_every_declared_skill_is_registered():
+    registered = set(SkillManager().skills)
+    for name in REVERSIBLE_SKILLS | NEVER_REVERSIBLE:
+        assert name in registered, f"{name} is not registered"
+
+
+def test_irreversible_skills_describe_themselves_honestly():
+    """If a skill cannot be undone, its description must say so — the model
+    relays that to the user before they agree to it."""
+    manager = SkillManager()
+    for name in ["run_command", "type_text", "press_keys", "click", "close_window"]:
+        description = manager.get(name).description.lower()
+        assert "undo" in description or "unsaved" in description, name

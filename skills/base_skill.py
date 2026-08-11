@@ -1,11 +1,28 @@
 """Base class every skill must implement. Adding a new skill is just
 subclassing this and registering it in skill_manager.py's SKILL_CLASSES list."""
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Union
+
+from core.risk import Risk
 
 # A skill returns either a plain string, or a list of Anthropic content blocks
 # (used by e.g. the screenshot skill to hand an image back to the model).
 SkillResult = Union[str, list[dict]]
+
+
+@dataclass
+class SkillOutcome:
+    """What running a skill produced.
+
+    undo_token is set only when the action can genuinely be reversed — the
+    caller uses its presence to decide whether to offer an undo affordance,
+    so a skill that cannot undo must leave it None rather than lie.
+    """
+
+    content: SkillResult
+    is_error: bool = False
+    undo_token: str | None = None
 
 
 class BaseSkill(ABC):
@@ -18,9 +35,9 @@ class BaseSkill(ABC):
     # JSON schema for the parameters this skill accepts (Anthropic tool format)
     input_schema: dict = {"type": "object", "properties": {}, "required": []}
 
-    # When True, the brain asks the user before running this skill. Use for
-    # anything hard to undo — shutting down, killing processes, deleting files.
-    requires_confirmation: bool = False
+    # How much friction this skill's actions deserve. Nothing is ever blocked;
+    # this only decides silent / undoable / ask-first.
+    risk: Risk = Risk.SAFE
 
     @abstractmethod
     def run(self, **kwargs) -> SkillResult:
@@ -28,14 +45,14 @@ class BaseSkill(ABC):
         user (this gets read out loud / printed)."""
         raise NotImplementedError
 
-    def needs_confirmation(self, **kwargs) -> bool:
-        """Per-call override. Lets a skill gate only its dangerous arguments —
-        e.g. power_control confirms 'shutdown' but not 'lock'."""
-        return self.requires_confirmation
+    def risk_for(self, **kwargs) -> Risk:
+        """Per-call risk. Lets a skill gate only its dangerous arguments —
+        e.g. power_control asks before 'shutdown' but not before 'lock'."""
+        return self.risk
 
-    def confirmation_prompt(self, **kwargs) -> str:
-        """Human-readable description of what is about to happen, phrased as a
-        yes/no question for the user."""
+    def consequence(self, **kwargs) -> str:
+        """Plain-language description of what is about to happen, phrased as a
+        yes/no question."""
         return f"Run {self.name} with {kwargs}?"
 
     def to_tool_definition(self) -> dict:

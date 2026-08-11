@@ -1,0 +1,175 @@
+"""Tests for filesystem skills."""
+from pathlib import Path
+
+import pytest
+
+from core.risk import Risk
+from skills.file_skills import ListDirSkill, ReadFileSkill, SearchFilesSkill
+
+
+@pytest.fixture
+def tree(tmp_path):
+    (tmp_path / "notes.txt").write_text("hello world\nsecond line\n", encoding="utf-8")
+    (tmp_path / "invoice_2026.txt").write_text("total: 42 EUR\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "deep.txt").write_text("buried treasure\n", encoding="utf-8")
+    (tmp_path / "binary.bin").write_bytes(b"\x00\x01\x02\xff")
+    skipped = tmp_path / "node_modules"
+    skipped.mkdir()
+    (skipped / "junk.txt").write_text("treasure\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_read_file_is_safe_tier():
+    assert ReadFileSkill().risk_for(path="x") == Risk.SAFE
+
+
+def test_read_file_returns_content(tree):
+    out = ReadFileSkill().run(path=str(tree / "notes.txt"))
+    assert "hello world" in out
+
+
+def test_read_file_missing_path(tree):
+    out = ReadFileSkill().run(path=str(tree / "nope.txt"))
+    assert "no file" in out.lower()
+
+
+def test_read_file_refuses_binary(tree):
+    out = ReadFileSkill().run(path=str(tree / "binary.bin"))
+    assert "binary" in out.lower()
+
+
+def test_read_file_truncates(tree):
+    big = tree / "big.txt"
+    big.write_text("x" * 5000, encoding="utf-8")
+    out = ReadFileSkill().run(path=str(big), max_bytes=100)
+    assert "truncated" in out.lower()
+    assert len(out) < 1000
+
+
+def test_list_dir(tree):
+    out = ListDirSkill().run(path=str(tree))
+    assert "notes.txt" in out
+    assert "sub" in out
+
+
+def test_search_by_name(tree):
+    out = SearchFilesSkill().run(root=str(tree), pattern="invoice*")
+    assert "invoice_2026.txt" in out
+
+
+def test_search_by_content(tree):
+    out = SearchFilesSkill().run(root=str(tree), pattern="*.txt", contains="treasure")
+    assert "deep.txt" in out
+
+
+def test_search_skips_noise_directories(tree):
+    out = SearchFilesSkill().run(root=str(tree), pattern="*.txt", contains="treasure")
+    assert "node_modules" not in out
+
+
+def test_search_reports_no_matches(tree):
+    out = SearchFilesSkill().run(root=str(tree), pattern="*.nothing")
+    assert "no files" in out.lower()
+
+
+from core.undo import UndoJournal, get_journal, set_journal
+from skills.file_skills import DeleteFileSkill, MakeDirSkill, MoveFileSkill, WriteFileSkill
+
+
+@pytest.fixture
+def journal(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path / "jarvisdata"))
+    j = UndoJournal(max_age_seconds=900)
+    set_journal(j)
+    yield j
+    set_journal(None)
+
+
+def test_write_new_file_is_moderate(journal, tmp_path):
+    target = tmp_path / "new.txt"
+    assert WriteFileSkill().risk_for(path=str(target), content="x") == Risk.MODERATE
+
+
+def test_overwrite_is_dangerous(journal, tmp_path):
+    target = tmp_path / "existing.txt"
+    target.write_text("old", encoding="utf-8")
+    assert WriteFileSkill().risk_for(path=str(target), content="new") == Risk.DANGEROUS
+
+
+def test_write_under_sensitive_root_is_dangerous(journal, monkeypatch, tmp_path):
+    monkeypatch.setattr("core.risk.SENSITIVE_ROOTS", [tmp_path])
+    assert WriteFileSkill().risk_for(path=str(tmp_path / "x.txt"), content="y") == Risk.DANGEROUS
+
+
+def test_write_then_undo_removes_a_new_file(journal, tmp_path):
+    target = tmp_path / "new.txt"
+    WriteFileSkill().run(path=str(target), content="hello")
+    assert target.read_text(encoding="utf-8") == "hello"
+
+    get_journal().undo(get_journal().latest().token)
+    assert not target.exists()
+
+
+def test_overwrite_then_undo_restores_original_bytes(journal, tmp_path):
+    target = tmp_path / "doc.txt"
+    target.write_text("ORIGINAL", encoding="utf-8")
+
+    WriteFileSkill().run(path=str(target), content="REPLACED")
+    assert target.read_text(encoding="utf-8") == "REPLACED"
+
+    get_journal().undo(get_journal().latest().token)
+    assert target.read_text(encoding="utf-8") == "ORIGINAL"
+
+
+def test_delete_then_undo_restores(journal, tmp_path):
+    target = tmp_path / "gone.txt"
+    target.write_text("still here", encoding="utf-8")
+
+    DeleteFileSkill().run(path=str(target))
+    assert not target.exists()
+
+    get_journal().undo(get_journal().latest().token)
+    assert target.read_text(encoding="utf-8") == "still here"
+
+
+def test_delete_is_dangerous(journal, tmp_path):
+    assert DeleteFileSkill().risk_for(path=str(tmp_path / "x")) == Risk.DANGEROUS
+
+
+def test_move_then_undo_returns_the_file(journal, tmp_path):
+    src = tmp_path / "a.txt"
+    dst = tmp_path / "b.txt"
+    src.write_text("data", encoding="utf-8")
+
+    MoveFileSkill().run(src=str(src), dst=str(dst))
+    assert dst.exists() and not src.exists()
+
+    get_journal().undo(get_journal().latest().token)
+    assert src.read_text(encoding="utf-8") == "data"
+    assert not dst.exists()
+
+
+def test_move_onto_existing_is_dangerous(journal, tmp_path):
+    src = tmp_path / "a.txt"
+    dst = tmp_path / "b.txt"
+    src.write_text("a", encoding="utf-8")
+    dst.write_text("b", encoding="utf-8")
+    assert MoveFileSkill().risk_for(src=str(src), dst=str(dst)) == Risk.DANGEROUS
+
+
+def test_make_dir_then_undo(journal, tmp_path):
+    target = tmp_path / "fresh"
+    MakeDirSkill().run(path=str(target))
+    assert target.is_dir()
+
+    get_journal().undo(get_journal().latest().token)
+    assert not target.exists()
+
+
+def test_delete_missing_file_records_no_undo(journal, tmp_path):
+    out = DeleteFileSkill().run(path=str(tmp_path / "ghost.txt"))
+    assert "no file" in out.lower()
+    assert get_journal().latest() is None, "a no-op must not offer a fake undo"

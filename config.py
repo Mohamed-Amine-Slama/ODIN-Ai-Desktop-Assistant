@@ -11,25 +11,36 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# --- LLM Provider Settings (Gemini API) -----------------------------------
-API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("API_KEY", "")
+# --- LLM provider settings ------------------------------------------------
+# Anything that speaks the OpenAI chat-completions protocol works here: Gemini's
+# compatibility endpoint, OpenRouter, DashScope/Qwen, a local llama.cpp server.
+# API_KEY / BASE_URL / MODEL are the real names; the provider-prefixed ones are
+# accepted so an existing .env keeps working after a provider switch.
+def _first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+API_KEY = _first_env(
+    "API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "DASHSCOPE_API_KEY"
+)
+BASE_URL = _first_env(
+    "BASE_URL", "GEMINI_BASE_URL", "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "DASHSCOPE_BASE_URL",
+    default="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+MODEL = _first_env(
+    "MODEL", "GEMINI_MODEL", "OPENROUTER_MODEL", "OPENAI_MODEL", "DASHSCOPE_MODEL",
+    default="gemini-3.6-flash",
 )
 
-BASE_URL = (
-    os.getenv("GEMINI_BASE_URL")
-    or os.getenv("BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-)
 
-MODEL = (
-    os.getenv("GEMINI_MODEL")
-    or os.getenv("MODEL", "gemini-3.6-flash")
-)
-
-
-# low | medium | high | xhigh | max. "low" keeps a voice assistant snappy:
-# fewer, more consolidated tool calls and terser replies.
+# low | medium | high, or "off" for models that have no reasoning control.
+# "low" keeps a voice assistant snappy: fewer, more consolidated tool calls and
+# terser replies. Sending it to a model that doesn't take it is handled at the
+# request layer, which drops the parameter and retries once.
 EFFORT = os.getenv("EFFORT", "low")
 
 # Ceiling on thinking + response text combined, NOT a target length.
@@ -39,11 +50,32 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 # How many tool-use round trips before we give up on a single turn.
 MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "10"))
 
+# Bound active conversation context in long-running sessions. Persistent
+# history remains in SQLite; only the request working set is trimmed.
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "80"))
+MEMORY_CONTEXT_LIMIT = int(os.getenv("MEMORY_CONTEXT_LIMIT", "5"))
+
 # --- Behaviour ------------------------------------------------------------
-ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Jarvis")
+ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "ODIN")
 DEFAULT_MODE = os.getenv("DEFAULT_MODE", "text")  # "voice" or "text"
 CONFIRM_DESTRUCTIVE = os.getenv("CONFIRM_DESTRUCTIVE", "1") not in ("0", "false", "False")
 DEBUG = os.getenv("DEBUG", "0") not in ("0", "false", "False")
+
+# --- System access --------------------------------------------------------
+# Global hotkey that summons the HUD. Needs the optional `keyboard` package;
+# without it the orb and the tray icon are still there. Set to "off" to skip.
+HUD_HOTKEY = os.getenv("HUD_HOTKEY", "ctrl+alt+j")
+
+ENABLE_SHELL = os.getenv("ENABLE_SHELL", "1") not in ("0", "false", "False")
+ENABLE_INPUT_CONTROL = os.getenv("ENABLE_INPUT_CONTROL", "1") not in ("0", "false", "False")
+UNDO_WINDOW_SECONDS = float(os.getenv("UNDO_WINDOW_SECONDS", "900"))
+
+# HUD only: how long a confirmation banner waits before it defaults to "no".
+# Text mode blocks on input() and cannot honour a timeout, so this has no
+# effect there.
+CONFIRM_TIMEOUT_SECONDS = float(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120"))
+TRASH_MAX_ENTRIES = int(os.getenv("TRASH_MAX_ENTRIES", "200"))
+TRASH_MAX_AGE_DAYS = float(os.getenv("TRASH_MAX_AGE_DAYS", "7"))
 
 # --- Voice ----------------------------------------------------------------
 # Wake word. openWakeWord ships a pretrained "hey_jarvis" model, so this works

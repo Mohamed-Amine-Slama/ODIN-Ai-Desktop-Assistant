@@ -16,12 +16,18 @@ def test_server_tools_are_advertised():
     assert {"web_search", "web_fetch"} <= names
 
 
-def test_server_tools_are_not_local_skills():
-    """SkillManager must never try to execute a server-side tool."""
-    manager = SkillManager()
+def test_a_tool_name_is_never_declared_twice():
+    """web_fetch exists both as a local skill (for OpenAI-compatible providers,
+    which have no server-side tools) and as an Anthropic server tool. On the
+    Anthropic path only one of the two may reach the request — a duplicate tool
+    name is a hard 400."""
+    definitions = SkillManager().tool_definitions()
+    names = [t["name"] for t in definitions]
+    assert len(names) == len(set(names))
+
+    # The server-side implementation is the one that survives.
     for tool in SERVER_TOOLS:
-        assert manager.is_local(tool["name"]) is False
-        assert manager.get(tool["name"]) is None
+        assert tool in definitions
 
 
 def test_no_code_execution_tool_declared():
@@ -181,3 +187,45 @@ def test_open_website_adds_scheme(monkeypatch):
 
     OpenWebsiteSkill().run(site="news.ycombinator.com")
     assert opened == ["https://news.ycombinator.com"]
+
+
+# -- web search key handling ----------------------------------------------
+
+
+def test_google_search_key_is_not_borrowed_from_another_provider(monkeypatch):
+    """Regression: web_search posted config.API_KEY to googleapis.com whatever
+    BASE_URL pointed at, so running on OpenRouter handed that OpenRouter key to
+    Google."""
+    import config
+    from skills.web_skills import google_search_key
+
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(config, "API_KEY", "sk-or-secret", raising=False)
+
+    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
+    assert google_search_key() == ""
+
+    monkeypatch.setattr(
+        config, "BASE_URL",
+        "https://generativelanguage.googleapis.com/v1beta/openai/", raising=False,
+    )
+    assert google_search_key() == "sk-or-secret"
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-own-key")
+    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
+    assert google_search_key() == "google-own-key"
+
+
+def test_web_search_makes_no_request_without_a_key(monkeypatch):
+    import config
+    from skills.web_skills import WebSearchSkill
+
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
+    monkeypatch.setattr(config, "API_KEY", "sk-or-secret", raising=False)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("no HTTP request may be made without a key")
+
+    monkeypatch.setattr("requests.post", explode)
+    assert "GOOGLE_API_KEY" in WebSearchSkill().run(query="what happened today")

@@ -1,11 +1,13 @@
-"""Registers all skills and exposes them as Claude tool definitions.
+"""Registers all skills and exposes them as tool definitions in both the
+Anthropic and the OpenAI function-calling shapes.
 
 TO ADD A NEW SKILL:
 1. Write a class in one of the skills/*.py files that subclasses BaseSkill.
 2. Import it below and add it to SKILL_CLASSES.
 That's it — the brain will automatically be able to call it.
 """
-from .base_skill import BaseSkill, SkillResult
+import config
+from .base_skill import BaseSkill, SkillOutcome, SkillResult
 from .system_skills import (
     OpenAppSkill,
     CloseAppSkill,
@@ -13,8 +15,22 @@ from .system_skills import (
     VolumeControlSkill,
     PowerControlSkill,
 )
-from .web_skills import OpenWebsiteSkill, SearchInBrowserSkill, WeatherSkill
+from .web_skills import (
+    OpenWebsiteSkill,
+    SearchInBrowserSkill,
+    WeatherSkill,
+    WebFetchSkill,
+    WebSearchSkill,
+    google_search_key,
+)
 from .vision_skills import ScreenshotSkill
+from .file_skills import (
+    DeleteFileSkill, ListDirSkill, MakeDirSkill, MoveFileSkill,
+    ReadFileSkill, SearchFilesSkill, WriteFileSkill,
+)
+from .window_skills import (
+    CloseWindowSkill, FocusWindowSkill, ListWindowsSkill, SetWindowStateSkill,
+)
 from .utility_skills import (
     TimeDateSkill,
     NoteSkill,
@@ -35,6 +51,17 @@ SKILL_CLASSES = [
     SearchInBrowserSkill,
     WeatherSkill,
     ScreenshotSkill,
+    ReadFileSkill,
+    ListDirSkill,
+    SearchFilesSkill,
+    WriteFileSkill,
+    MakeDirSkill,
+    MoveFileSkill,
+    DeleteFileSkill,
+    ListWindowsSkill,
+    FocusWindowSkill,
+    SetWindowStateSkill,
+    CloseWindowSkill,
     TimeDateSkill,
     NoteSkill,
     ReminderSkill,
@@ -43,6 +70,23 @@ SKILL_CLASSES = [
     CalculatorSkill,
     ClipboardSkill,
 ]
+
+# Reading a page needs no credentials, so it is always available. Search does,
+# and registering it without one would put a tool in the prompt that can only
+# ever answer "I can't" — build_system_prompt keys off the registered set.
+SKILL_CLASSES.append(WebFetchSkill)
+if google_search_key():
+    SKILL_CLASSES.append(WebSearchSkill)
+
+if getattr(config, "ENABLE_SHELL", True):
+    from .shell_skills import RunCommandSkill
+
+    SKILL_CLASSES.append(RunCommandSkill)
+
+if getattr(config, "ENABLE_INPUT_CONTROL", True):
+    from .input_skills import ClickSkill, PressKeysSkill, TypeTextSkill
+
+    SKILL_CLASSES.extend([TypeTextSkill, PressKeysSkill, ClickSkill])
 
 # Anthropic-hosted tools. These execute on Anthropic's servers and their results
 # arrive inline as content blocks — SkillManager never runs them and `execute()`
@@ -65,10 +109,17 @@ class SkillManager:
             self.skills[skill.name] = skill
 
     def tool_definitions(self) -> list[dict]:
-        """Local skills first, then server tools. Order is deterministic so the
-        rendered tool block stays byte-identical across requests, which is what
-        keeps the prompt cache warm."""
-        return [s.to_tool_definition() for s in self.skills.values()] + list(SERVER_TOOLS)
+        """Anthropic shape: local skills first, then server tools. Order is
+        deterministic so the rendered tool block stays byte-identical across
+        requests, which is what keeps the prompt cache warm.
+
+        A local skill sharing a name with a server tool is dropped here — the
+        server-side one is better on this provider, and declaring the same tool
+        name twice is a hard 400.
+        """
+        reserved = {t["name"] for t in SERVER_TOOLS}
+        local = [s.to_tool_definition() for s in self.skills.values() if s.name not in reserved]
+        return local + list(SERVER_TOOLS)
 
     def openai_tool_definitions(self) -> list[dict]:
         """Expose local skills formatted as OpenAI tools."""
@@ -90,19 +141,30 @@ class SkillManager:
     def get(self, tool_name: str) -> BaseSkill | None:
         return self.skills.get(tool_name)
 
-    def execute(self, tool_name: str, tool_input: dict) -> tuple[SkillResult, bool]:
-        """Run a local skill. Returns (content, is_error).
+    def execute(self, tool_name: str, tool_input: dict) -> SkillOutcome:
+        """Run a local skill.
 
         is_error tells the model the call failed so it can adapt, rather than
         reporting our error string back to the user as if it were an answer.
         """
         skill = self.skills.get(tool_name)
         if not skill:
-            return f"Unknown skill: {tool_name}", True
+            return SkillOutcome(f"Unknown skill: {tool_name}", is_error=True)
+
+        from core.undo import get_journal
+
+        journal = get_journal()
+        before = journal.latest()
+
         try:
-            return skill.run(**tool_input), False
+            content = skill.run(**tool_input)
         except TypeError as e:
             # Almost always the model passing arguments the schema doesn't match.
-            return f"Invalid arguments for {tool_name}: {e}", True
+            return SkillOutcome(f"Invalid arguments for {tool_name}: {e}", is_error=True)
         except Exception as e:
-            return f"Error running {tool_name}: {e}", True
+            return SkillOutcome(f"Error running {tool_name}: {e}", is_error=True)
+
+        # A skill that recorded an undo entry during run() is reversible.
+        after = journal.latest()
+        token = after.token if after is not None and after is not before else None
+        return SkillOutcome(content, is_error=False, undo_token=token)

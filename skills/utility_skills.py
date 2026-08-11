@@ -168,6 +168,7 @@ _OPS = {
 
 
 _MAX_EXPONENT = 1000
+_MAX_POW_BASE = 1_000_000
 
 
 def _safe_eval(node):
@@ -180,10 +181,13 @@ def _safe_eval(node):
         if op is None:
             raise ValueError("Unsupported operator")
         left, right = _safe_eval(node.left), _safe_eval(node.right)
-        # 2 ** 999999999 will hang the assistant computing a number nobody
-        # asked for, so cap the exponent rather than letting it run.
-        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_EXPONENT:
-            raise ValueError("Exponent too large")
+        # Keep both operands bounded. Huge bases can create massive responses
+        # even with a small exponent, while huge exponents can hang the process.
+        if isinstance(node.op, ast.Pow):
+            if abs(left) > _MAX_POW_BASE:
+                raise ValueError("Base too large")
+            if abs(right) > _MAX_EXPONENT:
+                raise ValueError("Exponent too large")
         return op(left, right)
     if isinstance(node, ast.UnaryOp):
         op = _OPS.get(type(node.op))
