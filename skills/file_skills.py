@@ -9,6 +9,7 @@ import os
 import shutil
 from pathlib import Path
 
+import config
 from core.risk import Risk, is_sensitive_path
 from core.undo import get_journal, move_to_trash
 
@@ -339,8 +340,8 @@ class MoveFileSkill(BaseSkill):
 class DeleteFileSkill(BaseSkill):
     name = "delete_file"
     description = (
-        "Delete a file or folder on the user's PC. It is copied to Jarvis's "
-        "trash first, so the deletion can be undone."
+        f"Delete a file or folder on the user's PC. It is copied to "
+        f"{config.ASSISTANT_NAME}'s trash first, so the deletion can be undone."
     )
     input_schema = {
         "type": "object",

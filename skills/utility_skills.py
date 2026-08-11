@@ -4,6 +4,7 @@ import datetime
 import operator
 import time
 
+import config
 from core.store import get_store
 
 from .base_skill import BaseSkill
@@ -88,9 +89,9 @@ class NoteSkill(BaseSkill):
 class ReminderSkill(BaseSkill):
     name = "set_reminder"
     description = (
-        "Set a one-off reminder that pops up a desktop notification after N "
-        "minutes. Reminders are saved to disk, so they survive a restart and "
-        "still fire if Jarvis was closed when they came due."
+        f"Set a one-off reminder that pops up a desktop notification after N "
+        f"minutes. Reminders are saved to disk, so they survive a restart and "
+        f"still fire if {config.ASSISTANT_NAME} was closed when they came due."
     )
     input_schema = {
         "type": "object",
