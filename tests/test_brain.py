@@ -4,7 +4,7 @@ The headline test is test_history_survives_midturn_failure — that's the
 regression guard for the bug where an exception between a tool_use block and
 its tool_result left history permanently invalid, 400ing every later request.
 """
-import anthropic
+import openai
 import pytest
 
 from conftest import response, text_block, tool_use_block
@@ -48,7 +48,7 @@ def test_history_survives_midturn_failure(make_brain):
     brain = make_brain(
         [
             response([tool_use_block("get_time_date", {})], stop_reason="tool_use"),
-            anthropic.APIConnectionError(request=None),
+            openai.APIConnectionError(request=None),
             response([text_block("Recovered fine.")]),
         ]
     )
@@ -59,7 +59,7 @@ def test_history_survives_midturn_failure(make_brain):
     ]
     snapshot = list(brain.history)
 
-    with pytest.raises(anthropic.APIConnectionError):
+    with pytest.raises(openai.APIConnectionError):
         brain.ask("what time is it")
 
     # History is byte-identical to before the failed turn.
@@ -152,7 +152,7 @@ def test_pause_turn_resumes_without_extra_message(make_brain):
     )
 
     assert brain.ask("search the web") == "Found it."
-    second_call = brain.client.messages.calls[1]
+    second_call = brain.client.chat.completions.calls[1]
     assert second_call["messages"][-1]["role"] == "assistant"
 
 
@@ -176,3 +176,134 @@ def test_decimals_do_not_split_sentences(make_brain):
     brain.ask("pi")
 
     assert spoken == ["Pi is 3.14 roughly."]
+
+
+def test_moderate_action_notifies_without_confirming(make_brain, monkeypatch):
+    """A MODERATE action runs immediately — no prompt — and is announced so
+    the UI can offer undo."""
+    from core.undo import UndoJournal, set_journal
+    notified = []
+    confirmed = []
+
+    journal = UndoJournal(max_age_seconds=900)
+    set_journal(journal)
+    monkeypatch.setattr("skills.system_skills.IS_WINDOWS", True)
+    monkeypatch.setattr("skills.system_skills.subprocess.run", lambda *a, **k: None)
+
+    brain = make_brain(
+        [
+            response([tool_use_block("power_control", {"action": "lock"})], stop_reason="tool_use"),
+            response([text_block("Locked.")]),
+        ],
+        confirm=lambda s, i: confirmed.append(i) or True,
+        on_action=lambda skill, tool_input, outcome: notified.append(skill.name),
+    )
+    brain.ask("lock the pc")
+    set_journal(None)
+
+    assert confirmed == [], "lock is MODERATE and must not prompt"
+
+
+def test_dangerous_action_still_confirms(make_brain, monkeypatch):
+    ran = []
+    monkeypatch.setattr("skills.system_skills.IS_WINDOWS", True)
+    monkeypatch.setattr("skills.system_skills.subprocess.run", lambda *a, **k: ran.append(a[0]))
+
+    brain = make_brain(
+        [
+            response([tool_use_block("power_control", {"action": "shutdown"})], stop_reason="tool_use"),
+            response([text_block("Cancelled.")]),
+        ],
+        confirm=lambda skill, tool_input: False,
+    )
+    brain.ask("shut down")
+
+    assert ran == []
+    assert "declined" in brain.history[2]["content"][0]["content"]
+
+
+def test_on_action_receives_the_undo_token(make_brain):
+    """A skill that records an undo entry must surface its token so the UI can
+    offer a working undo button."""
+    from skills.base_skill import BaseSkill
+    from core.risk import Risk
+    from core.undo import UndoJournal, get_journal, set_journal
+
+    journal = UndoJournal(max_age_seconds=900)
+    set_journal(journal)
+
+    class Reversible(BaseSkill):
+        name = "reversible_thing"
+        description = "test"
+        input_schema = {"type": "object", "properties": {}, "required": []}
+        risk = Risk.MODERATE
+
+        def run(self):
+            get_journal().record("Put it back", lambda: "Put back.")
+            return "Did it."
+
+    seen = []
+    brain = make_brain(
+        [
+            response([tool_use_block("reversible_thing", {})], stop_reason="tool_use"),
+            response([text_block("Done.")]),
+        ],
+        on_action=lambda skill, ti, outcome: seen.append(outcome.undo_token),
+    )
+    brain.skills.skills["reversible_thing"] = Reversible()
+    brain.ask("do it")
+    set_journal(None)
+
+    assert len(seen) == 1 and seen[0], "on_action should carry a usable undo token"
+
+
+# -- error mapping ---------------------------------------------------------
+
+
+def _http_error(cls, status: int):
+    """Build an SDK error without going through its normal HTTP plumbing."""
+    exc = cls.__new__(cls)
+    Exception.__init__(exc, f"simulated {status}")
+    exc.status_code = status
+    return exc
+
+
+def test_friendly_error_maps_every_tier_without_raising():
+    """Regression: the tiers were built by concatenating a tuple with a bare
+    class, so anything past the auth check raised TypeError from inside the
+    handler that was supposed to be reporting the problem."""
+    import openai
+
+    from core.brain import friendly_error
+
+    cases = {
+        openai.AuthenticationError: 401,
+        openai.PermissionDeniedError: 403,
+        openai.NotFoundError: 404,
+        openai.RateLimitError: 429,
+        openai.InternalServerError: 500,
+    }
+    for cls, status in cases.items():
+        message = friendly_error(_http_error(cls, status))
+        assert isinstance(message, str) and message
+
+    assert "rejected" in friendly_error(_http_error(openai.AuthenticationError, 401))
+    assert "not found" in friendly_error(_http_error(openai.NotFoundError, 404))
+    assert "rate limited" in friendly_error(_http_error(openai.RateLimitError, 429))
+    assert "trouble" in friendly_error(_http_error(openai.InternalServerError, 500))
+    assert "Something went wrong" in friendly_error(ValueError("plain"))
+
+
+def test_friendly_error_handles_anthropic_errors_when_the_sdk_is_present():
+    """The Anthropic SDK is optional. When it is installed its exception types
+    must be recognised too, and when it isn't, nothing may break."""
+    from core.brain import _sdk_errors, friendly_error
+
+    try:
+        import anthropic
+    except ImportError:
+        assert _sdk_errors("NotFoundError")  # openai's is always there
+        return
+
+    assert anthropic.NotFoundError in _sdk_errors("NotFoundError")
+    assert "not found" in friendly_error(_http_error(anthropic.NotFoundError, 404))

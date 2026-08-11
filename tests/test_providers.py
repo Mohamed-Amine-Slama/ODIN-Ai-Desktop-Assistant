@@ -4,7 +4,12 @@ Two failure modes are easy to reintroduce here:
   1. Telling the model to use a tool the active provider wasn't given.
   2. Stringifying an image content block into the request as base64 text.
 """
-from core.brain import _split_tool_result, build_system_prompt
+from types import SimpleNamespace
+
+import httpx
+
+from core.brain import Brain, _split_tool_result, build_system_prompt
+from conftest import FakeClient, FakeOpenAIClient, openai_chunk, response, text_block
 
 
 # -- system prompt tracks the real tool set --------------------------------
@@ -12,7 +17,7 @@ from core.brain import _split_tool_result, build_system_prompt
 def test_prompt_describes_web_search_when_present():
     prompt = build_system_prompt({"web_search", "see_screen", "clipboard"})
     assert "web_search when the answer depends" in prompt
-    assert "no web access" not in prompt
+    assert "You have no search tool" not in prompt
 
 
 def test_prompt_omits_web_search_when_absent():
@@ -21,7 +26,7 @@ def test_prompt_omits_web_search_when_absent():
     one — and should say plainly that it can't check current information."""
     prompt = build_system_prompt({"see_screen", "clipboard", "calculate"})
     assert "web_search when the answer depends" not in prompt
-    assert "no web access" in prompt
+    assert "You have no search tool" in prompt
 
 
 def test_prompt_omits_vision_guidance_without_the_skill():
@@ -106,18 +111,106 @@ def test_openai_request_carries_image_as_multimodal_part(monkeypatch):
 
 
 def test_openai_path_is_detected_from_the_client():
-    from conftest import FakeOpenAIClient
-    from core.brain import Brain
-
     assert Brain(client=FakeOpenAIClient([[]])).is_openai is True
 
 
 def test_openai_prompt_has_no_web_search():
     """The integration of the two fixes: on the OpenAI path the tool list has
     no web_search, so the prompt must not advertise one."""
-    from conftest import FakeOpenAIClient
+    brain = Brain(client=FakeOpenAIClient([[]]))
+    assert "You have no search tool" in brain.system_prompt
+    assert "web_search when the answer depends" not in brain.system_prompt
+
+
+def test_anthropic_request_uses_native_streaming_thinking_and_caching(monkeypatch):
+    """Claude gets its native API features, while Gemini keeps its OpenAI path."""
+    import config
+
+    monkeypatch.setattr(config, "MODEL", "claude-opus-5")
+    monkeypatch.setattr(config, "EFFORT", "low")
+    client = FakeClient([response([text_block("Ready.")])])
+    brain = Brain(client=client)
+
+    assert brain.is_openai is False
+    assert "web_search when the answer depends" in brain.system_prompt
+    assert brain.ask("hello") == "Ready."
+
+    request = client.messages.calls[0]
+    assert request["thinking"] == {"type": "adaptive"}
+    assert request["output_config"] == {"effort": "low"}
+    assert request["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert request["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert {tool["name"] for tool in request["tools"]} >= {"web_search", "web_fetch"}
+
+
+def test_cache_breakpoint_handles_sdk_content_blocks():
+    class SdkBlock:
+        def model_dump(self):
+            return {"type": "text", "text": "previous reply"}
+
+    cached = Brain._cached(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [SdkBlock()]},
+        ]
+    )
+
+    assert cached[-1]["content"][-1] == {
+        "type": "text",
+        "text": "previous reply",
+        "cache_control": {"type": "ephemeral"},
+    }
+
+
+# -- reasoning_effort negotiation ------------------------------------------
+
+
+class _RejectsEffort:
+    """An endpoint that 400s on reasoning_effort, the way a model with no
+    reasoning control does. Records every request it was sent."""
+
+    def __init__(self, script):
+        self.calls: list[dict] = []
+        self._script = list(script)
+        self.chat = SimpleNamespace(completions=self)
+
+    def create(self, **kwargs):
+        import openai
+
+        self.calls.append(kwargs)
+        if "reasoning_effort" in kwargs:
+            raise openai.BadRequestError(
+                "Unrecognized request argument supplied: reasoning_effort",
+                response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
+                body=None,
+            )
+        return iter([openai_chunk(content="Hi.", finish_reason="stop")])
+
+
+def test_effort_is_dropped_and_retried_when_the_model_rejects_it(monkeypatch):
+    """The endpoint is whatever BASE_URL points at. A model with no reasoning
+    control must not turn every single turn into a hard failure."""
+    import config
     from core.brain import Brain
 
-    brain = Brain(client=FakeOpenAIClient([[]]))
-    assert "no web access" in brain.system_prompt
-    assert "web_search when the answer depends" not in brain.system_prompt
+    monkeypatch.setattr(config, "EFFORT", "low", raising=False)
+    client = _RejectsEffort([])
+    brain = Brain(client=client)
+
+    assert brain.ask("hello") == "Hi."
+    assert "reasoning_effort" in client.calls[0]
+    assert "reasoning_effort" not in client.calls[1]
+    assert brain._send_effort is False
+
+
+def test_effort_off_is_never_sent(monkeypatch):
+    import config
+    from core.brain import Brain
+
+    monkeypatch.setattr(config, "EFFORT", "off", raising=False)
+    client = _RejectsEffort([])
+    brain = Brain(client=client)
+
+    assert brain.ask("hello") == "Hi."
+    assert len(client.calls) == 1, "no retry should have been needed"
+    assert "reasoning_effort" not in client.calls[0]

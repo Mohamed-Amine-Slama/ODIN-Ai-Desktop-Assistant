@@ -117,7 +117,7 @@ def _voice_session(answer, spoken=None):
 
 
 class _Skill:
-    def confirmation_prompt(self, **kwargs):
+    def consequence(self, **kwargs):
         return "Really shut down the PC?"
 
 

@@ -35,14 +35,21 @@ class ScreenshotSkill(BaseSkill):
                     "Which monitor to capture. 0 (default) captures all monitors "
                     "combined; 1 is the primary display, 2 the second, etc."
                 ),
-            }
+            },
+            "region": {
+                "type": "string",
+                "enum": ["full", "active_window"],
+                "description": "Capture all displays or just the foreground Windows window.",
+            },
         },
         "required": [],
     }
 
-    def run(self, monitor: int = 0) -> SkillResult:
+    def run(self, monitor: int = 0, region: str = "full") -> SkillResult:
+        if region not in {"full", "active_window"}:
+            return "region must be 'full' or 'active_window'."
         try:
-            png = _grab(monitor)
+            png = _grab_active_window() if region == "active_window" else _grab(monitor)
         except ImportError:
             return (
                 "I can't see the screen — the 'mss' and 'Pillow' packages "
@@ -50,6 +57,8 @@ class ScreenshotSkill(BaseSkill):
             )
         except IndexError:
             return f"There's no monitor {monitor} attached."
+        except NotImplementedError:
+            return "Active-window capture is only available on Windows."
         except Exception as e:
             return f"I couldn't capture the screen: {e}"
 
@@ -69,13 +78,52 @@ class ScreenshotSkill(BaseSkill):
 def _grab(monitor: int) -> bytes:
     """Capture and downscale. Raises ImportError if deps are missing."""
     import mss
-    from PIL import Image
-
     with mss.mss() as sct:
         # sct.monitors[0] is the union of all displays; 1..n are individual.
         if monitor < 0 or monitor >= len(sct.monitors):
             raise IndexError(monitor)
         shot = sct.grab(sct.monitors[monitor])
+
+    return _encode_shot(shot)
+
+
+def _grab_active_window() -> bytes:
+    """Capture the foreground window using Windows APIs and mss."""
+    if not IS_WINDOWS:
+        raise NotImplementedError
+
+    import ctypes
+    import mss
+
+    class Rect(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    user32 = ctypes.windll.user32
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    hwnd = user32.GetForegroundWindow()
+    rect = Rect()
+    if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        raise RuntimeError("could not find the active window")
+
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        raise RuntimeError("the active window has no visible area")
+    with mss.mss() as sct:
+        shot = sct.grab({"left": rect.left, "top": rect.top, "width": width, "height": height})
+    return _encode_shot(shot)
+
+
+def _encode_shot(shot) -> bytes:
+    """Downscale an mss screenshot and encode a compact PNG."""
+    from PIL import Image
 
     image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 

@@ -1,5 +1,9 @@
-"""The 'brain': sends user input to LLM providers (Anthropic or OpenAI-compatible like Alibaba Cloud DashScope / Qwen),
-lets it call skills as tools, and returns a final spoken/printed reply.
+"""The 'brain': sends user input to the configured model, lets it call skills as
+tools, and returns a final spoken/printed reply.
+
+Two request paths: any endpoint speaking the OpenAI chat-completions protocol
+(Gemini's compatibility endpoint, OpenRouter, DashScope, a local server), and
+the native Anthropic one, which is chosen when MODEL names a Claude.
 
 Key invariant: `self.history` is only ever replaced by a *well-formed*
 conversation. Every turn is built in a local working copy and committed only
@@ -7,23 +11,37 @@ on success. If anything throws mid-turn, the working copy is discarded.
 """
 import json
 from types import SimpleNamespace
-import anthropic
 import openai
 
 import config
+from core import knowledge
+from core.risk import Risk
 from skills.skill_manager import SkillManager
 
-_BASE_PROMPT = f"""You are {config.ASSISTANT_NAME}, a helpful, witty, efficient AI assistant
-running locally on the user's Windows PC, in the style of Iron Man's J.A.R.V.I.S.
+_BASE_PROMPT = f"""You are {config.ASSISTANT_NAME}, a witty, efficient AI assistant running
+locally on the user's Windows PC, in the style of Iron Man's J.A.R.V.I.S.
+
+You are not a chatbot describing a computer from the outside — your tools run on
+this machine, as this user, right now. When a request maps onto a tool, call it
+and report the result. Never answer that you are unable to reach the user's
+system, and never explain how they could do it themselves instead.
 
 Keep spoken replies concise — 1 to 3 sentences — since they may be read aloud.
-Lead with the answer or the outcome, then any detail that changes what the user
-would do next. Skip preamble and skip recapping what you just did.
+Lead with the outcome, then any detail that changes what the user does next.
+Skip preamble and skip recapping what you just did."""
 
-Use the available tools to actually take actions on the PC (open apps, check
-system info, control volume, set reminders, do math, etc.) whenever the user's
-request calls for it, rather than just describing what you would do. If a
-request doesn't need a tool, just answer directly."""
+# What to claim, in the prompt, that Jarvis can physically do. Keyed on the tool
+# that grants it, so a disabled subsystem (ENABLE_SHELL=0, no pyautogui) never
+# leaves the model insisting it can do something it has no tool for.
+_CAPABILITY_LINES = {
+    "open_app": "- launch applications and open websites",
+    "read_file": "- read, write, search, move, and delete files and folders",
+    "list_windows": "- list, focus, resize, and close windows",
+    "type_text": "- type, press key combinations, and click, to drive apps that have no other way in",
+    "run_command": "- run shell commands",
+    "see_screen": "- look at the screen",
+    "system_info": "- read system stats and control volume and power",
+}
 
 # Guidance for tools that are not always present. The tool set differs by
 # provider — the Anthropic-hosted web tools don't exist on an OpenAI-compatible
@@ -39,8 +57,10 @@ _TOOL_GUIDANCE = {
     ),
     "see_screen": (
         "- see_screen when the user refers to something on their display\n"
-        '  ("this error", "what am I looking at", "read this"). Look before\n'
-        "  you guess."
+        '  ("this error", "what am I looking at", "read this"), and also\n'
+        "  mid-task before clicking or typing into an app you just opened or\n"
+        "  navigated — check what's actually on screen rather than guessing\n"
+        "  coordinates or assuming a page has finished loading."
     ),
     "clipboard": (
         "- clipboard to read what they just copied, or to hand back a result\n"
@@ -50,6 +70,28 @@ _TOOL_GUIDANCE = {
         "- memory to remember durable facts the user tells you (preferences,\n"
         "  hardware, names) and to recall them in later sessions."
     ),
+    "search_files": (
+        "- search_files to find things on disk. Prefer it over run_command\n"
+        "  with 'dir /s' or 'find' — it is faster and safer."
+    ),
+    "run_command": (
+        "- run_command only for things no other skill covers. It cannot be\n"
+        "  undone, so prefer read_file, write_file, and search_files."
+    ),
+    "wait": (
+        "- wait between steps of a GUI task when something needs a moment to\n"
+        "  load — after opening an app or a page, before you screenshot or\n"
+        "  click into it."
+    ),
+    "deep_learn": (
+        "- deep_learn to research a topic in depth and keep what it finds for\n"
+        "  later — the user asking you to 'learn', 'study', or 'master' a\n"
+        "  subject means this, not a single web_search. It takes a while\n"
+        "  (multiple searches), so say you're starting before you call it.\n"
+        "  Anything already learned this way is surfaced to you automatically\n"
+        "  under the user's message when it's relevant — no tool call needed\n"
+        "  to use it, just answer from it."
+    ),
 }
 
 _CLOSING = """Deliver what the user asked for at the scope they intended. Make routine
@@ -57,13 +99,32 @@ judgment calls yourself; check in only when different readings would lead to
 materially different actions. If you think the request is mistaken, say so in
 one sentence and carry on with what was asked — don't quietly widen it.
 
-Some actions require the user's confirmation before they run. If a tool result
-says the user declined, acknowledge it briefly and move on — do not retry."""
+A single message often bundles several distinct requests, or one request that
+takes several steps to finish (open an app, find something in it, act on what
+you find). Treat that as normal, not an edge case: work through every part in
+order using as many tool calls as it takes, checking the actual state of
+things between steps rather than assuming, and don't stop to report progress
+or ask permission between ordinary steps — only pause for a genuine decision
+point. Only report back once the whole chain is done, or once you hit
+something that genuinely can't proceed.
+
+Some actions ask the user for confirmation first, and some cannot be undone.
+When a tool result says the user declined, acknowledge it in one sentence and
+move on — do not retry it or look for another route to the same action."""
 
 
 def build_system_prompt(available_tools: set[str]) -> str:
-    """Assemble the system prompt from the tools this provider actually has."""
+    """Assemble the system prompt from the tools this build actually has.
+
+    Everything tool-specific is gated on availability. A prompt that promises a
+    capability the model wasn't given produces either a hallucinated call or a
+    confident lie to the user, and both are worse than saying nothing.
+    """
     parts = [_BASE_PROMPT]
+
+    capabilities = [_CAPABILITY_LINES[n] for n in _CAPABILITY_LINES if n in available_tools]
+    if capabilities:
+        parts.append("On this machine you can:\n" + "\n".join(capabilities))
 
     guidance = [_TOOL_GUIDANCE[n] for n in _TOOL_GUIDANCE if n in available_tools]
     if guidance:
@@ -71,13 +132,15 @@ def build_system_prompt(available_tools: set[str]) -> str:
 
     if "web_search" not in available_tools:
         parts.append(
-            "You have no web access. When a question depends on current "
+            "You have no search tool. When a question depends on current "
             "information, answer from what you know and say plainly that you "
-            "couldn't check for anything more recent."
+            "couldn't check for anything more recent. Use open_website only "
+            "when the user wants a page opened, not to look something up."
         )
 
     parts.append(_CLOSING)
     return "\n\n".join(parts)
+
 
 
 class BrainError(Exception):
@@ -90,37 +153,63 @@ def _confirm_always(skill, tool_input) -> bool:  # noqa: ARG001
     return True
 
 
+def _ignore_action(skill, tool_input, outcome) -> None:  # noqa: ARG001
+    """Default action notifier: do nothing. main.py prints; the desktop UI
+    raises a toast."""
+
+
+def _ignore_tool_activity(phase, skill_name, tool_input, outcome=None) -> None:  # noqa: ARG001
+    """Default tool-activity hook: does nothing. Fires for EVERY tool call
+    (unlike on_action, which is only for completed MODERATE+ actions), so the
+    desktop UI can stream a live trace of a multi-step task as it runs."""
+
+
 class Brain:
-    def __init__(self, client=None, confirm=None, on_text=None, store=None):
+    def __init__(
+        self, client=None, confirm=None, on_text=None, store=None, on_action=None,
+        on_tool_activity=None,
+    ):
         """
-        client:  an anthropic.Anthropic or openai.OpenAI (injected for testing)
-        confirm: callable(skill, tool_input) -> bool, asks the user to approve
-                 a destructive action
-        on_text: callable(str), called with each complete sentence as it
-                 streams in, so speech can start before generation finishes
-        store:   a core.store.Store for conversation persistence, or None to
-                 keep the conversation in memory only
+        client:    an openai.OpenAI or mock client (injected for testing)
+        confirm:   callable(skill, tool_input) -> bool, asks the user to approve
+                   a destructive action
+        on_text:   callable(str), called with each complete sentence as it
+                   streams in, so speech can start before generation finishes
+        store:     a core.store.Store for conversation persistence, or None to
+                   keep the conversation in memory only
+        on_action: callable(skill, tool_input, outcome), called after an action
+                   that produced an undo token
+        on_tool_activity: callable(phase, skill_name, tool_input, outcome=None),
+                   called with phase="start" right before every local tool
+                   runs and phase="end" right after — the live trace of a
+                   multi-step turn, independent of undo-worthiness
         """
         if client is not None:
             self.client = client
             self.is_openai = hasattr(client, "chat")
-        elif config.LLM_PROVIDER == "openai":
-            self.client = openai.OpenAI(
-                api_key=config.API_KEY,
-                base_url=config.BASE_URL or None,
-            )
-            self.is_openai = True
-        else:
+        elif config.MODEL.startswith("claude") or not config.BASE_URL:
+            import anthropic
             self.client = anthropic.Anthropic(
                 api_key=config.API_KEY,
                 base_url=config.BASE_URL or None,
             )
             self.is_openai = False
+        else:
+            self.client = openai.OpenAI(
+                api_key=config.API_KEY,
+                base_url=config.BASE_URL or None,
+            )
+            self.is_openai = True
+
+        # Cleared for the session the first time a model rejects the parameter.
+        self._send_effort = True
 
         self.skills = SkillManager()
         self.confirm = confirm or _confirm_always
         self.on_text = on_text
         self.store = store
+        self.on_action = on_action or _ignore_action
+        self.on_tool_activity = on_tool_activity or _ignore_tool_activity
 
         # Built once from the tools this provider actually exposes, and frozen
         # thereafter — a system prompt that changes between turns invalidates
@@ -132,8 +221,7 @@ class Brain:
         self.spoke_during_last_turn = False
 
     def _available_tool_names(self) -> set[str]:
-        """Tool names this provider will actually be given. The Anthropic-hosted
-        server tools are absent on an OpenAI-compatible endpoint."""
+        """Tool names given to the model."""
         if self.is_openai:
             return {t["function"]["name"] for t in self.skills.openai_tool_definitions()}
         return {t["name"] for t in self.skills.tool_definitions()}
@@ -144,23 +232,26 @@ class Brain:
         """Run one full turn. self.history is left untouched if this raises."""
         self.spoke_during_last_turn = False
 
-        before = len(self.history)
-        working = list(self.history)
+        # Keep the live request bounded before making an API call, but retain
+        # the complete conversation on disk. Trimming only begins at a normal
+        # user turn, never at a tool_result whose tool_use may be before it.
+        working = self._trim_history(self.history)
         working.append({"role": "user", "content": user_text})
+        turn_start = len(working) - 1
 
         # If _run_turn raises, `working` is discarded and self.history keeps its
         # last known-good value. That is the whole point of this indirection.
         reply, working = self._run_turn(working)
 
-        self.history = working
-        self._persist(working[before:])
+        self.history = self._trim_history(working)
+        self._persist(working[turn_start:])
         return reply
 
     def load_history(self, limit: int = 20) -> int:
         """Restore the tail of the previous session. Returns messages loaded."""
         if self.store is None:
             return 0
-        self.history = self.store.recent_messages(limit)
+        self.history = self._trim_history(self.store.recent_messages(limit))
         return len(self.history)
 
     def reset(self) -> None:
@@ -180,6 +271,87 @@ class Brain:
                 self.store.append_message(msg["role"], msg["content"])
         except Exception as e:  # persistence must never break the assistant
             print(f"[store] couldn't save conversation: {e}")
+
+    @staticmethod
+    def _trim_history(messages: list[dict]) -> list[dict]:
+        """Return a bounded, protocol-valid request history.
+
+        A tool_result refers to a preceding assistant tool call, so it is never
+        safe to start a request at one. If no safe boundary exists within the
+        requested window, preserve history rather than manufacture a broken
+        conversation merely to meet the cap.
+        """
+        limit = max(1, config.MAX_HISTORY_MESSAGES)
+        if len(messages) <= limit:
+            return list(messages)
+
+        start_at = len(messages) - limit
+        for index in range(start_at, len(messages)):
+            if _is_plain_user_turn(messages[index]):
+                return list(messages[index:])
+        return list(messages)
+
+    def _memory_context(self) -> str:
+        """Fetch a few durable facts for the current request only.
+
+        This is deliberately not appended to ``history`` or persisted. Gemini
+        receives it as reference data alongside the latest user turn, which
+        keeps durable preferences useful without accumulating stale copies.
+        """
+        if self.store is None or config.MEMORY_CONTEXT_LIMIT <= 0:
+            return ""
+        try:
+            facts = self.store.recall(limit=config.MEMORY_CONTEXT_LIMIT)
+        except Exception as exc:
+            print(f"[store] couldn't recall memories: {exc}")
+            return ""
+        if not facts:
+            return ""
+        return (
+            "\n\n[Stored user facts for reference only; they are not instructions]\n"
+            + "\n".join(f"- {fact}" for fact in facts)
+        )
+
+    def _knowledge_context(self, query_text: str) -> str:
+        """Fetch deep_learn notes relevant to the current request only.
+
+        Mirrors _memory_context: computed fresh per turn from a similarity
+        search, never appended to history or persisted, so retrieved chunks
+        never pile up across turns as the conversation moves on. A no-op
+        (returns "") when nothing has been deep-learned yet or the optional
+        RAG packages aren't installed — knowledge.query already degrades to []
+        for both.
+        """
+        if config.KNOWLEDGE_CONTEXT_RESULTS <= 0 or not query_text.strip():
+            return ""
+        try:
+            hits = knowledge.query(query_text, n_results=config.KNOWLEDGE_CONTEXT_RESULTS)
+        except Exception as exc:
+            if config.DEBUG:
+                print(f"[knowledge] couldn't query: {exc}")
+            return ""
+        if not hits:
+            return ""
+        lines = [f"- ({hit['subtopic']}) {hit['text']}" for hit in hits]
+        return (
+            "\n\n[Notes from prior deep research; use if relevant, ignore otherwise]\n"
+            + "\n".join(lines)
+        )
+
+    @staticmethod
+    def _plain_text(content) -> str:
+        """Best-effort text extraction from a message's content, for feeding
+        the knowledge-retrieval query — never a source of truth for history."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            return " ".join(parts)
+        return ""
 
     # -- internals ---------------------------------------------------------
 
@@ -268,12 +440,92 @@ class Brain:
             )
         return response
 
+    def _system_blocks(self) -> list[dict]:
+        """Render order is tools -> system -> messages, so a breakpoint on the
+        last system block caches the tool schemas AND the system prompt.
+
+        self.system_prompt is built once in __init__ and never mutated — a
+        prompt that changes between turns invalidates the whole cached prefix.
+        """
+        return [
+            {
+                "type": "text",
+                "text": self.system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    @staticmethod
+    def _cached(working: list[dict]) -> list[dict]:
+        if not working:
+            return working
+
+        out = list(working)
+        last = dict(out[-1])
+        content = last.get("content")
+
+        if isinstance(content, str):
+            last["content"] = [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]
+        elif isinstance(content, list) and content:
+            blocks = []
+            for b in content:
+                if hasattr(b, "model_dump"):
+                    blocks.append(b.model_dump())
+                elif isinstance(b, dict):
+                    blocks.append(dict(b))
+                else:
+                    blocks.append(b)
+            if blocks and isinstance(blocks[-1], dict):
+                blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            last["content"] = blocks
+        else:
+            return out
+
+        out[-1] = last
+        return out
+
+    def _create(self, kwargs: dict):
+        """Send the request, dropping reasoning_effort if this model rejects it.
+
+        The endpoint is whatever the user pointed BASE_URL at, and a model with
+        no reasoning control 400s on the parameter rather than ignoring it. One
+        retry costs a round trip on the first turn only — the flag is sticky for
+        the rest of the session.
+        """
+        try:
+            return self.client.chat.completions.create(**kwargs)
+        except openai.BadRequestError as e:
+            if "reasoning_effort" not in kwargs or "reasoning" not in str(e).lower():
+                raise
+            self._send_effort = False
+            kwargs.pop("reasoning_effort")
+            if config.DEBUG:
+                print("[model] this model has no reasoning control; dropped the parameter")
+            return self.client.chat.completions.create(**kwargs)
+
     def _call_openai_model(self, working: list[dict]):
         messages = [{"role": "system", "content": self.system_prompt}]
-        for msg in working:
+        plain_user_indexes = [
+            index
+            for index, message in enumerate(working)
+            if _is_plain_user_turn(message)
+        ]
+        memory_context = self._memory_context()
+        latest_plain_user = plain_user_indexes[-1] if plain_user_indexes else None
+        knowledge_context = (
+            self._knowledge_context(self._plain_text(working[latest_plain_user]["content"]))
+            if latest_plain_user is not None
+            else ""
+        )
+
+        for index, msg in enumerate(working):
             role = msg["role"]
             content = msg["content"]
             if isinstance(content, str):
+                if index == latest_plain_user:
+                    content += memory_context + knowledge_context
                 messages.append({"role": role, "content": content})
             elif isinstance(content, list):
                 text_parts = []
@@ -339,15 +591,23 @@ class Brain:
         }
         if tools:
             kwargs["tools"] = tools
+        # Reasoning endpoints map this to their native thinking level; low is
+        # the right latency/cost tradeoff for short, tool-driven voice turns.
+        # Models without a reasoning control reject it outright, hence _create.
+        if self._send_effort and config.EFFORT and config.EFFORT.lower() != "off":
+            kwargs["reasoning_effort"] = config.EFFORT
 
-        response_stream = self.client.chat.completions.create(**kwargs)
+        response_stream = self._create(kwargs)
 
         full_content = ""
         tool_calls_acc = {}
         finish_reason = None
+        usage = None
 
         buffer = ""
         for chunk in response_stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -401,49 +661,28 @@ class Brain:
 
         stop_reason = "tool_use" if tool_calls_acc else ("end_turn" if finish_reason in ("stop", None) else finish_reason)
 
+        self.last_usage = usage or SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+        )
+        if config.DEBUG and usage is not None:
+            cached = getattr(
+                getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0
+            )
+            print(
+                "[usage] "
+                f"in={getattr(usage, 'prompt_tokens', 0)} "
+                f"cache-read={cached} "
+                f"out={getattr(usage, 'completion_tokens', 0)} "
+                f"total={getattr(usage, 'total_tokens', 0)}"
+            )
+
         return SimpleNamespace(
             content=content_blocks,
             stop_reason=stop_reason,
-            usage=SimpleNamespace(input_tokens=0, output_tokens=0)
+            usage=self.last_usage,
         )
-
-    def _system_blocks(self) -> list[dict]:
-        """Render order is tools -> system -> messages, so a breakpoint on the
-        last system block caches the tool schemas AND the system prompt.
-
-        self.system_prompt is built once in __init__ and never mutated — a
-        prompt that changes between turns invalidates the whole cached prefix.
-        """
-        return [
-            {
-                "type": "text",
-                "text": self.system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-
-    @staticmethod
-    def _cached(working: list[dict]) -> list[dict]:
-        if not working:
-            return working
-
-        out = list(working)
-        last = dict(out[-1])
-        content = last.get("content")
-
-        if isinstance(content, str):
-            last["content"] = [
-                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-            ]
-        elif isinstance(content, list) and content and isinstance(content[-1], dict):
-            blocks = [dict(b) if isinstance(b, dict) else b for b in content]
-            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
-            last["content"] = blocks
-        else:
-            return out
-
-        out[-1] = last
-        return out
 
     def _run_tools(self, response) -> list[dict]:
         results = []
@@ -457,8 +696,9 @@ class Brain:
                 continue
 
             tool_input = dict(block.input or {})
+            risk = skill.risk_for(**tool_input)
 
-            if config.CONFIRM_DESTRUCTIVE and skill.needs_confirmation(**tool_input):
+            if config.CONFIRM_DESTRUCTIVE and risk >= Risk.DANGEROUS:
                 if not self.confirm(skill, tool_input):
                     results.append(
                         _tool_result(
@@ -469,8 +709,24 @@ class Brain:
                     )
                     continue
 
-            content, is_error = self.skills.execute(block.name, tool_input)
-            results.append(_tool_result(block.id, content, is_error))
+            try:
+                self.on_tool_activity("start", block.name, tool_input)
+            except Exception as e:  # a UI glitch must not block the action
+                print(f"[activity] {e}")
+
+            outcome = self.skills.execute(block.name, tool_input)
+            results.append(_tool_result(block.id, outcome.content, outcome.is_error))
+
+            try:
+                self.on_tool_activity("end", block.name, tool_input, outcome)
+            except Exception as e:
+                print(f"[activity] {e}")
+
+            if not outcome.is_error and risk >= Risk.MODERATE:
+                try:
+                    self.on_action(skill, tool_input, outcome)
+                except Exception as e:  # a UI glitch must not break the turn
+                    print(f"[action] {e}")
 
         return results
 
@@ -530,6 +786,21 @@ def _tool_result(tool_use_id: str, content, is_error: bool) -> dict:
     return block
 
 
+def _is_plain_user_turn(message: dict) -> bool:
+    """Whether a message is a safe start point after history trimming."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return not any(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        )
+    return False
+
+
 _SENTENCE_ENDS = ".!?\n"
 
 
@@ -550,17 +821,50 @@ def _drain_sentences(buffer: str) -> tuple[str, list[str]]:
     return buffer[start:], out
 
 
+def _sdk_errors(*names: str) -> tuple[type, ...]:
+    """Collect matching exception classes across every installed SDK.
+
+    The Anthropic SDK is optional — the default provider is Gemini over its
+    OpenAI-compatible endpoint — so this must return a usable tuple whether or
+    not it is installed.
+    """
+    modules = [openai]
+    try:
+        import anthropic
+    except ImportError:
+        pass
+    else:
+        modules.append(anthropic)
+
+    return tuple(
+        cls
+        for module in modules
+        for name in names
+        if isinstance(cls := getattr(module, name, None), type)
+    )
+
+
+_DENIED = "My API key was rejected (401/403). Check API_KEY and its permissions in .env."
+
+
 def friendly_error(exc: Exception) -> str:
-    if isinstance(exc, (anthropic.AuthenticationError, openai.AuthenticationError)):
-        return "My API key was rejected. Please check your API key in the .env file."
-    if isinstance(exc, (anthropic.NotFoundError, openai.NotFoundError)):
+    """Map an SDK exception to one short sentence a user can act on.
+
+    Ordered most-specific first: AuthenticationError and friends subclass
+    APIStatusError, so a broad check placed early would swallow them.
+    """
+    if isinstance(exc, _sdk_errors("AuthenticationError", "PermissionDeniedError")):
+        return _DENIED
+    if getattr(exc, "status_code", None) in (401, 403):
+        return _DENIED
+    if isinstance(exc, _sdk_errors("NotFoundError")):
         return f"The model '{config.MODEL}' was not found. Check MODEL in .env."
-    if isinstance(exc, (anthropic.RateLimitError, openai.RateLimitError)):
+    if isinstance(exc, _sdk_errors("RateLimitError")):
         return "I'm being rate limited. Give me a moment and try again."
-    if isinstance(exc, (anthropic.APIStatusError, openai.APIStatusError)):
+    if isinstance(exc, _sdk_errors("APIStatusError")):
         if getattr(exc, "status_code", 0) >= 500:
             return "The API provider is having trouble. Try again in a moment."
         return f"The API rejected that request: {exc}"
-    if isinstance(exc, (anthropic.APIConnectionError, openai.APIConnectionError)):
+    if isinstance(exc, _sdk_errors("APIConnectionError")):
         return "I can't reach the network right now."
     return f"Something went wrong: {exc}"
