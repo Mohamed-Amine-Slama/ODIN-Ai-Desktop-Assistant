@@ -73,6 +73,38 @@ def test_web_fetch_closes_connection_on_success(monkeypatch, public_url):
     assert resp.closed
 
 
+def test_web_fetch_decodes_unlabeled_utf8_correctly(monkeypatch, public_url):
+    """requests defaults response.encoding to ISO-8859-1 for any text/* type
+    that doesn't declare its own charset — which is what a real, modern,
+    just-forgot-to-say-so UTF-8 page looks like. Blindly trusting that
+    default turns non-ASCII content into mojibake."""
+    body = "Café 😀".encode("utf-8")
+    resp = _FakeResponse(
+        status_code=200,
+        headers={"content-type": "text/plain"},  # no charset param
+        chunks=[body],
+        encoding="ISO-8859-1",  # requests' own default for unlabeled text/*
+    )
+    _patch_get(monkeypatch, resp)
+    out = WebFetchSkill().run(url="http://example.com")
+    assert "Café 😀" in out
+
+
+def test_web_fetch_respects_an_explicitly_declared_charset(monkeypatch, public_url):
+    """When the server actually declares a charset, that declaration must
+    still be honored rather than always forcing UTF-8."""
+    body = "Café".encode("iso-8859-1")
+    resp = _FakeResponse(
+        status_code=200,
+        headers={"content-type": "text/plain; charset=iso-8859-1"},
+        chunks=[body],
+        encoding="ISO-8859-1",
+    )
+    _patch_get(monkeypatch, resp)
+    out = WebFetchSkill().run(url="http://example.com")
+    assert "Café" in out
+
+
 # -- web_search (DuckDuckGo via ddgs) -----------------------------------------
 
 class _FakeDDGS:

@@ -1,7 +1,19 @@
 """Tests for core/memory_index.py's graceful degradation when chromadb /
-sentence-transformers aren't installed — the normal state in this test
-environment, and the contract every caller (core.store) depends on."""
+sentence-transformers aren't installed — forced via sys.modules (same
+technique test_capabilities.py uses for ddgs) so this holds regardless of
+whether the dev/CI machine actually has the optional RAG stack installed,
+and so it never does a real chromadb write as an accidental side effect."""
+import sys
+
+import pytest
+
 from core import memory_index
+
+
+@pytest.fixture(autouse=True)
+def _no_rag_deps(monkeypatch):
+    monkeypatch.setitem(sys.modules, "chromadb", None)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
 
 
 def test_available_is_false_without_the_optional_deps():

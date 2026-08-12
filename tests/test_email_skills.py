@@ -2,7 +2,7 @@
 
 No real OAuth or network: google_ready/microsoft_ready/default_account/
 get_provider are all mocked at the skills.email_skills module level, so these
-run without requirements-email.txt installed or any account connected.
+run without the email packages installed or any account connected.
 """
 import pytest
 

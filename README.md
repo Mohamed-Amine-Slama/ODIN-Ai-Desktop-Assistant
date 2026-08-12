@@ -33,35 +33,24 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Hands-free voice is optional and pulls ~1GB of ML wheels:
+That one file covers everything, including the heavier optional stacks below
+— Jarvis still runs fine at runtime if any of them are missing, it just
+degrades that one feature instead of failing to start. Notably:
 
-```bat
-pip install -r requirements-voice.txt
-```
+- Hands-free voice pulls ~1GB of ML wheels (`faster-whisper`, `onnxruntime`,
+  `openwakeword`, ...).
+- The `deep_learn` skill (research a topic in depth and remember it
+  permanently) and semantic recall for the `memory` skill both need a local
+  vector store and embedding model — `sentence-transformers` pulls in torch.
+  Without it, `deep_learn` just says what's missing instead of failing, and
+  `memory` recall falls back to plain-text search; nothing else in Jarvis is
+  affected.
+- Email and calendar (`read_email`, `send_email`, `list_events`,
+  `create_event`, `delete_event`) still need one Google or Microsoft account
+  connected before they do anything — see section 9 below.
 
 `web_search` needs no setup at all — it runs on DuckDuckGo via the `ddgs`
 package (already in `requirements.txt`), with no API key, signup, or billing.
-
-The `deep_learn` skill (research a topic in depth and remember it permanently)
-and semantic recall for the `memory` skill both need a local vector store and
-embedding model — also optional, also separate since `sentence-transformers`
-pulls in torch:
-
-```bat
-pip install -r requirements-rag.txt
-```
-
-Without it, `deep_learn` just says what's missing instead of failing, and
-`memory` recall falls back to plain-text search; nothing else in Jarvis is
-affected.
-
-Email and calendar (`read_email`, `send_email`, `list_events`, `create_event`,
-`delete_event`) are optional too, and need one Google or Microsoft account
-connected before they do anything — see section 9 below.
-
-```bat
-pip install -r requirements-email.txt
-```
 
 ## 2. Configure
 
@@ -246,7 +235,7 @@ platform, so they need no display either.
 ## 9. Email and calendar setup
 
 `read_email`, `send_email`, `list_events`, `create_event`, and `delete_event`
-need `pip install -r requirements-email.txt` plus one connected account.
+need one connected account (the packages are already in `requirements.txt`).
 Neither provider is registered as a skill at all until it's at least set up
 enough to attempt a connection — see `skill_manager.py`'s gating.
 

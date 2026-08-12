@@ -1,8 +1,8 @@
 """Spectrum — ODIN-HUD.md §5.6, zone K's audio analyser.
 
 No AnalyserNode equivalent exists in Qt. Loopback capture is feasible
-without any new heavy dependency: `sounddevice` (already optional, via
-requirements-voice.txt) wraps PortAudio, which supports WASAPI loopback on
+without any new heavy dependency: `sounddevice` (already optional, in
+requirements.txt) wraps PortAudio, which supports WASAPI loopback on
 Windows. A small FFT over the captured ring buffer (numpy, also already an
 optional dependency of the voice path) stands in for AnalyserNode.
 
@@ -104,7 +104,7 @@ class Spectrum(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(56)
+        self.setMinimumHeight(28)
         self._levels = [0.0] * BAR_COUNT
         self._peaks = [0.0] * BAR_COUNT
         self._rng = random.Random(7)

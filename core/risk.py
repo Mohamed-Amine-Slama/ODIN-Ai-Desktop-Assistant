@@ -93,6 +93,17 @@ def classify_command(command: str) -> Risk:
     return worst
 
 
+
+# File-deletion commands (cmd.exe and PowerShell, including PS aliases) that
+# destroy their target outright with no flag required — `del file.txt` and
+# `Remove-Item file.txt` need no /s or -Recurse to be irreversible, unlike
+# `rmdir`/`rd`, which without a recurse flag only removes an already-empty
+# directory. DANGEROUS_PATTERNS above only catches the flagged forms, so
+# these were falling through to MODERATE — silent, unconfirmed, and (per
+# this module's own docstring on shell commands) never undoable.
+FILE_DELETE_COMMANDS = {"del", "erase", "remove-item", "ri", "rm"}
+
+
 def _classify_segment(segment: str) -> Risk:
     tokens = segment.lower().split()
     if not tokens:
@@ -108,6 +119,8 @@ def _classify_segment(segment: str) -> Risk:
         return Risk.SAFE
     if head in READ_ONLY_COMMANDS:
         return Risk.SAFE
+    if head in FILE_DELETE_COMMANDS and len(tokens) > 1:
+        return Risk.DANGEROUS
     return Risk.MODERATE
 
 

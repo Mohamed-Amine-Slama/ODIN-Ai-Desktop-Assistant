@@ -12,11 +12,23 @@ reports success.
 vision_skills records the transform after every capture; input_skills applies
 it before every click/scroll so the model can keep reasoning purely in the
 coordinates of the image it was just shown.
+
+The mapping carries a recorded_at timestamp so a click issued long after the
+screenshot it was read off — the screen may have changed, a window moved, a
+monitor been unplugged — can be refused rather than silently aimed at
+whatever now occupies that stale coordinate. See is_stale().
 """
 import threading
+import time
 
 _lock = threading.Lock()
 _mapping: dict | None = None
+
+# How long a screenshot's coordinate mapping stays trustworthy. Generous on
+# purpose — this only guards against "the model is reasoning off a
+# screenshot from a much earlier, unrelated turn," not normal think time
+# between a screenshot and the click it informs.
+STALE_AFTER_SECONDS = 120.0
 
 
 def record(scale: float, origin_x: int, origin_y: int) -> None:
@@ -29,7 +41,10 @@ def record(scale: float, origin_x: int, origin_y: int) -> None:
     """
     global _mapping
     with _lock:
-        _mapping = {"scale": scale, "origin_x": origin_x, "origin_y": origin_y}
+        _mapping = {
+            "scale": scale, "origin_x": origin_x, "origin_y": origin_y,
+            "recorded_at": time.monotonic(),
+        }
 
 
 def to_real(x: float, y: float) -> tuple[int, int]:
@@ -48,6 +63,17 @@ def to_real(x: float, y: float) -> tuple[int, int]:
         int(round(mapping["origin_x"] + x * mapping["scale"])),
         int(round(mapping["origin_y"] + y * mapping["scale"])),
     )
+
+
+def is_stale() -> bool:
+    """Whether the current mapping is old enough that the screen it was
+    read from probably no longer matches. False when no screenshot has been
+    recorded yet — that's the identity-mapping case above, not staleness."""
+    with _lock:
+        mapping = _mapping
+    if mapping is None:
+        return False
+    return (time.monotonic() - mapping["recorded_at"]) > STALE_AFTER_SECONDS
 
 
 def clear() -> None:

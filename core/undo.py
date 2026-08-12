@@ -114,7 +114,10 @@ def move_to_trash(src: Path) -> Path:
     src = Path(src)
     bucket = trash_dir() / uuid.uuid4().hex[:12]
     bucket.mkdir(parents=True, exist_ok=True)
-    dest = bucket / src.name
+    # src.name is "" for a bare drive root ("C:/") or "." — bucket / "" is a
+    # no-op path join, so dest would silently collapse onto bucket itself
+    # (which was just created, and empty) instead of holding a copy.
+    dest = bucket / (src.name or "item")
     if src.is_dir():
         shutil.copytree(src, dest)
     else:

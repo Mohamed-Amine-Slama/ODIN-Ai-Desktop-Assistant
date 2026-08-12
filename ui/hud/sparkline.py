@@ -22,7 +22,7 @@ class Sparkline(QWidget):
         self._unit = unit
         self._samples: deque[float] = deque(maxlen=MAX_SAMPLES)
         self._scale_max = 1.0
-        self.setMinimumHeight(44)
+        self.setMinimumHeight(36)
 
         self._anim = QPropertyAnimation(self, b"scaleMax", self)
         self._anim.setDuration(tokens.DUR_VAL)

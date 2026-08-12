@@ -17,24 +17,33 @@ GRID_GAP = 14
 # setContentsMargins(left, top, right, bottom) order.
 GRID_MARGINS = (18, 0, 18, 18)
 
-# zone -> (col_start, col_end, row_start, row_end), 1-indexed, end-exclusive —
-# copied straight from the §4 table.
+# zone -> (col_start, col_end, row_start, row_end), 1-indexed, end-exclusive.
+#
+# Row spans deviate from ODIN-HUD.md §4's literal table. That table was
+# written for a CSS layout where a panel can simply grow to fit its content;
+# translated verbatim into this fixed 24x12 Qt grid, several single-row
+# zones (storage, clock, thermals, transcript, skill log) got ~40px of real
+# content height against 70-100px+ of fixed-height widgets — the exact
+# overlapping/clipped text a live screenshot caught. These spans were
+# rebalanced against the actual per-zone pixel budget (computed from
+# GRID_GAP/GRID_MARGINS at 1920x1080) so every zone's content fits without
+# overlap; the col spans and the left/center/right grouping are unchanged.
 ZONE_GRID: dict[str, tuple[int, int, int, int]] = {
-    "A": (1, 25, 1, 2),    # header / tick ruler
-    "B": (1, 6, 2, 4),     # CPU
-    "C": (1, 6, 4, 6),     # memory
-    "C2": (1, 6, 6, 7),    # storage
-    "D": (7, 19, 2, 7),    # voice orb
-    "E": (7, 19, 7, 8),    # transcript
-    "E2": (7, 19, 8, 9),   # skill activity log
-    "F": (20, 25, 2, 3),   # clock
-    "G": (20, 25, 3, 6),   # weather
-    "H": (20, 25, 6, 7),   # temps
-    "I": (1, 6, 7, 9),     # network
-    "J": (20, 25, 7, 9),   # knowledge base
-    "K": (1, 6, 9, 11),    # audio spectrum
-    "L": (20, 25, 9, 11),  # notes / reminders
-    "M": (1, 25, 11, 13),  # dock
+    "A": (1, 25, 1, 2),     # header / tick ruler
+    "B": (1, 6, 2, 4),      # CPU
+    "C": (1, 6, 4, 6),      # memory
+    "C2": (1, 6, 6, 8),     # storage — was 1 row, needed 2
+    "D": (7, 19, 2, 7),     # voice orb
+    "E": (7, 19, 7, 9),     # transcript — was 1 row, needed 2
+    "E2": (7, 19, 9, 11),   # skill activity log — was 1 row, needed 2
+    "F": (20, 25, 2, 4),    # clock — was 1 row, needed 2
+    "G": (20, 25, 4, 6),    # weather — was 3 rows, 2 is enough
+    "H": (20, 25, 6, 8),    # temps — was 1 row, needed 2
+    "I": (1, 6, 8, 10),     # network
+    "J": (20, 25, 8, 10),   # knowledge base
+    "K": (1, 6, 10, 11),    # audio spectrum — decorative, 1 row
+    "L": (20, 25, 10, 11),  # notes / reminders — lower priority, 1 row
+    "M": (1, 25, 11, 13),   # dock
 }
 
 

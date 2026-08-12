@@ -161,3 +161,16 @@ def test_console_slash_command_does_not_reach_brain(window, mock_brain):
     window.console._on_submit()
     QTest.qWait(50)
     mock_brain.ask.assert_not_called()
+
+
+def test_console_echoes_the_reply_it_triggered(window, mock_brain):
+    # The transcript ticker (zone E) is ODIN's primary output, but the
+    # console is a self-contained surface too — someone watching only the
+    # console (not zone E, elsewhere on the HUD) must still see the reply
+    # land where they typed the question.
+    window.show_and_activate()
+    QTest.qWait(50)
+    window.console.input_field.setText("open spotify")
+    window.console._on_submit()
+    QTest.qWait(300)
+    assert "Hello from ODIN!" in window.console._scrollback.text()

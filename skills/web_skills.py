@@ -286,13 +286,17 @@ def web_search(query: str, count: int = 6) -> list[dict]:
     try:
         with DDGS() as ddgs:
             raw = list(ddgs.text(query, max_results=count))
+        return [
+            {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
+            for r in raw
+        ]
     except Exception as e:
+        # Covers a malformed/unexpected result shape from ddgs too, not just
+        # the search call itself — deep_learn's callers only catch
+        # RuntimeError (see core/research.py) to skip one subtopic rather
+        # than aborting the whole run, so any other exception type here
+        # would defeat that.
         raise RuntimeError(f"I couldn't search the web: {e}") from e
-
-    return [
-        {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
-        for r in raw
-    ]
 
 
 class WebFetchSkill(BaseSkill):
@@ -349,7 +353,7 @@ class WebFetchSkill(BaseSkill):
         finally:
             response.close()
 
-        text = raw.decode(response.encoding or "utf-8", errors="replace")
+        text = _decode_response(bytes(raw), content_type, response.encoding)
         if "html" in content_type or "<html" in text[:500].lower():
             text = _html_text(text)
         text = " ".join(text.split())
@@ -358,6 +362,26 @@ class WebFetchSkill(BaseSkill):
         if len(text) > _FETCH_MAX_CHARS:
             text = text[:_FETCH_MAX_CHARS].rstrip() + "\n\n[Page text truncated.]"
         return text
+
+
+def _decode_response(raw: bytes, content_type: str, declared_encoding: str | None) -> str:
+    """Decode a fetched page's bytes to text.
+
+    requests defaults response.encoding to ISO-8859-1 for any text/* content
+    type that doesn't declare its own charset (get_encoding_from_headers) —
+    which is almost always wrong, since most modern pages are UTF-8 and
+    simply didn't bother declaring it. Trusting that default unconditionally
+    turned every such page into mojibake. Only a charset actually present in
+    the Content-Type header is trustworthy; otherwise UTF-8 is tried first
+    (a real decode failure is a good signal it genuinely isn't UTF-8) before
+    falling back to whatever requests guessed.
+    """
+    if "charset=" in content_type and declared_encoding:
+        return raw.decode(declared_encoding, errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(declared_encoding or "utf-8", errors="replace")
 
 
 class WeatherSkill(BaseSkill):

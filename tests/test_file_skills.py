@@ -59,6 +59,13 @@ def test_search_by_name(tree):
     assert "invoice_2026.txt" in out
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_path_is_rejected_for_read_only_skills(blank):
+    assert "path" in ReadFileSkill().run(path=blank).lower()
+    assert "path" in ListDirSkill().run(path=blank).lower()
+    assert "directory" in SearchFilesSkill().run(root=blank, pattern="*").lower()
+
+
 def test_search_by_content(tree):
     out = SearchFilesSkill().run(root=str(tree), pattern="*.txt", contains="treasure")
     assert "deep.txt" in out
@@ -222,4 +229,45 @@ def test_make_dir_then_undo(journal, tmp_path):
 def test_delete_missing_file_records_no_undo(journal, tmp_path):
     out = DeleteFileSkill().run(path=str(tmp_path / "ghost.txt"))
     assert "no file" in out.lower()
-    assert get_journal().latest() is None, "a no-op must not offer a fake undo"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_path_is_rejected_rather_than_resolving_to_cwd(journal, blank):
+    """Path("").expanduser() silently resolves to the process's own working
+    directory rather than raising — every mutating skill must reject a
+    blank path outright rather than quietly operating on Jarvis's own cwd."""
+    assert "path" in WriteFileSkill().run(path=blank, content="x").lower()
+    assert "path" in DeleteFileSkill().run(path=blank).lower()
+    assert "path" in MakeDirSkill().run(path=blank).lower()
+    assert "path" in MoveFileSkill().run(src=blank, dst="dst.txt").lower()
+    assert "path" in MoveFileSkill().run(src="src.txt", dst=blank).lower()
+    assert get_journal().latest() is None
+
+
+def test_overwrite_failure_after_truncation_still_leaves_a_usable_undo(journal, monkeypatch, tmp_path):
+    """write_text() opens in "w" mode, which truncates the file immediately
+    — before a single byte of new content lands. If the write then fails
+    partway (simulated here), the backup taken before the write started
+    must still be a valid, discoverable undo entry: the original must not
+    end up destroyed with no way back."""
+    target = tmp_path / "doc.txt"
+    target.write_text("ORIGINAL", encoding="utf-8")
+
+    real_write_text = Path.write_text
+
+    def _truncate_then_fail(self, *a, **k):
+        if self == target:
+            self.write_bytes(b"")  # simulate write_text's truncate-on-open
+            raise OSError("disk full")
+        return real_write_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", _truncate_then_fail)
+
+    out = WriteFileSkill().run(path=str(target), content="REPLACED")
+    assert target.read_text(encoding="utf-8") == ""  # confirms the failure really did truncate it
+    assert "recoverable" in out.lower() or "backed up" in out.lower()
+
+    entry = get_journal().latest()
+    assert entry is not None, "the pre-write backup must still be a usable undo entry"
+    get_journal().undo(entry.token)
+    assert target.read_text(encoding="utf-8") == "ORIGINAL"

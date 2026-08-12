@@ -295,14 +295,14 @@ class TelemetryWorker(QThread):
 
     def _thermals(self) -> ThermalSample:
         """§10: never fabricate. Every field stays None — rendering `--` —
-        unless the matching optional backend (requirements-hud.txt) is both
+        unless the matching optional backend (requirements.txt) is both
         installed and actually reachable."""
         cpu_c = fan_rpm = None
         gpu_c = gpu_load = gpu_vram_percent = None
 
         if not self._wmi_missing:
             try:
-                import wmi  # optional: requirements-hud.txt
+                import wmi  # optional: requirements.txt
 
                 if self._wmi_lhm is None:
                     self._wmi_lhm = wmi.WMI(namespace="root\\LibreHardwareMonitor")
@@ -316,7 +316,7 @@ class TelemetryWorker(QThread):
 
         if not self._nvml_missing:
             try:
-                import pynvml  # optional: requirements-hud.txt
+                import pynvml  # optional: requirements.txt (nvidia-ml-py)
 
                 if not self._nvml_ready:
                     pynvml.nvmlInit()

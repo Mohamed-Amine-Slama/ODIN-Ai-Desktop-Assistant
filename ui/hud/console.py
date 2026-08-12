@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import QLineEdit, QVBoxLayout, QWidget
 
@@ -16,6 +16,11 @@ from . import tokens
 from .widgets import Panel
 
 SCROLLBACK_LINES = 6
+# Matches Panel's own private _TITLE_H (widgets.py) — the band above the
+# hairline rule where Panel paints its own background rather than a child
+# widget, so it's the only region that can hand mouse events to us instead
+# of the scrollback label or input field underneath.
+_DRAG_HANDLE_HEIGHT = 20
 
 
 class ConsoleOverlay(QWidget):
@@ -35,6 +40,11 @@ class ConsoleOverlay(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         self.panel = Panel("ODIN CONSOLE", self)
         outer.addWidget(self.panel)
+
+        # Drag state: set on a press inside the title band (see eventFilter
+        # below), cleared on release. None means "not dragging."
+        self._drag_offset: QPoint | None = None
+        self.panel.installEventFilter(self)
 
         self._lines: deque[str] = deque(maxlen=SCROLLBACK_LINES)
         from PyQt6.QtWidgets import QLabel
@@ -86,3 +96,43 @@ class ConsoleOverlay(QWidget):
             self.hide_console()
             return
         super().keyPressEvent(event)
+
+    # -- dragging --------------------------------------------------------
+    # This is a plain QWidget floating over the HUD's root widget, not an
+    # OS-level window, so there's no title bar to drag by default — Qt gives
+    # window-manager dragging for free only to real top-level windows.
+    # Panel (self.panel) fills this widget's entire rect via a zero-margin
+    # layout, so it — not self — is what actually receives mouse events; an
+    # event filter on it is the only way to intercept the title band's
+    # clicks before Panel (which has no mouse handling of its own) ignores
+    # them.
+
+    def eventFilter(self, obj: QObject, event) -> bool:
+        if obj is self.panel:
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+                and event.position().y() <= _DRAG_HANDLE_HEIGHT
+            ):
+                self._drag_offset = event.position().toPoint()
+                return True
+            if event.type() == QEvent.Type.MouseMove and self._drag_offset is not None:
+                if event.buttons() & Qt.MouseButton.LeftButton:
+                    self._move_clamped(event.position().toPoint() - self._drag_offset)
+                else:
+                    self._drag_offset = None
+                return True
+            if event.type() == QEvent.Type.MouseButtonRelease and self._drag_offset is not None:
+                self._drag_offset = None
+                return True
+        return super().eventFilter(obj, event)
+
+    def _move_clamped(self, delta: QPoint) -> None:
+        parent = self.parentWidget()
+        target = self.pos() + delta
+        if parent is not None:
+            max_x = max(parent.width() - self.width(), 0)
+            max_y = max(parent.height() - self.height(), 0)
+            target.setX(min(max(target.x(), 0), max_x))
+            target.setY(min(max(target.y(), 0), max_y))
+        self.move(target)
