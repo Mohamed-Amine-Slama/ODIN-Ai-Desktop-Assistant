@@ -91,6 +91,66 @@ def test_launch_preset_is_a_no_op_while_a_turn_is_in_flight(window, mock_brain):
     QTest.qWait(300)
 
 
+def test_voice_heard_is_a_no_op_while_a_turn_is_in_flight(window, mock_brain, mock_session):
+    """Mirrors _launch_preset's guard: without it, a voice-heard turn and a
+    dock/console-triggered turn could both start a BrainWorker, racing on
+    Brain's shared history and the confirmation bridge's single Event."""
+    mock_session.mode = "voice"
+    window.show_and_activate()
+    window._launch_preset("typed command")  # sets current_worker
+    calls_after_first = mock_brain.ask.call_count
+
+    window._on_voice_heard("something spoken")
+
+    assert mock_brain.ask.call_count == calls_after_first
+    QTest.qWait(300)
+
+
+def test_voice_heard_starts_a_turn_when_idle(window, mock_brain, mock_session):
+    mock_session.mode = "voice"
+    window.show_and_activate()
+    window._on_voice_heard("hello")
+    QTest.qWait(300)
+    mock_brain.ask.assert_called_with("hello")
+
+
+def test_reset_is_refused_while_a_turn_is_in_flight(window, mock_brain):
+    """Brain.ask() snapshots self.history at the start of a turn and only
+    writes it back at the end — a reset while a turn is in flight would
+    appear to work, then be silently overwritten when that turn finishes."""
+    window.show_and_activate()
+    window._launch_preset("first command")  # sets current_worker
+
+    window.trigger_reset()
+
+    mock_brain.reset.assert_not_called()
+    assert "wait" in window.console._scrollback.text().lower()
+    QTest.qWait(300)
+
+
+def test_reset_runs_when_idle(window, mock_brain):
+    window.show_and_activate()
+    window.trigger_reset()
+    mock_brain.reset.assert_called_once()
+
+
+def test_switch_to_voice_is_a_no_op_while_the_voice_loop_is_already_running(window):
+    """Reachable via '/mode voice' typed twice, not just the dock toggle
+    (which already checks session.mode) — without this guard, a second call
+    would overwrite _voice_loop_worker with a new VoiceListenWorker while
+    the first is still running, leaking its thread and duplicating every
+    transcription."""
+    from unittest.mock import MagicMock
+
+    sentinel = MagicMock()
+    window._voice_loop_worker = sentinel
+
+    window._switch_to_voice()
+
+    assert window._voice_setup_worker is None
+    assert window._voice_loop_worker is sentinel
+
+
 def test_confirm_requested_shows_a_banner_and_answering_clears_it(window):
     window.show_and_activate()
     QTest.qWait(50)

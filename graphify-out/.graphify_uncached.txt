@@ -1,8 +1,0 @@
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/ODIN-HUD.md
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/Plan.md
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/README.md
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/docs/superpowers/plans/2026-08-10-jarvis-system-access.md
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/docs/superpowers/specs/2026-08-10-jarvis-system-access-design.md
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/requirements.txt
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/1db5c47072bf7764c8130b9ad0009427.jpg
-/mnt/c/Users/moham/OneDrive/Desktop/Jarvis/d6016865af34cc7c5889657fd0ed035f.jpg

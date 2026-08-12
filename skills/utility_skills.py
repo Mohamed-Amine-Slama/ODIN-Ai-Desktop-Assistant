@@ -1,6 +1,7 @@
 """General utility skills."""
 import ast
 import datetime
+import math
 import operator
 import time
 
@@ -109,6 +110,12 @@ class ReminderSkill(BaseSkill):
             minutes = float(minutes)
         except (TypeError, ValueError):
             return "I need a number of minutes for the reminder."
+        if not math.isfinite(minutes):
+            # NaN slips past `< 0` (every NaN comparison is False), and +inf
+            # passes it too — either would store a fire_at that no later
+            # `WHERE fire_at <= ?` scheduler check can ever match, so the
+            # reminder would silently be created and then never fire.
+            return "I need a real number of minutes for the reminder."
         if minutes < 0:
             return "I can't set a reminder in the past."
 

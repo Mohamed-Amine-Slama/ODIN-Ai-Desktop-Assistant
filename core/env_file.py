@@ -6,6 +6,7 @@ Never reads a value back out loud or logs the file's contents; it only ever
 writes the couple of keys a toggle just changed.
 """
 import os
+import tempfile
 
 import config
 
@@ -31,5 +32,20 @@ def update_env(values: dict[str, str]) -> None:
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    # Written to a temp file in the same directory, then swapped into place
+    # with os.replace() — a plain open(path, "w") truncates immediately, so
+    # a crash between the truncate and the write completing would otherwise
+    # leave .env empty or partially written, losing every setting (API_KEY
+    # included), not just the couple of keys this call touched.
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".env.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise

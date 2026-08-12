@@ -4,6 +4,7 @@ The heavy deps (faster-whisper, openwakeword, sounddevice, pygame) are not
 installed in CI, so these cover the logic that surrounds them: graceful
 degradation, the confirmation parser, and the speech queue.
 """
+import os
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import config
-from core.speech_output import SpeechOutput, _make_engine
+from core.speech_output import EdgeEngine, SapiEngine, SpeechOutput, _make_engine
 from main import NO_WORDS, YES_WORDS, Session
 
 
@@ -122,6 +123,156 @@ def test_stop_drains_the_queue_and_stops_the_engine(monkeypatch):
         speaker.wait(timeout=1)  # must not hang on drained backlog
     finally:
         speaker.shutdown()
+
+
+def test_edge_engine_stop_actually_stops_the_mixer(monkeypatch):
+    """The real EdgeEngine had no stop() method at all — SpeechOutput.stop()
+    calling self._engine.stop() against it was always an AttributeError,
+    swallowed by SpeechOutput.stop()'s own bare except, so barge-in never
+    actually interrupted audio already playing through pygame.mixer.music.
+    Every other test here uses a fake engine that *does* implement stop(),
+    which is exactly what hid this."""
+    calls = []
+
+    class FakeMusic:
+        def stop(self):
+            calls.append("stop")
+
+    class FakeMixer:
+        music = FakeMusic()
+
+        def init(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "edge_tts", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "pygame", SimpleNamespace(mixer=FakeMixer()))
+
+    engine = EdgeEngine("en-GB-RyanNeural")
+    engine.stop()
+
+    assert calls == ["stop"]
+
+
+def test_sapi_engine_stop_actually_stops_the_underlying_engine(monkeypatch):
+    """Same missing-stop() defect as EdgeEngine, for the offline pyttsx3
+    fallback."""
+    calls = []
+
+    class FakePyttsx3Engine:
+        def setProperty(self, name, value):  # noqa: ARG002
+            pass
+
+        def stop(self):
+            calls.append("stop")
+
+    monkeypatch.setitem(sys.modules, "pyttsx3", SimpleNamespace(init=lambda: FakePyttsx3Engine()))
+
+    engine = SapiEngine(config.TTS_RATE)
+    engine.stop()
+
+    assert calls == ["stop"]
+
+
+def test_edge_engine_synthesize_failure_does_not_leak_the_temp_file(monkeypatch):
+    """tempfile.mkstemp() runs before the network call — if that call then
+    fails, the file it already created must not be left behind."""
+    import core.speech_output as speech_output_module
+
+    class FakeCommunicate:
+        def __init__(self, text, voice):  # noqa: ARG002
+            pass
+
+        async def save(self, path):  # noqa: ARG002
+            raise RuntimeError("network down")
+
+    class FakeMixer:
+        music = SimpleNamespace(stop=lambda: None)
+
+        def init(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "edge_tts", SimpleNamespace(Communicate=FakeCommunicate))
+    monkeypatch.setitem(sys.modules, "pygame", SimpleNamespace(mixer=FakeMixer()))
+
+    engine = EdgeEngine("en-GB-RyanNeural")
+
+    created_paths = []
+    real_mkstemp = speech_output_module.tempfile.mkstemp
+
+    def spy_mkstemp(*a, **k):
+        fd, path = real_mkstemp(*a, **k)
+        created_paths.append(path)
+        return fd, path
+
+    monkeypatch.setattr(speech_output_module.tempfile, "mkstemp", spy_mkstemp)
+
+    with pytest.raises(RuntimeError):
+        engine._synthesize("hello")
+
+    assert created_paths
+    assert not os.path.exists(created_paths[0])
+
+
+def test_vad_threshold_does_not_deadlock_on_the_first_block():
+    """Seeding the noise floor from the first block's own level made
+    threshold = level * 3 on that very first call — "level >= level * 3" is
+    false for any level > 0, so real speech starting with no leading
+    silence would deterministically miss its own first block, and
+    steady-volume continuous speech barely nudges the floor away from that
+    self-referential trap on the blocks right after (can stall the whole
+    recording out to VAD_MAX_SECONDS instead of just missing one block)."""
+    from core.speech_input import SpeechInput
+
+    instance = SpeechInput.__new__(SpeechInput)  # __init__ would load a real Whisper model
+    instance._noise_floor = None
+
+    level = 0.03  # within config.py's documented ~0.02-0.05 typical-speech range
+    threshold = instance._threshold(level, heard_speech=False)
+
+    assert level >= threshold
+
+
+def test_record_unsubscribes_even_if_something_raises_mid_loop(monkeypatch):
+    """A bare (non-try/finally) unsubscribe after the loop skips cleanup on
+    any exception other than the one already caught around q.get() —
+    permanently leaking this queue as a registered consumer, so every
+    future audio block gets appended to a queue nothing will ever drain
+    again."""
+    import queue as queue_module
+
+    import numpy as np
+
+    from core.speech_input import SpeechInput
+
+    class FakeMic:
+        def __init__(self):
+            self.block_size = 1280
+            self.sample_rate = 16000
+            self.unsubscribed = []
+            self._q = queue_module.Queue()
+            self._q.put(np.zeros(1280, dtype=np.int16))
+
+        def subscribe(self):
+            return self._q
+
+        def unsubscribe(self, q):
+            self.unsubscribed.append(q)
+
+    mic = FakeMic()
+    instance = SpeechInput.__new__(SpeechInput)
+    instance.mic = mic
+    instance._np = np
+    instance._noise_floor = None
+
+    def _boom(block, np):  # noqa: ARG001
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("core.speech_input.rms", _boom)
+
+    with pytest.raises(RuntimeError):
+        instance._record(max_seconds=1.0)
+
+    assert mic.unsubscribed == [mic._q]
 
 
 def test_is_speaking_reflects_playback_state(monkeypatch):

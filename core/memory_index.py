@@ -89,13 +89,17 @@ def search(query_text: str, limit: int = 20) -> list[str]:
         if collection.count() == 0:
             return []
         embedding = get_embedder().encode([query_text]).tolist()
+        result = collection.query(
+            query_embeddings=embedding,
+            n_results=min(limit, max(1, collection.count())),
+        )
+        docs = (result.get("documents") or [[]])[0]
+        dists = (result.get("distances") or [[]])[0]
+        return [doc for doc, dist in zip(docs, dists) if dist <= RELEVANCE_DISTANCE_MAX]
     except Exception:
+        # Every caller (core.store.recall(), MemorySkill) depends on this
+        # module's own documented contract — degrade to "nothing indexed
+        # yet," never raise — so a real Chroma failure at query time
+        # (corrupted collection, a version mismatch after an upgrade, disk
+        # I/O) has to be covered too, not just the setup calls above it.
         return []
-
-    result = collection.query(
-        query_embeddings=embedding,
-        n_results=min(limit, max(1, collection.count())),
-    )
-    docs = (result.get("documents") or [[]])[0]
-    dists = (result.get("distances") or [[]])[0]
-    return [doc for doc, dist in zip(docs, dists) if dist <= RELEVANCE_DISTANCE_MAX]

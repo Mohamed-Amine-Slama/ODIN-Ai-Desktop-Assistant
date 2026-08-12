@@ -13,6 +13,7 @@ this module only chunks, embeds, and retrieves what it's handed.
 import os
 import re
 import time
+import uuid
 
 import config
 from core.embeddings import get_embedder
@@ -99,7 +100,13 @@ def store_notes(topic: str, subtopic: str, notes: str, sources: list[str]) -> in
     embeddings = get_embedder().encode(chunks).tolist()
     source_str = " | ".join(sources[:5])
     ts = time.time()
-    base_id = f"{_slug(topic)}::{_slug(subtopic)}::{int(ts * 1000)}"
+    # The uuid suffix is what actually guarantees uniqueness — millisecond
+    # timestamps alone collide under two store_notes() calls for the same
+    # topic+subtopic within the same millisecond (overlapping deep_learn
+    # runs on the same topic from two conversations), and a second upsert
+    # to the same ids silently overwrites the first call's chunks instead
+    # of adding to them.
+    base_id = f"{_slug(topic)}::{_slug(subtopic)}::{int(ts * 1000)}::{uuid.uuid4().hex[:8]}"
     ids = [f"{base_id}::{i}" for i in range(len(chunks))]
     metadatas = [
         {"topic": topic, "subtopic": subtopic, "sources": source_str, "ts": ts}

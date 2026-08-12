@@ -7,7 +7,7 @@ its tool_result left history permanently invalid, 400ing every later request.
 import openai
 import pytest
 
-from conftest import response, text_block, tool_use_block
+from conftest import openai_chunk, response, text_block, tool_use_block
 
 
 def test_simple_turn_commits_history(make_brain):
@@ -103,6 +103,27 @@ def test_refusal_produces_valid_history(make_brain):
     reply = brain.ask("do something disallowed")
 
     assert "can't help" in reply
+    assert brain.history[-1]["content"], "assistant message must not be empty"
+    assert brain.ask("something benign") == "Sure, here you go."
+
+
+def test_openai_path_empty_completion_produces_valid_history(make_brain):
+    """A gateway can legitimately stream zero text deltas and zero tool
+    calls — a reasoning-heavy model burning its whole budget on hidden
+    reasoning and hitting finish_reason="length", or simply an empty
+    completion. Appending that verbatim as {"role": "assistant",
+    "content": []} is the same "history left holding a malformed message"
+    failure class as an unhandled refusal, just reached through the
+    OpenAI-compatible path (_call_openai_model) instead of Anthropic's
+    literal "refusal" stop_reason."""
+    brain = make_brain([
+        [openai_chunk(finish_reason="length")],
+        response([text_block("Sure, here you go.")]),
+    ])
+
+    reply = brain.ask("write me an essay")
+
+    assert reply  # not an empty/falsy reply
     assert brain.history[-1]["content"], "assistant message must not be empty"
     assert brain.ask("something benign") == "Sure, here you go."
 

@@ -121,6 +121,12 @@ def main() -> None:
         hud._stop_voice_loop()
         hud.telemetry.stop()
         hud.telemetry.wait(2000)
+        # dismiss() (the window-close path) already stops this; aboutToQuit
+        # can also fire without dismiss() running first (tray "Quit"), and
+        # without this a mid-request WeatherWorker (up to an 8s timeout)
+        # could still be alive when the interpreter starts tearing down.
+        hud.weather.stop()
+        hud.weather.wait(2000)
         bridge.release()  # let a worker parked on a confirmation fall through
         scheduler.stop()
         session.shutdown()

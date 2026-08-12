@@ -145,15 +145,33 @@ class EdgeEngine:
                 except OSError:
                     pass
 
+    def stop(self) -> None:
+        """Interrupt playback that's in progress — for barge-in. Calling
+        this drops mixer.music's get_busy() to False, which is what lets
+        speak()'s poll loop above (running on SpeechOutput's worker thread)
+        exit and fall through to its own cleanup."""
+        self._mixer.music.stop()
+
     def _synthesize(self, text: str) -> str:
         fd, path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
 
-        async def run():
-            await self._edge_tts.Communicate(text, self.voice).save(path)
+        try:
+            async def run():
+                await self._edge_tts.Communicate(text, self.voice).save(path)
 
-        # The worker thread has no running loop, so a fresh one is fine here.
-        asyncio.run(run())
+            # The worker thread has no running loop, so a fresh one is fine here.
+            asyncio.run(run())
+        except Exception:
+            # mkstemp already created the file above — without this, a
+            # network failure here (edge-tts never got to write it) leaks
+            # one temp .mp3 per failed synthesis, since speak()'s own
+            # cleanup only runs for a path it actually received back.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
         return path
 
 
@@ -171,6 +189,10 @@ class SapiEngine:
     def speak(self, text: str) -> None:
         self._engine.say(text)
         self._engine.runAndWait()
+
+    def stop(self) -> None:
+        """Interrupt playback that's in progress — for barge-in."""
+        self._engine.stop()
 
 
 def _make_engine(preference: str, voice: str):

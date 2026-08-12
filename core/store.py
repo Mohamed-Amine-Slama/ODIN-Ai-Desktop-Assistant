@@ -85,9 +85,19 @@ class Store:
                 "SELECT role, content FROM messages ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
 
-        messages = [
-            {"role": r["role"], "content": json.loads(r["content"])} for r in reversed(rows)
-        ]
+        messages = []
+        for r in reversed(rows):
+            try:
+                content = json.loads(r["content"])
+            except (json.JSONDecodeError, TypeError):
+                # A single corrupted row (partial write from a hard kill,
+                # disk corruption, a hand-edited DB) must not take down the
+                # whole app at startup — every write into this table already
+                # treats persistence failures as "degrade, don't crash" (see
+                # Brain._persist()); the read path deserves the same rather
+                # than propagating out of load_history() unguarded.
+                continue
+            messages.append({"role": r["role"], "content": content})
 
         # A conversation may not start on an assistant turn, and must never
         # start on a tool_result whose tool_use we just trimmed away.

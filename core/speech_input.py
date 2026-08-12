@@ -60,28 +60,35 @@ class SpeechInput:
         silent_run = 0
         heard_speech = False
 
-        for _ in range(max_blocks):
-            try:
-                block = q.get(timeout=1.0)
-            except Exception:
-                break
-
-            level = rms(block, np)
-            threshold = self._threshold(level, heard_speech)
-
-            if level >= threshold:
-                heard_speech = True
-                silent_run = 0
-                collected.append(block)
-            elif heard_speech:
-                # Keep trailing silence — clipping the last word hurts accuracy.
-                silent_run += 1
-                collected.append(block)
-                if silent_run >= silence_blocks_needed:
+        try:
+            for _ in range(max_blocks):
+                try:
+                    block = q.get(timeout=1.0)
+                except Exception:
                     break
-            # Leading silence before any speech is simply dropped.
 
-        self.mic.unsubscribe(q)
+                level = rms(block, np)
+                threshold = self._threshold(level, heard_speech)
+
+                if level >= threshold:
+                    heard_speech = True
+                    silent_run = 0
+                    collected.append(block)
+                elif heard_speech:
+                    # Keep trailing silence — clipping the last word hurts accuracy.
+                    silent_run += 1
+                    collected.append(block)
+                    if silent_run >= silence_blocks_needed:
+                        break
+                # Leading silence before any speech is simply dropped.
+        finally:
+            # A bare statement here (as this used to be) would skip the
+            # unsubscribe on any exception other than the one already
+            # caught around q.get() above, permanently leaking this queue
+            # as a registered consumer in Microphone._consumers — every
+            # future audio block would then be appended to a queue nothing
+            # is ever going to drain again.
+            self.mic.unsubscribe(q)
 
         if not heard_speech:
             return None
@@ -92,7 +99,15 @@ class SpeechInput:
         so a noisy room doesn't make Jarvis deaf (or a silent one make it
         trigger-happy)."""
         if self._noise_floor is None:
-            self._noise_floor = level
+            # Seeded at 0.0 (assume silence going in), not this block's own
+            # level. Seeding from the block's own level is a deadlock if
+            # speech starts on block one with no leading silence: threshold
+            # becomes level * 3, "level >= level * 3" is false for that same
+            # level, and steady-volume continuous speech barely nudges the
+            # floor away from that self-referential trap on the blocks right
+            # after — so heard_speech can stay false for the whole recording
+            # instead of just missing one block.
+            self._noise_floor = 0.0
         if not heard_speech:
             # Slow decay toward the current ambient level.
             self._noise_floor = 0.9 * self._noise_floor + 0.1 * level
