@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 
 from PyQt6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRectF, Qt, QTimer, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen, QRadialGradient
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QRadialGradient
 from PyQt6.QtWidgets import QWidget
 
 from . import tokens
@@ -30,6 +30,15 @@ _STATUS_LABELS = {
     "speaking": "SPEAKING",
     "error": "ERROR",
 }
+
+
+def _lerp_color(a: QColor, b: QColor, t: float) -> QColor:
+    t = max(0.0, min(1.0, t))
+    return QColor(
+        int(a.red() + (b.red() - a.red()) * t),
+        int(a.green() + (b.green() - a.green()) * t),
+        int(a.blue() + (b.blue() - a.blue()) * t),
+    )
 
 
 class VoiceOrb(QWidget):
@@ -62,6 +71,16 @@ class VoiceOrb(QWidget):
         self._hover_index: int | None = None
         self._flashing = False
 
+        # Boot sequence hooks (ui/hud/boot.py): frozen holds the rings still
+        # until the core-ignition beat, per ODIN-HUD.md §8 ("rings begin
+        # rotating" only once the core ignites, not from frame one).
+        # bootScale/bootFlash are separate from the state-driven properties
+        # above so the boot animation never has to fight the idle breathing
+        # or state-color logic — it's a pure multiply/blend on top.
+        self.boot_frozen = False
+        self._boot_scale = 1.0
+        self._boot_flash = 0.0
+
         self._data_anim = QPropertyAnimation(self, b"dataValue", self)
         self._data_anim.setDuration(tokens.DUR_VAL)
         self._data_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -69,6 +88,21 @@ class VoiceOrb(QWidget):
         self._error_timer = QTimer(self)
         self._error_timer.setSingleShot(True)
         self._error_timer.timeout.connect(self._clear_error_flash)
+
+        # Perf: the tick ring is 120 hairlines recomputed from trig every
+        # single frame at 30fps in the original implementation — by far the
+        # most expensive thing this widget painted, since each is its own
+        # native draw call. The geometry is fixed (only overall rotation
+        # changes), so it's built exactly once here and just rotated with a
+        # transform at paint time — 120 drawLine calls become one drawPath.
+        self._tick_path = self._build_tick_path()
+
+        # Perf: the outer ring's 32 segments each need a fresh alpha every
+        # frame (a breathing sine wave), but the QColor/QPen objects
+        # themselves don't need to be reconstructed from scratch each
+        # time — they're built once per accent color and mutated in place.
+        self._outer_pens: list[QPen] = []
+        self._outer_pens_accent: tuple[int, int, int] | None = None
 
     # -- state ---------------------------------------------------------
 
@@ -135,12 +169,35 @@ class VoiceOrb(QWidget):
 
     dataValue = pyqtProperty(float, getDataValue, setDataValue)
 
+    def getBootScale(self) -> float:
+        return self._boot_scale
+
+    def setBootScale(self, value: float) -> None:
+        self._boot_scale = value
+        self.update()
+
+    bootScale = pyqtProperty(float, getBootScale, setBootScale)
+
+    def getBootFlash(self) -> float:
+        return self._boot_flash
+
+    def setBootFlash(self, value: float) -> None:
+        self._boot_flash = value
+        self.update()
+
+    bootFlash = pyqtProperty(float, getBootFlash, setBootFlash)
+
     # -- driven by the shared animation loop (ODIN-HUD.md §10) --------------
 
     def advance(self, dt: float) -> None:
-        if not self._flashing:
-            self._phase = (self._phase + dt * self._ring_speed()) % 360.0
-            self._tick_phase = (self._tick_phase - dt * 4.0) % 360.0
+        # Held still by the boot sequence until the core-ignition beat
+        # (ODIN-HUD.md §8: "rings begin rotating" there, not from frame
+        # one) — the breathing/flash phase still needs to advance so the
+        # ignition flash itself can animate smoothly.
+        if not self.boot_frozen:
+            if not self._flashing:
+                self._phase = (self._phase + dt * self._ring_speed()) % 360.0
+                self._tick_phase = (self._tick_phase - dt * 4.0) % 360.0
         self._breathe_phase += dt
         self.update()
 
@@ -229,6 +286,12 @@ class VoiceOrb(QWidget):
         painter.save()
         painter.translate((self.width() - side) / 2, (self.height() - side) / 2)
         painter.scale(scale, scale)
+        if self._boot_scale != 1.0:
+            # Boot sequence only (ui/hud/boot.py): rings scale in from 0.85
+            # to 1.0 around the orb's own center, per ODIN-HUD.md §8.
+            painter.translate(self.CENTER, self.CENTER)
+            painter.scale(self._boot_scale, self._boot_scale)
+            painter.translate(-self.CENTER, -self.CENTER)
 
         accent = self._core_color()
         ring_accent = tokens.THINKING if self._state == "thinking" else tokens.CY_300
@@ -256,18 +319,34 @@ class VoiceOrb(QWidget):
         painter.setBrush(glow)
         painter.drawEllipse(QPointF(self.CENTER, self.CENTER), r, r)
 
+    def _outer_ring_pens(self, accent: QColor, n: int) -> list[QPen]:
+        """Perf: n QColor + n QPen objects were reconstructed from scratch
+        every single frame here (only the alpha actually changes frame to
+        frame) — now built once per accent color and reused, only their
+        alpha mutated in place."""
+        key = (accent.red(), accent.green(), accent.blue())
+        if self._outer_pens_accent != key or len(self._outer_pens) != n:
+            self._outer_pens = []
+            for _ in range(n):
+                pen = QPen(QColor(accent), 3.0)
+                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                self._outer_pens.append(pen)
+            self._outer_pens_accent = key
+        return self._outer_pens
+
     def _paint_outer_ring(self, painter: QPainter, accent: QColor) -> None:
         n = 32
         gap_deg = 4.0
         seg_span = 360.0 / n - gap_deg
         rect = QRectF(self.CENTER - self.R_OUTER, self.CENTER - self.R_OUTER, self.R_OUTER * 2, self.R_OUTER * 2)
+        pens = self._outer_ring_pens(accent, n)
         for i in range(n):
             start = self._phase + i * (360.0 / n)
             wave = 0.5 + 0.5 * math.sin(math.radians(start) + self._breathe_phase)
-            color = QColor(accent)
+            pen = pens[i]
+            color = pen.color()
             color.setAlphaF(0.25 + 0.75 * wave)
-            pen = QPen(color, 3.0)
-            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            pen.setColor(color)
             painter.setPen(pen)
             painter.drawArc(rect, int(start * 16), int(-seg_span * 16))
 
@@ -299,18 +378,33 @@ class VoiceOrb(QWidget):
             painter.setPen(tokens.CY_100 if hovered else tokens.CY_200)
             painter.drawText(QRectF(tx - 30, ty - 8, 60, 16), Qt.AlignmentFlag.AlignCenter, label)
 
-    def _paint_tick_ring(self, painter: QPainter) -> None:
+    def _build_tick_path(self) -> QPainterPath:
+        """The 120 tick marks' geometry is fixed — only their overall
+        rotation changes frame to frame — so it's built once at a baseline
+        orientation (tick_phase == 0) and just rotated at paint time
+        instead of recomputing 120 trig-derived line segments every frame."""
         n = 120
-        color = QColor(tokens.CY_400)
-        color.setAlphaF(0.55)
-        painter.setPen(QPen(color, 1.2))
+        path = QPainterPath()
         for i in range(n):
-            ang = math.radians(self._tick_phase + i * 360.0 / n)
+            ang = math.radians(i * 360.0 / n)
             x0 = self.CENTER + (self.R_TICK - 6) * math.cos(ang)
             y0 = self.CENTER - (self.R_TICK - 6) * math.sin(ang)
             x1 = self.CENTER + self.R_TICK * math.cos(ang)
             y1 = self.CENTER - self.R_TICK * math.sin(ang)
-            painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+            path.moveTo(x0, y0)
+            path.lineTo(x1, y1)
+        return path
+
+    def _paint_tick_ring(self, painter: QPainter) -> None:
+        color = QColor(tokens.CY_400)
+        color.setAlphaF(0.55)
+        painter.setPen(QPen(color, 1.2))
+        painter.save()
+        painter.translate(self.CENTER, self.CENTER)
+        painter.rotate(-self._tick_phase)
+        painter.translate(-self.CENTER, -self.CENTER)
+        painter.drawPath(self._tick_path)
+        painter.restore()
 
     def _paint_data_ring(self, painter: QPainter, accent: QColor) -> None:
         rect = QRectF(self.CENTER - self.R_DATA, self.CENTER - self.R_DATA, self.R_DATA * 2, self.R_DATA * 2)
@@ -334,6 +428,12 @@ class VoiceOrb(QWidget):
 
     def _paint_core(self, painter: QPainter, accent: QColor) -> None:
         r = self._core_radius()
+        if self._boot_flash > 0.0:
+            # Boot sequence only (ui/hud/boot.py): core ignition — a flash
+            # to white settling back to the idle gradient, per
+            # ODIN-HUD.md §8.
+            accent = _lerp_color(accent, QColor(255, 255, 255), self._boot_flash)
+            r *= 1.0 + 0.5 * self._boot_flash
         gradient = QRadialGradient(QPointF(self.CENTER, self.CENTER), r)
         gradient.setColorAt(0.0, QColor(0xDF, 0xFB, 0xFF))
         gradient.setColorAt(0.55, accent)

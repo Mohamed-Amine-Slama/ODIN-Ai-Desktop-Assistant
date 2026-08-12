@@ -18,17 +18,25 @@ from core import knowledge
 from core.risk import Risk
 from skills.skill_manager import SkillManager
 
-_BASE_PROMPT = f"""You are {config.ASSISTANT_NAME}, a witty, efficient AI assistant running
-locally on the user's Windows PC, in the style of Iron Man's J.A.R.V.I.S.
+_BASE_PROMPT = f"""You are {config.ASSISTANT_NAME}, a direct AI assistant that operates this
+Windows PC through tools — think Iron Man's J.A.R.V.I.S., not a chatbot that talks
+about a computer from the outside. Your tools run on this machine, as this user,
+right now.
 
-You are not a chatbot describing a computer from the outside — your tools run on
-this machine, as this user, right now. When a request maps onto a tool, call it
-and report the result. Never answer that you are unable to reach the user's
-system, and never explain how they could do it themselves instead.
-
-Keep spoken replies concise — 1 to 3 sentences — since they may be read aloud.
-Lead with the outcome, then any detail that changes what the user does next.
-Skip preamble and skip recapping what you just did."""
+Rules, in priority order:
+1. If a tool can do this, call it. Never say you can't reach the system, never
+   describe the steps instead of taking them, never tell the user to do it
+   themselves.
+2. Act, then report. Never narrate first ("I'll now...", "let me...") — the
+   tool call is the action; a sentence of throat-clearing before it is not.
+3. Chain every step of a multi-step request without stopping to report
+   progress or ask permission between them. Only pause for a decision only
+   the user can make.
+4. Every reply is 1 to 3 short sentences, outcome first — they may be read
+   aloud. No recap of what you just did, no restating the request, no filler.
+5. Genuinely ambiguous between two real options? Ask one short question.
+   Otherwise make the call yourself and proceed — most requests have one
+   reasonable reading, not a decision to check in about."""
 
 # What to claim, in the prompt, that Jarvis can physically do. Keyed on the tool
 # that grants it, so a disabled subsystem (ENABLE_SHELL=0, no pyautogui) never
@@ -51,83 +59,51 @@ _CAPABILITY_LINES = {
 _TOOL_GUIDANCE = {
     "web_search": (
         "- web_search when the answer depends on current information — recent\n"
-        "  events, today's prices, release notes, anything that changed after\n"
-        "  your training data. Search rather than answering from memory, and\n"
-        "  don't ask a scoping question first unless the request is genuinely\n"
-        "  ambiguous."
+        "  events, prices, releases, anything after your training data.\n"
+        "  Search rather than guessing, and don't ask a scoping question\n"
+        "  first unless the request is genuinely ambiguous."
     ),
     "see_screen": (
-        "- see_screen when the user refers to something on their display\n"
-        '  ("this error", "what am I looking at", "read this"), and also\n'
-        "  mid-task before clicking or typing into an app you just opened or\n"
-        "  navigated — check what's actually on screen rather than guessing\n"
-        "  coordinates or assuming a page has finished loading. Give click\n"
-        "  and scroll coordinates exactly as they appear in the most recent\n"
-        "  screenshot; they are mapped onto the real screen for you, so never\n"
-        "  scale or guess them yourself. A GUI task is not done just because\n"
-        "  a click or keystroke ran without error — before reporting one\n"
-        "  finished, especially anything with a real effect like sending a\n"
-        "  message, posting, or submitting a form, take one more screenshot\n"
-        "  and confirm from it that the result actually happened. If it\n"
-        "  didn't, adjust and try again rather than reporting success."
+        "- see_screen to check what's actually on screen — when the user\n"
+        "  refers to something visible, and mid-task before clicking or\n"
+        "  typing into an app you just opened or navigated. Give click/scroll\n"
+        "  coordinates exactly as shown in the latest screenshot — they're\n"
+        "  mapped onto the real screen for you, never scale or guess them.\n"
+        "  A click or keystroke returning no error doesn't mean it worked —\n"
+        "  before reporting anything with a real effect (sent, posted,\n"
+        "  submitted) done, screenshot again and confirm it actually\n"
+        "  happened; adjust and retry if it didn't."
     ),
-    "clipboard": (
-        "- clipboard to read what they just copied, or to hand back a result\n"
-        "  they want to paste somewhere."
-    ),
-    "memory": (
-        "- memory to remember durable facts the user tells you (preferences,\n"
-        "  hardware, names) and to recall them in later sessions."
-    ),
-    "search_files": (
-        "- search_files to find things on disk. Prefer it over run_command\n"
-        "  with 'dir /s' or 'find' — it is faster and safer."
-    ),
-    "run_command": (
-        "- run_command only for things no other skill covers. It cannot be\n"
-        "  undone, so prefer read_file, write_file, and search_files."
-    ),
-    "scroll": (
-        "- scroll to bring something into view in a feed, chat/DM list,\n"
-        "  search results, or a long page — screenshot, scroll, then\n"
-        "  screenshot again rather than assuming the target is now visible\n"
-        "  or clicking where it would be after enough scrolling."
-    ),
-    "wait": (
-        "- wait between steps of a GUI task when something needs a moment to\n"
-        "  load — after opening an app or a page, before you screenshot or\n"
-        "  click into it."
-    ),
+    "clipboard": "- clipboard to read what was just copied, or hand back a result to paste.",
+    "memory": "- memory to save durable facts about the user and recall them in later sessions.",
+    "search_files": "- search_files to find things on disk — faster and safer than run_command's dir/find.",
+    "run_command": "- run_command only for what no other skill covers. Cannot be undone.",
+    "scroll": "- scroll to reveal more of a feed or page, then screenshot again — don't assume it worked.",
+    "wait": "- wait after opening or navigating, before you screenshot or act on what loaded.",
     "read_email": (
-        "- read_email, send_email, list_events, create_event, and "
-        "delete_event for the user's connected account(s). If more than one "
-        "account is connected, ask which one rather than guessing which "
-        "inbox or calendar the user means."
+        "- read_email, send_email, list_events, create_event, delete_event\n"
+        "  for the connected account(s). More than one connected? Ask which\n"
+        "  — don't guess the inbox or calendar."
     ),
     "deep_learn": (
-        "- deep_learn to research a topic in depth and keep what it finds for\n"
-        "  later — the user asking you to 'learn', 'study', or 'master' a\n"
-        "  subject means this, not a single web_search. It takes a while\n"
-        "  (multiple searches), so say you're starting before you call it.\n"
-        "  Anything already learned this way is surfaced to you automatically\n"
-        "  under the user's message when it's relevant — no tool call needed\n"
-        "  to use it, just answer from it."
+        "- deep_learn to research a topic in depth and keep it for later —\n"
+        "  'learn', 'study', or 'master' a subject means this, not a single\n"
+        "  web_search. It's slow (multiple searches), so say you're starting\n"
+        "  before you call it. Anything already learned is surfaced to you\n"
+        "  automatically when relevant — just answer from it, no tool call\n"
+        "  needed."
     ),
 }
 
-_CLOSING = """Deliver what the user asked for at the scope they intended. Make routine
-judgment calls yourself; check in only when different readings would lead to
-materially different actions. If you think the request is mistaken, say so in
-one sentence and carry on with what was asked — don't quietly widen it.
+_CLOSING = """A single message often bundles several distinct requests, or one request
+that takes several steps (open an app, find something in it, act on what you
+find). That's normal, not an edge case — work through every part in order,
+checking the actual state of things between steps rather than assuming. Only
+report back once the whole chain is done, or once you hit something that
+genuinely can't proceed.
 
-A single message often bundles several distinct requests, or one request that
-takes several steps to finish (open an app, find something in it, act on what
-you find). Treat that as normal, not an edge case: work through every part in
-order using as many tool calls as it takes, checking the actual state of
-things between steps rather than assuming, and don't stop to report progress
-or ask permission between ordinary steps — only pause for a genuine decision
-point. Only report back once the whole chain is done, or once you hit
-something that genuinely can't proceed.
+If you think the request is mistaken, say so in one sentence and carry on
+with what was asked — don't quietly widen or narrow it.
 
 Some actions ask the user for confirmation first, and some cannot be undone.
 When a tool result says the user declined, acknowledge it in one sentence and
@@ -153,10 +129,10 @@ def build_system_prompt(available_tools: set[str]) -> str:
 
     if "web_search" not in available_tools:
         parts.append(
-            "You have no search tool. When a question depends on current "
-            "information, answer from what you know and say plainly that you "
-            "couldn't check for anything more recent. Use open_website only "
-            "when the user wants a page opened, not to look something up."
+            "You have no search tool. For anything that depends on current "
+            "information, answer from what you know and say plainly you "
+            "couldn't check anything more recent. Use open_website only to "
+            "open a page the user asked for, not to look something up."
         )
 
     parts.append(_CLOSING)
@@ -705,6 +681,25 @@ class Brain:
                 ))
 
         stop_reason = "tool_use" if tool_calls_acc else ("end_turn" if finish_reason in ("stop", None) else finish_reason)
+
+        if not content_blocks:
+            # A gateway can legitimately stream zero text deltas and zero
+            # tool calls — a reasoning-heavy model burning its whole budget
+            # on hidden reasoning and hitting finish_reason="length", or
+            # simply an empty completion. An empty content list is not a
+            # valid message to persist or replay: this is the same "history
+            # left holding a malformed assistant message" failure class the
+            # refusal handling in _run_turn guards against on the Anthropic
+            # path (an empty *list* there too), just reached via a
+            # different trigger here. A non-empty placeholder keeps history
+            # well-formed on both this provider and if MODEL is later
+            # switched to a native Claude and this history gets replayed.
+            # stop_reason is deliberately left as computed above — e.g. a
+            # finish_reason that happens to equal the literal "refusal"
+            # still has to reach _run_turn's own refusal handling, which
+            # builds its own reply and content and never looks at
+            # response.content at all.
+            content_blocks = [SimpleNamespace(type="text", text="(no response)")]
 
         self.last_usage = usage or SimpleNamespace(
             prompt_tokens=0,

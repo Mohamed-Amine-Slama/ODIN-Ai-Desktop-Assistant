@@ -297,21 +297,36 @@ class OdinHudWindow(QMainWindow):
         for row in range(layout.GRID_ROWS):
             grid.setRowStretch(row, 1)
 
-        layout.place(grid, self._build_zone_a(), "A")
-        layout.place(grid, self._build_zone_b(), "B")
-        layout.place(grid, self._build_zone_c(), "C")
-        layout.place(grid, self._build_zone_c2(), "C2")
+        # Collected for the boot sequence's staggered per-panel reveal
+        # (ui/hud/boot.py, ODIN-HUD.md §8) — every zone panel except D,
+        # which is the orb column: the orb gets its own dedicated
+        # scale-in + ignition animation, but the four gauges flanking it
+        # join the normal panel stagger individually.
+        self._boot_reveal_widgets: list[QWidget] = []
+        for zone, builder in (
+            ("A", self._build_zone_a),
+            ("B", self._build_zone_b),
+            ("C", self._build_zone_c),
+            ("C2", self._build_zone_c2),
+            ("E", self._build_zone_e),
+            ("E2", self._build_zone_e2),
+            ("F", self._build_zone_f),
+            ("G", self._build_zone_g),
+            ("H", self._build_zone_h),
+            ("I", self._build_zone_i),
+            ("J", self._build_zone_j),
+            ("K", self._build_zone_k),
+            ("L", self._build_zone_l),
+            ("M", self._build_zone_m),
+        ):
+            widget = builder()
+            self._boot_reveal_widgets.append(widget)
+            layout.place(grid, widget, zone)
+
         layout.place(grid, self._build_zone_d(), "D")
-        layout.place(grid, self._build_zone_e(), "E")
-        layout.place(grid, self._build_zone_e2(), "E2")
-        layout.place(grid, self._build_zone_f(), "F")
-        layout.place(grid, self._build_zone_g(), "G")
-        layout.place(grid, self._build_zone_h(), "H")
-        layout.place(grid, self._build_zone_i(), "I")
-        layout.place(grid, self._build_zone_j(), "J")
-        layout.place(grid, self._build_zone_k(), "K")
-        layout.place(grid, self._build_zone_l(), "L")
-        layout.place(grid, self._build_zone_m(), "M")
+        self._boot_reveal_widgets.extend(
+            [self.gauge_cpu, self.gauge_ram, self.gauge_disk, self.gauge_gpu, self.orb_status_label]
+        )
 
         self._root = root
         self.console = ConsoleOverlay(root)
@@ -1014,6 +1029,14 @@ class OdinHudWindow(QMainWindow):
             self.console.echo(f"I couldn't undo that: {e}")
 
     def trigger_reset(self) -> None:
+        if self.current_worker is not None:
+            # Brain.ask() reads self.history into a local snapshot at the
+            # start of a turn and only writes it back at the end — a reset
+            # while a turn is still in flight would appear to work, then be
+            # silently overwritten the moment that turn's worker thread
+            # finishes and persists its own (pre-reset) snapshot back.
+            self.console.echo("Wait for the current action to finish before resetting.")
+            return
         self.brain.reset()
         self.console.echo("Conversation memory cleared. Notes and reminders kept.")
 
@@ -1088,7 +1111,12 @@ class OdinHudWindow(QMainWindow):
         self.console.echo(self.session.set_mode("text"))
 
     def _switch_to_voice(self) -> None:
-        if self._voice_setup_worker is not None:
+        if self._voice_setup_worker is not None or self._voice_loop_worker is not None:
+            # Reachable via /mode voice typed twice, not just the dock
+            # toggle (which already checks session.mode) — without this, a
+            # second call here would overwrite _voice_loop_worker with a
+            # new VoiceListenWorker while the first is still running,
+            # leaking its thread and duplicating every transcription.
             return
         self.console.echo("Starting microphone and loading speech models…")
         worker = VoiceSetupWorker(self.session, self)
@@ -1130,7 +1158,11 @@ class OdinHudWindow(QMainWindow):
                 self._stop_mic_meter()
 
     def _on_voice_heard(self, text: str) -> None:
-        if self.session.mode != "voice":
+        if self.session.mode != "voice" or self.current_worker is not None:
+            # Mirrors _launch_preset's guard — without it, a voice-heard
+            # turn and a dock/console-triggered turn arriving close together
+            # could both start a BrainWorker, racing on self.brain's shared
+            # history and the UiBridge's single confirm() Event.
             return
         self._stop_mic_meter()
         self.transcript_user.setText(text)

@@ -17,8 +17,8 @@ import random
 import threading
 from collections import deque
 
-from PyQt6.QtCore import QRectF
-from PyQt6.QtGui import QPainter
+from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtGui import QPainter, QPainterPath
 from PyQt6.QtWidgets import QWidget
 
 import config
@@ -139,6 +139,11 @@ class Spectrum(QWidget):
         return bins
 
     def paintEvent(self, _event) -> None:
+        # Perf: this used to be one fillRect() native draw call per lit LED
+        # cell — up to BAR_COUNT * max_cells (400-900+) of them every frame
+        # at 30fps. Cells are batched into one QPainterPath per color tier
+        # instead, so this is at most 4 fillPath calls (3 body tiers + 1
+        # peak tier) regardless of how many cells are actually lit.
         painter = QPainter(self)
         rect = self.rect()
         n = BAR_COUNT
@@ -146,22 +151,32 @@ class Spectrum(QWidget):
         period = CELL_H + CELL_GAP
         max_cells = max(1, int(rect.height() / period))
 
+        low_path = QPainterPath()
+        mid_path = QPainterPath()
+        high_path = QPainterPath()
+        peak_path = QPainterPath()
+
         for i in range(n):
             x = i * (bar_w + CELL_GAP)
             filled = int(self._levels[i] * max_cells)
             for c in range(filled):
                 frac = c / max_cells
-                if frac < 0.6:
-                    color = tokens.CY_400
-                elif frac < 0.85:
-                    color = tokens.CY_200
-                else:
-                    color = tokens.CY_100
+                path = low_path if frac < 0.6 else mid_path if frac < 0.85 else high_path
                 y = rect.height() - (c + 1) * period
-                painter.fillRect(QRectF(x, y, bar_w, CELL_H), color)
+                path.addRect(QRectF(x, y, bar_w, CELL_H))
 
             peak_cell = int(self._peaks[i] * max_cells)
             if peak_cell > 0:
                 y = rect.height() - peak_cell * period
-                painter.fillRect(QRectF(x, y, bar_w, CELL_H), tokens.CY_100)
+                peak_path.addRect(QRectF(x, y, bar_w, CELL_H))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        for path, color in (
+            (low_path, tokens.CY_400),
+            (mid_path, tokens.CY_200),
+            (high_path, tokens.CY_100),
+            (peak_path, tokens.CY_100),
+        ):
+            if not path.isEmpty():
+                painter.fillPath(path, color)
         painter.end()

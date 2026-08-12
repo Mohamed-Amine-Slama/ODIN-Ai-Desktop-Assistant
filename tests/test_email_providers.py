@@ -99,6 +99,63 @@ def test_microsoft_provider_reports_missing_package_not_a_crash(oauth_dir):  # n
         provider.list_recent_mail(5)
 
 
+def test_google_refresh_failure_is_a_clean_reconnect_message_not_a_raw_exception(oauth_dir, monkeypatch):
+    """creds.refresh() raises google.auth's own RefreshError (or a network
+    error) on a revoked/expired refresh token. Every Google skill only
+    catches ProviderError (skills/email_skills.py) — an uncaught raw
+    exception here would surface as an ugly SDK error instead of a plain
+    'run /connect google again' message."""
+    from google.oauth2.credentials import Credentials
+
+    (oauth_dir / "oauth").mkdir()
+    (oauth_dir / "oauth" / "google_token.json").write_text("{}", encoding="utf-8")
+
+    class _ExpiredCreds:
+        expired = True
+        refresh_token = "refresh-me"
+
+        def refresh(self, request):  # noqa: ARG002
+            raise RuntimeError("invalid_grant: Token has been expired or revoked.")
+
+    monkeypatch.setattr(
+        Credentials, "from_authorized_user_file", lambda path, scopes: _ExpiredCreds()  # noqa: ARG005
+    )
+
+    provider = GoogleProvider()
+    with pytest.raises(ProviderError, match="expired"):
+        provider._credentials()
+
+
+def test_google_create_event_declares_utc_matching_microsofts_convention(oauth_dir, monkeypatch):
+    """Both providers' create_event take the same naive-datetime input
+    (CreateEventSkill's schema, e.g. '2026-08-13T14:00:00') — without an
+    explicit timeZone, the same literal string could land at a different
+    wall-clock time depending purely on which account is connected."""
+    captured = {}
+
+    class _FakeEvents:
+        def insert(self, calendarId, body):  # noqa: ARG002, N803
+            captured.update(body)
+
+            class _Req:
+                def execute(self_inner):  # noqa: ANN001
+                    return {"id": "evt1"}
+
+            return _Req()
+
+    class _FakeCalendar:
+        def events(self):
+            return _FakeEvents()
+
+    provider = GoogleProvider()
+    monkeypatch.setattr(provider, "_service", lambda name, version: _FakeCalendar())  # noqa: ARG005
+
+    provider.create_event("Standup", "2026-08-13T14:00:00", "2026-08-13T14:30:00")
+
+    assert captured["start"] == {"dateTime": "2026-08-13T14:00:00", "timeZone": "UTC"}
+    assert captured["end"] == {"dateTime": "2026-08-13T14:30:00", "timeZone": "UTC"}
+
+
 def test_google_connect_without_a_credentials_file_names_where_to_put_it(oauth_dir, monkeypatch):
     """Distinguishes 'package missing' from 'package present but not set
     up' — this only exercises the latter by faking the package present."""

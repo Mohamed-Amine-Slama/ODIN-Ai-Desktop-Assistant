@@ -87,3 +87,32 @@ def test_click_outside_the_launcher_band_emits_nothing(qapp):
     orb = VoiceOrb()
     orb.resize(440, 440)
     assert orb._segment_at(220, 220) is None  # dead center — inside the core, not the ring
+
+
+# -- perf: tick ring / outer ring caching (was 120 trig-computed drawLine
+# calls and 32 fresh QColor+QPen allocations, both every single frame at
+# 30fps) --------------------------------------------------------------
+
+def test_tick_path_is_built_once_and_reused_across_frames(qapp):
+    orb = VoiceOrb()
+    path = orb._tick_path
+    assert path.elementCount() > 0
+    for _ in range(5):
+        orb.advance(1 / 30)
+        _render(orb)
+    assert orb._tick_path is path  # never rebuilt — only rotated at paint time
+
+
+def test_outer_ring_pens_are_cached_per_accent_color(qapp):
+    orb = VoiceOrb()
+    orb.state = "idle"
+    _render(orb)
+    idle_pens = orb._outer_pens
+    assert len(idle_pens) == 32
+
+    _render(orb)
+    assert orb._outer_pens is idle_pens  # same accent -> same pen objects reused
+
+    orb.state = "thinking"  # a different ring_accent (tokens.THINKING)
+    _render(orb)
+    assert orb._outer_pens is not idle_pens  # accent changed -> pens rebuilt once

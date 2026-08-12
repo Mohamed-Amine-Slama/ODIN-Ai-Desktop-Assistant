@@ -152,6 +152,16 @@ def test_web_search_wraps_errors(monkeypatch):
         web_search("query")
 
 
+def test_web_search_wraps_a_malformed_result_shape_too(monkeypatch):
+    """Result-shape processing must be covered by the same try/except as the
+    search call itself — deep_learn's callers only catch RuntimeError to
+    skip one subtopic, so any other exception type here would abort the
+    whole run instead."""
+    monkeypatch.setattr("ddgs.DDGS", lambda: _FakeDDGS(["not-a-dict"]))
+    with pytest.raises(RuntimeError, match="couldn't search the web"):
+        web_search("query")
+
+
 def test_web_search_passes_the_query_and_count(monkeypatch):
     calls = []
 

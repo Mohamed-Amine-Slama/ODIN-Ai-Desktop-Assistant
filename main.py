@@ -319,6 +319,14 @@ def main() -> None:
             scheduler.stop()
             session.shutdown()
             return
+        except Exception as e:  # noqa: BLE001 - a transcription/mic hiccup must not kill the loop
+            # ui/workers.py's VoiceListenWorker already catches exactly this
+            # around the same self.listener.listen() call on the GUI path;
+            # the CLI loop here had no equivalent, so any STT hiccup (a
+            # transient ctranslate2/whisper error, a mic dropout) used to
+            # take the whole process down instead of just that one turn.
+            print(f"[voice] {e}")
+            continue
 
         if not text:
             continue

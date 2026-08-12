@@ -148,6 +148,15 @@ def test_reminder_rejects_bad_input(store):
     assert "in the past" in ReminderSkill().run(message="x", minutes=-5)
 
 
+def test_reminder_rejects_non_finite_minutes(store):
+    """NaN slips straight past `< 0` (every NaN comparison is False), and
+    +inf passes it too — either would store a fire_at no scheduler check
+    could ever match, silently creating a reminder that can never fire."""
+    assert "real number" in ReminderSkill().run(message="x", minutes=float("nan"))
+    assert "real number" in ReminderSkill().run(message="x", minutes=float("inf"))
+    assert store.pending_reminders() == []
+
+
 # -- memory ----------------------------------------------------------------
 
 def test_memory_remember_and_recall(store):
@@ -299,6 +308,27 @@ def test_restore_never_starts_on_a_tool_result(store, make_brain):
     for msg in restored:
         if msg["role"] == "user" and isinstance(msg["content"], list):
             assert not any(b.get("type") == "tool_result" for b in msg["content"])
+
+
+def test_recent_messages_skips_a_corrupted_row_instead_of_crashing(store):
+    """A row with non-JSON content (a partial write from a hard kill, disk
+    corruption, a hand-edited DB) must not make recent_messages() — called
+    unguarded from load_history() at startup, both in main.py and app.py —
+    raise and take the whole app down before it can even launch."""
+    store.append_message("user", [{"type": "text", "text": "hello"}])
+    with store._lock:
+        store._conn.execute(
+            "INSERT INTO messages (ts, role, content) VALUES (?, ?, ?)",
+            (time.time(), "assistant", "{not valid json"),
+        )
+    store.append_message("assistant", [{"type": "text", "text": "world"}])
+
+    restored = store.recent_messages()
+
+    assert restored == [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "world"}]},
+    ]
 
 
 def test_reset_clears_saved_history(store, make_brain):

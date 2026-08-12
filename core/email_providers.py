@@ -125,7 +125,18 @@ class GoogleProvider:
 
         creds = Credentials.from_authorized_user_file(token_path, GOOGLE_SCOPES)
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                # A revoked/expired refresh token or a network failure here
+                # raises google.auth's own RefreshError, not ProviderError —
+                # every Google skill only catches ProviderError, so this
+                # would otherwise surface as a raw SDK exception instead of
+                # a plain-English "reconnect" message.
+                raise ProviderError(
+                    "Google sign-in expired and couldn't be refreshed "
+                    "automatically. Run /connect google again."
+                ) from e
             with open(token_path, "w", encoding="utf-8") as f:
                 f.write(creds.to_json())
         return creds
@@ -176,13 +187,19 @@ class GoogleProvider:
         from email.mime.text import MIMEText
 
         gmail = self._service("gmail", "v1")
-        mime = MIMEText(body)
-        mime["to"] = to
-        mime["subject"] = subject
-        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("ascii")
         try:
+            mime = MIMEText(body)
+            mime["to"] = to
+            mime["subject"] = subject
+            raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("ascii")
             gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
         except Exception as e:
+            # A subject/recipient containing an embedded raw newline (e.g. a
+            # subject an LLM composed from multi-line text) makes
+            # mime.as_bytes() raise email.errors.HeaderParseError here, not
+            # a Gmail API error — covered by the same try/except either way
+            # so it still becomes a ProviderError instead of a raw exception
+            # skills/email_skills.py doesn't catch.
             raise ProviderError(f"Couldn't send that email: {e}") from e
 
     def list_events(self, days_ahead: int) -> list[dict]:
@@ -217,8 +234,15 @@ class GoogleProvider:
         body = {
             "summary": title,
             "description": description,
-            "start": {"dateTime": start},
-            "end": {"dateTime": end},
+            # Matches MicrosoftProvider.create_event's convention for the
+            # same naive-datetime input (see CreateEventSkill's schema,
+            # e.g. "2026-08-13T14:00:00") — without an explicit timeZone,
+            # the Google Calendar API's interpretation of that same literal
+            # string is undefined/account-dependent, so the identical input
+            # could land at a different wall-clock time than the identical
+            # request against Microsoft.
+            "start": {"dateTime": start, "timeZone": "UTC"},
+            "end": {"dateTime": end, "timeZone": "UTC"},
         }
         try:
             created = calendar.events().insert(calendarId="primary", body=body).execute()

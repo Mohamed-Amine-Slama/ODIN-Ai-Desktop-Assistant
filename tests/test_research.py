@@ -102,6 +102,27 @@ def test_llm_complete_wraps_provider_errors(monkeypatch):
         research._llm_complete("prompt")
 
 
+def test_llm_complete_treats_empty_choices_as_an_empty_answer(monkeypatch):
+    """A gateway can legitimately return zero choices (content filtered, a
+    malformed upstream response). Every caller of _llm_complete only catches
+    RuntimeError to skip one step — an uncaught IndexError from blindly
+    indexing choices[0] would abort the whole deep_learn run instead."""
+    monkeypatch.setattr(config, "MODEL", "gpt-4o-mini", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://api.example.com", raising=False)
+
+    class FakeCompletions:
+        def create(self, **kwargs):  # noqa: ARG002
+            return SimpleNamespace(choices=[])
+
+    class FakeOpenAI:
+        def __init__(self, api_key, base_url):  # noqa: ARG002
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+
+    assert research._llm_complete("prompt") == ""
+
+
 # -- run_deep_learn orchestration ----------------------------------------------
 
 def test_run_deep_learn_needs_a_topic(monkeypatch):

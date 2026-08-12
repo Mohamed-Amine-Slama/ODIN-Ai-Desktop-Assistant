@@ -34,3 +34,31 @@ def test_search_returns_empty_list_without_deps():
 
 def test_search_with_blank_query_returns_empty_list():
     assert memory_index.search("   ") == []
+
+
+def test_search_degrades_to_empty_list_when_query_itself_raises(monkeypatch):
+    """The module's own docstring promises search() 'returns [] rather than
+    raising ... when ... anything else goes wrong' — that has to cover a
+    real failure from collection.query() itself (corrupted collection, a
+    chromadb version mismatch, disk I/O), not just chromadb/
+    sentence-transformers being absent."""
+
+    class _BoomCollection:
+        def count(self):
+            return 1
+
+        def query(self, **kwargs):  # noqa: ARG002
+            raise RuntimeError("boom")
+
+    class _FakeEmbedder:
+        def encode(self, texts):  # noqa: ARG002
+            class _Vec:
+                def tolist(self):
+                    return [[0.0]]
+
+            return _Vec()
+
+    monkeypatch.setattr(memory_index, "_get_collection", lambda: _BoomCollection())
+    monkeypatch.setattr(memory_index, "get_embedder", lambda: _FakeEmbedder())
+
+    assert memory_index.search("anything") == []
