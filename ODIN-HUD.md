@@ -53,25 +53,22 @@ psutil numbers, real ODIN skill activity, real knowledge-base contents.
 
 ## 2. Tech stack
 
-Build it as a **local web app rendered in a frameless desktop window**, with a
-Python backend that ODIN already runs inside.
+Build it as a **native PyQt6 window** living in ODIN's own process — no
+browser, no web view, nothing web-based anywhere in the stack.
 
 | Layer | Choice | Why |
 |---|---|---|
-| Rendering | HTML + CSS + inline SVG + Canvas2D | Arcs, glows, and rotating rings are trivial in SVG; the spectrum analyzer and waveform need Canvas. Nothing here justifies a game engine. |
-| Frontend framework | **None.** Vanilla ES modules. | The DOM is ~40 static panels updated by pushed values. A framework's diffing buys nothing and fights the animation loop. |
-| Transport | WebSocket, JSON frames | Push, not poll. One socket, one message shape. |
-| Backend | **FastAPI** + `uvicorn`, running in a daemon thread inside ODIN | Reuses ODIN's existing process, so skill events are already in scope. |
-| Telemetry | `psutil`, `pynvml` (GPU), `WMI`/`LibreHardwareMonitor` (fan/temp) | `psutil` covers CPU, RAM, disk, net, battery, uptime. Temps on Windows need a helper — see §7.4. |
-| Window shell | `pywebview` (frameless, `on_top` optional) | One `pip install`, no Node toolchain, no Electron bundle. |
+| Rendering | PyQt6 `QWidget` + `QPainter` (arcs, glow, gradients painted directly) | Arcs, glows, and rotating rings are as trivial in `QPainter` as in SVG (`drawArc`, `QConicalGradient`, `QRadialGradient`); a multi-pass stroke technique substitutes for `feGaussianBlur`. No SVG, no Canvas, no browser engine anywhere in the process. |
+| Frontend framework | **None.** Plain `QWidget` subclasses. | The window is ~40 static panels updated by pushed values via Qt signals. A framework's diffing buys nothing here, same reasoning as the original vanilla-JS choice — it just now applies to Qt widgets instead of the DOM. |
+| Transport | Qt signals/slots, in-process | Push, not poll, same principle as the socket — but no serialization boundary at all, since producer and consumer share one process. See §7.1. |
+| Backend | None separate — a `QThread` worker inside the same PyQt6 process | No second process, no HTTP server, no daemon thread to manage; the telemetry collector is just another worker thread alongside the existing voice-loop/brain workers. |
+| Telemetry | `psutil`, `pynvml` (GPU, optional), `WMI`/`LibreHardwareMonitor` (fan/temp, optional) | `psutil` covers CPU, RAM, disk, net, battery, uptime. Temps on Windows need a helper — see §7.4. |
+| Window shell | `QMainWindow` with `Qt.WindowType.FramelessWindowHint`, shown full-screen | Ships with PyQt6, already the shell the rest of ODIN's UI uses — no extra window-management dependency. |
 
-**Alternative shell (optional, nice-to-have):** to make the HUD the actual
-desktop wallpaper behind icons, render the same URL through **Lively Wallpaper**
-(free, open source, accepts a local URL as a wallpaper source). Do not build
-custom `WorkerW` window-parenting — it is fragile across Windows updates.
-
-Do not build a native PyQt/QML version. The visual language here is arcs,
-gradients, blurs, and glows; CSS and SVG do those in a fraction of the code.
+Do not build a web-view version, embedded or otherwise (`pywebview`, Electron,
+CEF). The visual language here is arcs, gradients, blurs, and glows; `QPainter`
+does all of those directly, in the same process as the assistant it's a front
+end for, with no IPC boundary and no browser runtime to ship or update.
 
 ---
 
@@ -482,95 +479,91 @@ so the user can type a command instead of speaking).
 
 ## 7. Data layer
 
-### 7.1 Socket contract
+### 7.1 Signal contract
 
-One WebSocket at `ws://127.0.0.1:8777/telemetry`. Server pushes frames; client
-never polls. Three message types, discriminated by `type`.
+No socket, no serialization — telemetry and ODIN state cross from their
+producer thread to the GUI thread as Qt signals, delivered queued
+(thread-safe) by Qt's own event loop. Three signal groups, the direct
+in-process equivalents of the old three message types.
 
-**`telemetry`** — every 1000ms:
+**Telemetry** — `TelemetryWorker.frame_ready(object)`, emitted every 1000ms,
+carrying a `TelemetryFrame` dataclass (`ui/hud/telemetry.py`) with nested
+dataclasses for each field group:
 
-```json
-{
-  "type": "telemetry",
-  "ts": 1754870400.12,
-  "cpu": {
-    "percent": 34.2,
-    "per_core": [22.1, 41.0, 18.7, 55.3],
-    "freq_mhz": 3592,
-    "processes": 214,
-    "top": [{"name": "chrome.exe", "cpu": 12.4}]
-  },
-  "mem": {"used_gb": 18.4, "total_gb": 32.0, "percent": 57.5,
-          "swap_percent": 12.0},
-  "disks": [{"mount": "C:", "used_gb": 411.2, "total_gb": 931.5, "percent": 44.1}],
-  "disk_io": {"read_mbs": 4.2, "write_mbs": 1.1},
-  "net": {"up_kbs": 128.4, "down_kbs": 2044.9,
-          "total_up_gb": 12.1, "total_down_gb": 88.7, "ip": "192.168.1.14"},
-  "battery": {"percent": 88, "plugged": true},
-  "thermals": {"cpu_c": 54, "gpu_c": 61, "gpu_load": 22,
-               "gpu_vram_percent": 31, "fan_rpm": 1180},
-  "uptime_sec": 246540
-}
+```python
+@dataclass
+class TelemetryFrame:
+    ts: float
+    cpu: CpuSample          # percent, per_core, freq_mhz, processes, top
+    mem: MemSample          # used_gb, total_gb, percent, swap_percent
+    disks: list[DiskSample]  # mount, used_gb, total_gb, percent
+    disk_io: DiskIoSample     # read_mbs, write_mbs
+    net: NetSample           # up_kbs, down_kbs, total_up_gb, total_down_gb, ip
+    battery: BatterySample    # percent, plugged
+    thermals: ThermalSample   # cpu_c, gpu_c, gpu_load, gpu_vram_percent, fan_rpm
+    uptime_sec: float
 ```
 
-Any unavailable field is `null` — the client renders `--`. Never send 0 for
+Any unavailable field is `None` — the client renders `--`. Never send 0 for
 "unknown"; a fake zero is worse than an honest blank.
 
-**`odin`** — pushed on state change, not on an interval:
+**ODIN state** — decomposed into several `UiBridge` signals (`ui/workers.py`),
+each fired on the event that produces it rather than on an interval:
 
-```json
-{
-  "type": "odin",
-  "state": "listening",
-  "mic_rms": 0.42,
-  "transcript_user": "make a deep search about react",
-  "transcript_odin": "Starting deep research on React…",
-  "learning": {"topic": "react", "subtopic": "Hooks", "progress": 0.375},
-  "skill_log": [
-    {"ts": 1754870399, "skill": "deep_learn", "ok": true, "ms": 84210}
-  ]
-}
-```
+- `state_changed(str)` — idle / listening / thinking / speaking / learning / error.
+- `mic_rms(float)` — emitted at ~20Hz while `state == "listening"`, nothing else.
+- `text_chunk(str)` — ODIN's streamed reply (already existed).
+- `learning_progress(str, str, float)` — topic, subtopic, progress 0..1.
+- `skill_logged(object)` — a `SkillLogEntry(ts, skill, ok, ms)` dataclass, one
+  per completed tool call, feeding zone E2's `deque(maxlen=6)`.
 
-Send `mic_rms` alone at 20 Hz while `state === "listening"` (a minimal frame
-with just `type`, `state`, `mic_rms`) — do not resend the whole object.
+The user's own utterance needs no new plumbing — it's already a GUI-thread
+value via `VoiceListenWorker.heard(str)` (typed input is GUI-thread by
+construction). Zone E connects to that and to `text_chunk` directly.
 
-**`kb`** — on demand and after any `deep_learn` completes:
-
-```json
-{
-  "type": "kb",
-  "topics": [{"topic": "react", "chunks": 142, "updated": 1754870400}]
-}
-```
+**Knowledge base** — `kb_changed()` (no payload), emitted after any
+`deep_learn` completes successfully. The knowledge panel just re-reads
+`get_store().list_knowledge_topics()` on receipt — no need to push the topic
+list itself through a signal when a synchronous re-query is already fast
+enough (proven by the existing `KnowledgeDialog`).
 
 ### 7.2 Backend structure
 
 ```
-core/hud/
-  server.py       FastAPI app, WS endpoint, broadcast manager
-  telemetry.py    psutil/pynvml collectors -> the telemetry dict
-  bridge.py       ODIN state hooks: on_state_change, on_skill_start/end,
-                  on_mic_frame, on_learn_progress  -> broadcast()
-static/
-  index.html
-  css/  tokens.css  layout.css  components.css  effects.css
-  js/   main.js  socket.js  components/*.js
-  fonts/
+ui/hud/
+  tokens.py        design tokens (§3) as QColor/QFont/int constants
+  layout.py         §4 grid geometry + QGridLayout placement helper
+  widgets.py         Panel, Readout, BarMeter, DockButton, TickRuler
+  radial_gauge.py     RadialGauge
+  sparkline.py        Sparkline
+  spectrum.py         Spectrum + optional WASAPI-loopback capture
+  voice_orb.py         VoiceOrb (the centerpiece, §5.3)
+  telemetry.py        TelemetryWorker(QThread) + frame dataclasses
+  weather.py          structured wttr.in fetch + poller
+  console.py          ODIN CONSOLE overlay (§6.10)
+  confirm.py          ConfirmationBannerWidget
+  boot.py             boot sequence (§8)
+  window.py           OdinHudWindow(QMainWindow) — assembles zones A–M
+ui/workers.py         UiBridge (extended) + the existing QThread workers
+core/learning_status.py   deep_learn progress callback, Brain-side
 ```
 
-`server.py` runs `uvicorn` in a daemon thread started from ODIN's `main.py`, so
-one process owns both the assistant and the HUD.
+`TelemetryWorker` is started from `OdinHudWindow.show_and_activate()`
+alongside the existing voice-loop worker, so one process — the same one
+`main.py`/`app.py` already run — owns the assistant and the HUD with no
+second process and nothing to keep in sync across a process boundary.
 
-### 7.3 Command endpoint (HUD → ODIN)
+### 7.3 Command dispatch (HUD → ODIN)
 
-`POST /command` with `{"text": "open chrome"}`. The handler passes the string
-straight into ODIN's existing brain/tool-use loop — identical to a typed
-message. Dock buttons and ring launchers are **just preset command strings**.
-This is the whole integration; do not duplicate skill logic in the frontend.
-
-Bind to `127.0.0.1` only. No auth needed on loopback, but do not bind `0.0.0.0`
-"for convenience" — that exposes remote PC control on the LAN.
+Every dock button and orb ring launcher calls `Brain.ask()` with a preset
+command string on the same `BrainWorker` path typed console input already
+uses — identical to a typed message, and never a direct call into a skill.
+This is the whole integration; do not duplicate skill logic, and do not add a
+second way to invoke a skill that bypasses `Brain`'s risk-tier confirmation
+gate. See the implementation plan for the concrete reasoning: a dock button
+wired straight to `PowerControlSkill.run()` would skip the DANGEROUS-tier
+confirmation a typed "restart my PC" gets, which is exactly the kind of
+shortcut this rule exists to prevent.
 
 ### 7.4 Sensor notes
 

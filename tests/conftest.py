@@ -11,6 +11,21 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Must be set before PyQt6 is imported anywhere in the test session — Qt
+# tests (test_gui.py, test_hud_*.py) run headless so they work in WSL / CI
+# with no display.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
 
 @pytest.fixture(autouse=True)
 def _reset_screen_state():

@@ -24,7 +24,7 @@ import json
 import re
 
 import config
-from core import knowledge
+from core import knowledge, learning_status
 from core.store import get_store
 from skills.web_skills import web_search, web_search_available
 
@@ -69,14 +69,24 @@ def run_deep_learn(topic: str, depth: str = "standard", progress=None) -> dict:
             except Exception:
                 pass
 
+    def report(subtopic: str, done: int, total: int) -> None:
+        """Structured progress for anything watching (the HUD's voice orb) —
+        independent of `progress` above, so it fires for every deep_learn
+        run regardless of who's calling it, not just callers that pass a
+        `progress` callback."""
+        if total > 0:
+            learning_status.report(topic, subtopic, min(1.0, done / total))
+
     n = DEPTH_SUBTOPICS.get(depth, DEPTH_SUBTOPICS["standard"])
     note(f"Breaking '{topic}' down into subtopics...")
     subtopics = _decompose(topic, n)
+    total_steps = len(subtopics) + MAX_GAP_FILLS
 
     covered: list[str] = []
     added_chunks = 0
-    for sub in subtopics:
+    for i, sub in enumerate(subtopics):
         note(f"Researching: {sub}")
+        report(sub, i, total_steps)
         chunks = _research_and_store(topic, sub)
         added_chunks += chunks
         if chunks:
@@ -85,12 +95,15 @@ def run_deep_learn(topic: str, depth: str = "standard", progress=None) -> dict:
     note("Checking for gaps...")
     gaps = _find_gaps(topic, covered)
     filled: list[str] = []
-    for gap in gaps[:MAX_GAP_FILLS]:
+    for i, gap in enumerate(gaps[:MAX_GAP_FILLS]):
         note(f"Filling a gap: {gap}")
+        report(gap, len(subtopics) + i, total_steps)
         chunks = _research_and_store(topic, gap)
         added_chunks += chunks
         if chunks:
             filled.append(gap)
+
+    report(topic, total_steps, total_steps)
 
     store = get_store()
     previous = store.get_knowledge_topic(topic)

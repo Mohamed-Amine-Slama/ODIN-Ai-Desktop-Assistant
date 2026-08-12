@@ -84,6 +84,17 @@ CONFIRM_TIMEOUT_SECONDS = float(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120"))
 TRASH_MAX_ENTRIES = int(os.getenv("TRASH_MAX_ENTRIES", "200"))
 TRASH_MAX_AGE_DAYS = float(os.getenv("TRASH_MAX_AGE_DAYS", "7"))
 
+# --- Instrument HUD (ODIN-HUD.md) ------------------------------------------
+HUD_TELEMETRY_INTERVAL_MS = int(os.getenv("HUD_TELEMETRY_INTERVAL_MS", "1000"))
+HUD_DISK_POLL_SECONDS = float(os.getenv("HUD_DISK_POLL_SECONDS", "15"))
+# "" lets wttr.in auto-locate from the requesting IP instead of a named city.
+WEATHER_CITY = os.getenv("WEATHER_CITY", "")
+HUD_WEATHER_POLL_SECONDS = float(os.getenv("HUD_WEATHER_POLL_SECONDS", "600"))
+# loopback | mic | off — see ui/hud/spectrum.py for the fallback chain when
+# the chosen source isn't actually available.
+HUD_SPECTRUM_SOURCE = os.getenv("HUD_SPECTRUM_SOURCE", "loopback")
+HUD_REDUCED_MOTION = os.getenv("HUD_REDUCED_MOTION", "0") not in ("0", "false", "False")
+
 # --- Voice ----------------------------------------------------------------
 # Wake word. openWakeWord ships a pretrained "hey_jarvis" model, so this works
 # with no API key and no training. Set WAKE_WORD=off for push-to-talk.

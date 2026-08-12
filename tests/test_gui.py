@@ -1,22 +1,13 @@
-"""HUD tests. Run headless via Qt's offscreen platform, so they work in WSL."""
-import os
+"""HUD tests. Run headless via Qt's offscreen platform, so they work in WSL.
+
+The `qapp` fixture (and the QT_QPA_PLATFORM=offscreen setup it depends on)
+lives in conftest.py, shared with tests/test_hud_*.py.
+"""
 import threading
 from unittest.mock import MagicMock
 
 import pytest
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from PyQt6.QtTest import QTest  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    return app
+from PyQt6.QtTest import QTest
 
 
 @pytest.fixture

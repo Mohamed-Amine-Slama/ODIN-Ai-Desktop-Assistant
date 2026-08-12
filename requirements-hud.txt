@@ -1,0 +1,14 @@
+# Optional thermal/GPU sensors for the instrument HUD (see ODIN-HUD.md §7.4).
+# Install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-hud.txt
+#
+# Neither package is required — without them, the HUD's thermal readouts
+# render "--" instead of a fabricated value, per the HUD's own rule against
+# inventing numbers a sensor didn't actually report.
+
+# GPU temp / load / VRAM. NVIDIA only.
+pynvml>=11.5.0; sys_platform == "win32"
+
+# CPU temp / fan RPM. Needs LibreHardwareMonitor running with its WMI
+# provider enabled — this package only talks to it, it doesn't ship it.
+wmi>=1.5.1; sys_platform == "win32"
