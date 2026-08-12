@@ -12,6 +12,18 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+@pytest.fixture(autouse=True)
+def _reset_screen_state():
+    """screen_state's last-screenshot mapping is module-global; without this a
+    mapping recorded by one test could leak into an unrelated test's click/
+    scroll coordinates."""
+    from skills import screen_state
+
+    screen_state.clear()
+    yield
+    screen_state.clear()
+
+
 class Block(SimpleNamespace):
     """Stands in for an SDK content block (TextBlock / ToolUseBlock)."""
 

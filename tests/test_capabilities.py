@@ -3,9 +3,10 @@ import base64
 from types import SimpleNamespace
 
 from conftest import Block, response, text_block, tool_use_block
+from skills import screen_state
 from skills.skill_manager import SERVER_TOOLS, SkillManager
 from skills.utility_skills import ClipboardSkill
-from skills.vision_skills import ScreenshotSkill
+from skills.vision_skills import MAX_EDGE, ScreenshotSkill, _encode_shot
 from skills.web_skills import OpenWebsiteSkill
 
 
@@ -90,6 +91,39 @@ def test_screenshot_bad_monitor(monkeypatch):
 
     monkeypatch.setattr("skills.vision_skills._grab", boom)
     assert "no monitor 9" in ScreenshotSkill().run(monitor=9)
+
+
+def _fake_shot(width: int, height: int) -> SimpleNamespace:
+    """A stand-in for an mss ScreenShot: just enough (.size, .bgra) for
+    PIL.Image.frombytes to build a real image from it."""
+    return SimpleNamespace(size=(width, height), bgra=bytes(width * height * 4))
+
+
+def test_encode_shot_records_identity_mapping_below_max_edge():
+    """No downscaling happens, so image-space coordinates are real screen
+    coordinates unchanged (once the origin is added back in)."""
+    _encode_shot(_fake_shot(800, 600), origin_x=0, origin_y=0)
+    assert screen_state.to_real(100, 50) == (100, 50)
+
+
+def test_encode_shot_records_scale_for_a_downscaled_capture():
+    """A capture wider than MAX_EDGE is shrunk before it's sent to the model,
+    so a coordinate read off that smaller image must be scaled back up before
+    it reaches pyautogui — otherwise every click after a see_screen on a
+    large/high-res display lands short of its target."""
+    real_width, real_height = 2560, 1440
+    _encode_shot(_fake_shot(real_width, real_height), origin_x=0, origin_y=0)
+
+    # The capture was shrunk to MAX_EDGE on its long edge -> scale factor 2.0.
+    assert screen_state.to_real(0, 0) == (0, 0)
+    assert screen_state.to_real(MAX_EDGE, 0) == (real_width, 0)
+
+
+def test_encode_shot_records_a_non_origin_capture():
+    """An active-window capture (or a non-primary monitor) doesn't start at
+    real screen (0, 0); the recorded origin must be added, not ignored."""
+    _encode_shot(_fake_shot(800, 600), origin_x=1920, origin_y=100)
+    assert screen_state.to_real(10, 20) == (1930, 120)
 
 
 def test_image_result_flows_back_as_tool_result(make_brain, monkeypatch):
@@ -189,43 +223,50 @@ def test_open_website_adds_scheme(monkeypatch):
     assert opened == ["https://news.ycombinator.com"]
 
 
-# -- web search key handling ----------------------------------------------
+# -- web search --------------------------------------------------------------
 
 
-def test_google_search_key_is_not_borrowed_from_another_provider(monkeypatch):
-    """Regression: web_search posted config.API_KEY to googleapis.com whatever
-    BASE_URL pointed at, so running on OpenRouter handed that OpenRouter key to
-    Google."""
-    import config
-    from skills.web_skills import google_search_key
+def test_web_search_available_reflects_whether_ddgs_is_installed(monkeypatch):
+    """ddgs is a core dependency (requirements.txt), so this is True in the
+    normal case — this only checks the degradation path."""
+    import sys
 
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.setattr(config, "API_KEY", "sk-or-secret", raising=False)
+    from skills.web_skills import web_search_available
 
-    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
-    assert google_search_key() == ""
+    assert web_search_available() is True
 
-    monkeypatch.setattr(
-        config, "BASE_URL",
-        "https://generativelanguage.googleapis.com/v1beta/openai/", raising=False,
-    )
-    assert google_search_key() == "sk-or-secret"
-
-    monkeypatch.setenv("GOOGLE_API_KEY", "google-own-key")
-    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
-    assert google_search_key() == "google-own-key"
+    monkeypatch.setitem(sys.modules, "ddgs", None)  # simulate not installed
+    assert web_search_available() is False
 
 
-def test_web_search_makes_no_request_without_a_key(monkeypatch):
-    import config
+def test_web_search_makes_no_search_call_when_ddgs_is_missing(monkeypatch):
+    import sys
+
     from skills.web_skills import WebSearchSkill
 
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
-    monkeypatch.setattr(config, "API_KEY", "sk-or-secret", raising=False)
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+    assert "ddgs" in WebSearchSkill().run(query="what happened today")
 
-    def explode(*args, **kwargs):
-        raise AssertionError("no HTTP request may be made without a key")
 
-    monkeypatch.setattr("requests.post", explode)
-    assert "GOOGLE_API_KEY" in WebSearchSkill().run(query="what happened today")
+def test_web_search_formats_results_for_the_model(monkeypatch):
+    from skills.web_skills import WebSearchSkill
+
+    monkeypatch.setattr(
+        "skills.web_skills.web_search",
+        lambda query, count=6: [  # noqa: ARG005
+            {"title": "Example", "url": "https://example.com", "snippet": "An example page."}
+        ],
+    )
+
+    out = WebSearchSkill().run(query="what happened today")
+    assert "Example" in out
+    assert "https://example.com" in out
+    assert "An example page." in out
+
+
+def test_web_search_reports_no_results(monkeypatch):
+    from skills.web_skills import WebSearchSkill
+
+    monkeypatch.setattr("skills.web_skills.web_search", lambda query, count=6: [])  # noqa: ARG005
+
+    assert "nothing usable" in WebSearchSkill().run(query="an obscure query")

@@ -233,6 +233,7 @@ NEVER_REVERSIBLE = {
     "type_text",
     "press_keys",
     "click",
+    "scroll",
     "close_window",
     "power_control",
     "close_app",
@@ -253,6 +254,6 @@ def test_irreversible_skills_describe_themselves_honestly():
     """If a skill cannot be undone, its description must say so — the model
     relays that to the user before they agree to it."""
     manager = SkillManager()
-    for name in ["run_command", "type_text", "press_keys", "click", "close_window"]:
+    for name in NEVER_REVERSIBLE:
         description = manager.get(name).description.lower()
         assert "undo" in description or "unsaved" in description, name

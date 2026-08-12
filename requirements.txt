@@ -10,6 +10,11 @@ mss>=9.0.1
 pillow>=10.0.0
 pyperclip>=1.8.2
 
+# web_search / deep_learn's search step. No API key, no signup, no billing —
+# unlike every LLM-provider-hosted search option, this needs nothing beyond
+# the package itself.
+ddgs>=9.0.0
+
 # Windows-only: system volume control
 pycaw>=20240210; sys_platform == "win32"
 comtypes>=1.2.0; sys_platform == "win32"

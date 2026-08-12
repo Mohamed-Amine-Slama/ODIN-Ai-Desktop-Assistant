@@ -1,15 +1,16 @@
-# Local knowledge base for the deep_learn skill (RAG). Install on top of
-# requirements.txt:
+# Local knowledge base for the deep_learn skill (RAG), and semantic search
+# for the memory skill's recall (core/memory_index.py) — both share one
+# embedding model via core/embeddings.py. Install on top of requirements.txt:
 #   pip install -r requirements.txt -r requirements-rag.txt
 #
 # Kept separate: sentence-transformers pulls in torch, which is a large
 # install (hundreds of MB to a couple GB depending on platform). Jarvis runs
-# fine without any of this — deep_learn just reports what's missing until
-# it's installed, and everything else is unaffected.
+# fine without any of this — deep_learn just reports what's missing, and
+# memory recall quietly falls back to plain-text search, until it's installed.
 
 # Local embeddings — no API key, no per-chunk cost, works offline after the
 # first run (which downloads the ~90MB all-MiniLM-L6-v2 model).
 sentence-transformers>=3.0.0
 
-# Local vector store, persisted under data/knowledge_db.
+# Local vector store, persisted under data/knowledge_db and data/memory_db.
 chromadb>=0.5.0

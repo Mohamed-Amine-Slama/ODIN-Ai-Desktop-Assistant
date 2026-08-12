@@ -298,12 +298,20 @@ class MoveFileSkill(BaseSkill):
 
     def risk_for(self, src: str = "", dst: str = "", **_) -> Risk:
         destination = Path(dst).expanduser()
-        if destination.exists() or is_sensitive_path(Path(src).expanduser()):
+        if is_sensitive_path(destination):
+            return Risk.DANGEROUS
+        # An existing directory is the normal case — shutil.move nests the
+        # file inside it, nothing is replaced. Only an existing *file* at the
+        # destination is a genuine overwrite.
+        if destination.exists() and not destination.is_dir():
             return Risk.DANGEROUS
         return Risk.MODERATE
 
     def consequence(self, src: str = "", dst: str = "", **_) -> str:
-        if Path(dst).expanduser().exists():
+        destination = Path(dst).expanduser()
+        if is_sensitive_path(destination):
+            return f"{dst} is a protected system location. Move {src} there anyway?"
+        if destination.exists() and not destination.is_dir():
             return f"Move {src} onto {dst}, replacing what's there?"
         return f"Move {src} to {dst}?"
 
@@ -314,8 +322,13 @@ class MoveFileSkill(BaseSkill):
         if not source.exists():
             return f"There is no file at {src}."
 
+        # Where the item actually ends up: nested inside an existing directory,
+        # or exactly at `destination` otherwise (rename, or overwrite).
+        into_dir = destination.is_dir()
+        final_path = destination / source.name if into_dir else destination
+
         replaced = None
-        if destination.exists():
+        if not into_dir and destination.exists():
             try:
                 replaced = move_to_trash(destination)
             except OSError as e:
@@ -324,16 +337,19 @@ class MoveFileSkill(BaseSkill):
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(destination))
-        except OSError as e:
+        except (OSError, shutil.Error) as e:
             return f"I couldn't move {src}: {e}"
 
-        def undo(a=source, b=destination, old=replaced):
+        def undo(a=source, b=final_path, old=replaced):
             shutil.move(str(b), str(a))
             if old is not None:
-                shutil.copy2(old, b)
+                if old.is_dir():
+                    shutil.copytree(old, b)
+                else:
+                    shutil.copy2(old, b)
             return f"Moved {a.name} back."
 
-        get_journal().record(f"Move {destination.name} back to {source}", undo)
+        get_journal().record(f"Move {final_path.name} back to {source}", undo)
         return f"Moved {src} to {dst}."
 
 

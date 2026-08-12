@@ -11,6 +11,7 @@ import threading
 import time
 
 import config
+from core import memory_index
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -158,20 +159,35 @@ class Store:
         """Store a durable fact. Returns False if it was already known."""
         with self._lock:
             try:
-                self._conn.execute(
+                cur = self._conn.execute(
                     "INSERT INTO memories (ts, text) VALUES (?, ?)", (time.time(), text)
                 )
                 self._conn.commit()
-                return True
+                memory_id = cur.lastrowid
             except sqlite3.IntegrityError:
                 return False
+        # Outside the lock: embedding is comparatively slow, and best-effort
+        # anyway — memory_index never raises, so a bad index doesn't undo the
+        # commit that already succeeded.
+        memory_index.index(memory_id, text)
+        return True
 
     def recall(self, query: str = "", limit: int = 20) -> list[str]:
+        """Semantic search first when a query is given, falling back to the
+        LIKE search when the index is unavailable, empty, or finds nothing
+        close enough — same "nothing indexed yet is normal" philosophy as
+        core.knowledge. An empty query always lists the most recent facts;
+        there is nothing to embed a similarity search against."""
+        if query:
+            semantic = memory_index.search(query, limit=limit)
+            if semantic:
+                return semantic
+
         with self._lock:
             if query:
                 rows = self._conn.execute(
-                    "SELECT text FROM memories WHERE text LIKE ? ORDER BY id DESC LIMIT ?",
-                    (f"%{query}%", limit),
+                    "SELECT text FROM memories WHERE text LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+                    (f"%{_escape_like(query)}%", limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
@@ -181,11 +197,18 @@ class Store:
 
     def forget(self, query: str) -> int:
         with self._lock:
+            doomed = self._conn.execute(
+                "SELECT id FROM memories WHERE text LIKE ? ESCAPE '\\'",
+                (f"%{_escape_like(query)}%",),
+            ).fetchall()
             cur = self._conn.execute(
-                "DELETE FROM memories WHERE text LIKE ?", (f"%{query}%",)
+                "DELETE FROM memories WHERE text LIKE ? ESCAPE '\\'",
+                (f"%{_escape_like(query)}%",),
             )
             self._conn.commit()
-            return cur.rowcount
+        for row in doomed:
+            memory_index.remove(row["id"])
+        return cur.rowcount
 
     # -- knowledge (deep_learn manifest) ------------------------------------
 
@@ -223,14 +246,20 @@ class Store:
     def _migrate_notes_file(self) -> None:
         """One-time import of the old data/notes.txt into the notes table."""
         legacy = config.NOTES_FILE
-        if not os.path.exists(legacy):
+        marker = legacy + ".migrated"
+        # The marker's existence, not the rename's success, is what means
+        # "already migrated" — trusting the rename let a FileExistsError (the
+        # marker surviving a prior run for any reason) silently fall through
+        # to except OSError, leaving notes.txt in place to be re-imported
+        # (duplicated) on every subsequent startup.
+        if os.path.exists(marker) or not os.path.exists(legacy):
             return
         try:
             with open(legacy, "r", encoding="utf-8") as f:
                 lines = [ln.strip() for ln in f if ln.strip()]
             for line in lines:
                 self.add_note(line)
-            os.rename(legacy, legacy + ".migrated")
+            os.rename(legacy, marker)
         except OSError:
             pass  # not worth failing startup over
 
@@ -258,6 +287,13 @@ def set_store(store: Store | None) -> None:
     global _STORE
     with _STORE_LOCK:
         _STORE = store
+
+
+def _escape_like(text: str) -> str:
+    """Escape SQL LIKE wildcards so a literal '%' or '_' in a memory query
+    matches literally instead of acting as a wildcard. Paired with an
+    ESCAPE '\\' clause at each call site."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _encode_block(obj):

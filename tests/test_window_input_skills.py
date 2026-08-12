@@ -10,7 +10,8 @@ import pytest
 
 from core.risk import Risk
 from core.undo import UndoJournal, get_journal, set_journal
-from skills.input_skills import ClickSkill, PressKeysSkill, TypeTextSkill
+from skills import screen_state
+from skills.input_skills import ClickSkill, PressKeysSkill, ScrollSkill, TypeTextSkill
 from skills.window_skills import (
     CloseWindowSkill, FocusWindowSkill, ListWindowsSkill, SetWindowStateSkill,
 )
@@ -43,6 +44,7 @@ def gui(monkeypatch):
             ("click", x, y, button, clicks)
         ),
         press=lambda key: calls.append(("press", key)),
+        scroll=lambda amount, x=None, y=None: calls.append(("scroll", amount, x, y)),
     )
     monkeypatch.setitem(sys.modules, "pyautogui", fake)
     return calls
@@ -146,3 +148,51 @@ def test_missing_dependency_is_a_message(monkeypatch):
     monkeypatch.setitem(sys.modules, "pyautogui", None)
     out = TypeTextSkill().run(text="x")
     assert "pyautogui" in out
+
+
+# -- coordinate mapping (see_screen -> click/scroll) ------------------------
+#
+# see_screen may downscale its capture (skills/vision_skills.MAX_EDGE); the
+# model reads coordinates straight off that image with no idea it was scaled.
+# screen_state.record/to_real is what maps those image-space coordinates back
+# onto the real screen, and this is the fix for clicks silently landing on
+# the wrong element while still reporting success.
+
+def test_click_is_unscaled_with_no_screenshot_recorded(gui):
+    """Identity mapping when see_screen was never called this session —
+    matches the old, pre-mapping behaviour exactly."""
+    ClickSkill().run(x=100, y=250, button="right", clicks=2)
+    assert ("click", 100, 250, "right", 2) in gui
+
+
+def test_click_maps_through_a_downscaled_screenshot(gui):
+    """A screenshot taken at half real resolution: a click at image (100, 50)
+    must land at real screen (200, 100), not at (100, 50)."""
+    screen_state.record(scale=2.0, origin_x=0, origin_y=0)
+    ClickSkill().run(x=100, y=50)
+    assert ("click", 200, 100, "left", 1) in gui
+
+
+def test_click_maps_through_a_non_primary_monitor_origin(gui):
+    """A capture whose origin isn't (0, 0) — a second monitor, or an active
+    window not anchored at the screen origin — must offset, not just scale."""
+    screen_state.record(scale=1.0, origin_x=1920, origin_y=100)
+    ClickSkill().run(x=10, y=20)
+    assert ("click", 1930, 120, "left", 1) in gui
+
+
+def test_scroll_passes_amount(gui):
+    ScrollSkill().run(amount=-3)
+    assert ("scroll", -3, None, None) in gui
+
+
+def test_scroll_maps_position_through_the_last_screenshot(gui):
+    screen_state.record(scale=2.0, origin_x=0, origin_y=0)
+    ScrollSkill().run(amount=5, x=100, y=50)
+    assert ("scroll", 5, 200, 100) in gui
+
+
+def test_scroll_is_moderate_and_irreversible(gui, journal):
+    assert ScrollSkill().risk_for(amount=1) == Risk.MODERATE
+    ScrollSkill().run(amount=1)
+    assert get_journal().latest() is None

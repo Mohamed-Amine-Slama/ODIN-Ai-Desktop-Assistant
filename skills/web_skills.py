@@ -1,12 +1,14 @@
 """Skills that reach out to the web.
 
-Note: actual web *search* is handled by Anthropic's server-side `web_search`
-and `web_fetch` tools (declared in skill_manager.SERVER_TOOLS), not by a skill
-here. Those run on Anthropic's infrastructure and return real results the model
-can answer from — unlike the old WebSearchSkill, which only opened a browser
-tab and left the model with nothing to say.
+On the Anthropic path, web *search* is handled by Anthropic's server-side
+`web_search`/`web_fetch` tools (declared in skill_manager.SERVER_TOOLS)
+instead of the local WebSearchSkill here — SkillManager drops the local one
+whenever a server tool shares its name, since only one of the two may be
+declared per request. On every other (OpenAI-compatible) provider, which has
+no server-side tools of its own, WebSearchSkill below is what gives Jarvis
+real search results instead of just opening a browser tab.
 
-What stays local is anything that has to happen on *this* machine.
+What stays local otherwise is anything that has to happen on *this* machine.
 """
 import os
 import re
@@ -33,23 +35,15 @@ _SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):(.*)$", re.DOTALL)
 _FETCH_MAX_CHARS = 24_000
 _FETCH_MAX_BYTES = 1_000_000
 
-GEMINI_HOST = "generativelanguage.googleapis.com"
-
-
-def google_search_key() -> str:
-    """The key to use for Google Search grounding, or "" if there isn't one.
-
-    config.API_KEY is only usable here when BASE_URL actually points at Google.
-    Reusing it otherwise would post a live OpenRouter or DashScope credential to
-    googleapis.com, which is a credential leak to an unrelated third party — so
-    an explicit GOOGLE_API_KEY is the only other way to enable this.
-    """
-    explicit = os.getenv("GOOGLE_API_KEY", "")
-    if explicit:
-        return explicit
-    if GEMINI_HOST in config.BASE_URL:
-        return config.API_KEY
-    return ""
+def web_search_available() -> bool:
+    """Whether the optional 'ddgs' package is installed. No API key, no
+    signup, no billing needed — unlike every LLM-provider-hosted search
+    option, this needs nothing beyond the package itself."""
+    try:
+        import ddgs  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _to_web_url(raw: str) -> str | None:
@@ -235,18 +229,22 @@ class SearchInBrowserSkill(BaseSkill):
 
 
 class WebSearchSkill(BaseSkill):
-    """Gemini Grounding with Google Search, exposed as a normal local tool.
+    """DuckDuckGo search (via the `ddgs` package), exposed as a normal local
+    tool. No API key, no signup, no billing — the only search option here
+    that needs nothing beyond the package itself.
 
-    Gemini's OpenAI-compatible chat endpoint does not expose built-in Google
-    Search as a tool. Its native Interactions endpoint does, so this small
-    adapter gives Jarvis grounded, cited answers without opening a browser.
+    Returns raw results (title/url/snippet) rather than a pre-synthesized
+    answer — ddgs is a plain search library with no LLM behind it, so the
+    calling model reads the results and writes the answer itself, same as it
+    would for any other tool_result.
     """
 
     name = "web_search"
     description = (
-        "Search the live web with Google Search grounding and return a concise, "
-        "cited answer. Use for current events, recent releases, live prices, "
-        "and any fact that may have changed since training."
+        "Search the live web and return the top results (title, URL, "
+        "snippet) for you to read and answer from — cite sources by URL. Use "
+        "for current events, recent releases, live prices, and any fact that "
+        "may have changed since training."
     )
     input_schema = {
         "type": "object",
@@ -263,24 +261,38 @@ class WebSearchSkill(BaseSkill):
         query = query.strip()
         if not query:
             return "I need something to search for."
-        key = google_search_key()
-        if not key:
-            return (
-                "Web search needs a Google API key. Set GOOGLE_API_KEY in .env, "
-                "or point BASE_URL at Gemini."
-            )
 
         try:
-            answer = gemini_generate(
-                "Answer the following question accurately using Google Search. "
-                "Be concise and retain the source citations in your answer.\n\n"
-                + query,
-                key,
-                grounded=True,
-            )
+            results = web_search(query)
         except RuntimeError as exc:
             return str(exc)
-        return answer or "Google Search returned no usable answer."
+        if not results:
+            return "That search returned nothing usable."
+        return "\n".join(
+            f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results
+        )
+
+
+def web_search(query: str, count: int = 6) -> list[dict]:
+    """Raw DuckDuckGo search results: [{title, url, snippet}]. Raises
+    RuntimeError with a user-facing message on failure. Shared by
+    WebSearchSkill and core.research's deep_learn pipeline, so both search
+    the same way."""
+    try:
+        from ddgs import DDGS
+    except ImportError as e:
+        raise RuntimeError("Web search needs the 'ddgs' package. Run: pip install ddgs") from e
+
+    try:
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=count))
+    except Exception as e:
+        raise RuntimeError(f"I couldn't search the web: {e}") from e
+
+    return [
+        {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
+        for r in raw
+    ]
 
 
 class WebFetchSkill(BaseSkill):
@@ -319,17 +331,17 @@ class WebFetchSkill(BaseSkill):
         except requests.RequestException as exc:
             return f"I couldn't fetch that page: {exc}"
 
-        if 300 <= response.status_code < 400:
-            return "That page redirects elsewhere; search for the final public URL instead."
-        if response.status_code != 200:
-            return f"I couldn't fetch that page (status {response.status_code})."
-
-        content_type = response.headers.get("content-type", "").lower()
-        if content_type and not any(kind in content_type for kind in ("text/", "json", "xml")):
-            return f"That URL returned {content_type}, not readable text."
-
-        raw = bytearray()
         try:
+            if 300 <= response.status_code < 400:
+                return "That page redirects elsewhere; search for the final public URL instead."
+            if response.status_code != 200:
+                return f"I couldn't fetch that page (status {response.status_code})."
+
+            content_type = response.headers.get("content-type", "").lower()
+            if content_type and not any(kind in content_type for kind in ("text/", "json", "xml")):
+                return f"That URL returned {content_type}, not readable text."
+
+            raw = bytearray()
             for chunk in response.iter_content(chunk_size=16_384):
                 raw.extend(chunk)
                 if len(raw) >= _FETCH_MAX_BYTES:
@@ -375,88 +387,7 @@ class WeatherSkill(BaseSkill):
         return f"I couldn't fetch the weather for {city} (status {resp.status_code})."
 
 
-# Only used when the caller passes no explicit model — e.g. an explicit
-# GOOGLE_API_KEY set alongside a non-Gemini primary provider, where
-# config.MODEL names a model this endpoint has never heard of.
-_DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
-
-
-def _gemini_model() -> str:
-    return config.MODEL if "gemini" in config.MODEL.lower() else _DEFAULT_GEMINI_MODEL
-
-
-def gemini_generate(prompt: str, key: str, grounded: bool = True, model: str | None = None) -> str:
-    """Call Gemini, optionally with Google Search grounding, and return the
-    text answer. Raises RuntimeError with a user-facing message on failure.
-
-    Shared by WebSearchSkill and the deep_learn research pipeline (core.research)
-    so both speak to the same endpoint the same way — deep_learn's plain
-    (non-grounded) calls for topic decomposition and self-checking reuse this
-    rather than standing up a second HTTP client.
-    """
-    payload = {"model": model or _gemini_model(), "input": prompt}
-    if grounded:
-        payload["tools"] = [{"type": "google_search"}]
-
-    try:
-        response = requests.post(
-            f"https://{GEMINI_HOST}/v1beta/interactions",
-            headers={"x-goog-api-key": key},
-            json=payload,
-            timeout=30,
-        )
-    except requests.Timeout:
-        raise RuntimeError("Google did not respond in time.")
-    except requests.RequestException as exc:
-        raise RuntimeError(f"I couldn't reach Google: {exc}")
-
-    if response.status_code != 200:
-        raise RuntimeError(f"Google could not complete that request (status {response.status_code}).")
-    try:
-        return _grounded_answer(response.json())
-    except ValueError as exc:
-        raise RuntimeError(f"Google returned an unreadable response: {exc}")
-
-
-def _grounded_answer(payload: dict) -> str:
-    """Extract model text plus linkable URL citations from Interactions JSON."""
-    if not isinstance(payload, dict):
-        raise ValueError("expected an object")
-
-    direct = payload.get("output_text") or payload.get("outputText")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-
-    texts: list[str] = []
-    sources: list[tuple[str, str]] = []
-    for step in payload.get("steps", []):
-        if not isinstance(step, dict) or step.get("type") != "model_output":
-            continue
-        for content in step.get("content", []):
-            if not isinstance(content, dict) or content.get("type") != "text":
-                continue
-            text = content.get("text", "").strip()
-            if text:
-                texts.append(text)
-            for annotation in content.get("annotations", []):
-                if not isinstance(annotation, dict):
-                    continue
-                url = annotation.get("url")
-                if not isinstance(url, str) or not url:
-                    continue
-                title = annotation.get("title") or urllib.parse.urlparse(url).netloc
-                pair = (str(title), url)
-                if pair not in sources:
-                    sources.append(pair)
-
-    if not texts:
-        return ""
-    answer = texts[-1]
-    if sources:
-        answer += "\n\nSources:\n" + "\n".join(
-            f"- [{title}]({url})" for title, url in sources
-        )
-    return answer
+_DNS_TIMEOUT_SECONDS = 5
 
 
 def _is_public_url(url: str) -> bool:
@@ -464,10 +395,18 @@ def _is_public_url(url: str) -> bool:
     host = urllib.parse.urlparse(url).hostname
     if not host or host.lower() in {"localhost", "localhost.localdomain"}:
         return False
+    # getaddrinfo has no timeout parameter of its own; a slow/unresponsive
+    # resolver would otherwise block well past the fetch's own 15s timeout,
+    # which hasn't even started yet at this point. Scoped narrowly and always
+    # restored, since this touches process-global socket state.
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_DNS_TIMEOUT_SECONDS)
     try:
         addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
-    except socket.gaierror:
+    except (socket.gaierror, socket.timeout, OSError):
         return False
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
     try:
         return bool(addresses) and all(ip_address(address).is_global for address in addresses)
     except ValueError:

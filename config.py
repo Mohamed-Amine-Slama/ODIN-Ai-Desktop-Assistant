@@ -106,6 +106,14 @@ TTS_RATE = int(os.getenv("TTS_RATE", "180"))  # SAPI only
 VAD_SILENCE_SECONDS = float(os.getenv("VAD_SILENCE_SECONDS", "0.8"))
 VAD_MAX_SECONDS = float(os.getenv("VAD_MAX_SECONDS", "20"))
 
+# Barge-in: interrupt Jarvis mid-sentence by talking over it. Same RMS-energy
+# scale as the VAD floor in speech_input (typical speech clears ~0.02-0.05);
+# lower catches interruptions faster but risks tripping on room noise. This
+# has no acoustic echo cancellation, so it works best with headphones —
+# without them, Jarvis's own voice coming back through the mic from the
+# speakers can trigger a false interruption.
+BARGE_IN_THRESHOLD = float(os.getenv("BARGE_IN_THRESHOLD", "0.05"))
+
 # --- Paths ----------------------------------------------------------------
 NOTES_FILE = os.path.join(DATA_DIR, "notes.txt")
 

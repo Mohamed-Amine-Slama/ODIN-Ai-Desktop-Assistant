@@ -37,10 +37,11 @@ _CAPABILITY_LINES = {
     "open_app": "- launch applications and open websites",
     "read_file": "- read, write, search, move, and delete files and folders",
     "list_windows": "- list, focus, resize, and close windows",
-    "type_text": "- type, press key combinations, and click, to drive apps that have no other way in",
+    "type_text": "- type, press key combinations, click, and scroll, to drive apps that have no other way in",
     "run_command": "- run shell commands",
     "see_screen": "- look at the screen",
     "system_info": "- read system stats and control volume and power",
+    "read_email": "- read and send email, and manage calendar events",
 }
 
 # Guidance for tools that are not always present. The tool set differs by
@@ -60,7 +61,15 @@ _TOOL_GUIDANCE = {
         '  ("this error", "what am I looking at", "read this"), and also\n'
         "  mid-task before clicking or typing into an app you just opened or\n"
         "  navigated — check what's actually on screen rather than guessing\n"
-        "  coordinates or assuming a page has finished loading."
+        "  coordinates or assuming a page has finished loading. Give click\n"
+        "  and scroll coordinates exactly as they appear in the most recent\n"
+        "  screenshot; they are mapped onto the real screen for you, so never\n"
+        "  scale or guess them yourself. A GUI task is not done just because\n"
+        "  a click or keystroke ran without error — before reporting one\n"
+        "  finished, especially anything with a real effect like sending a\n"
+        "  message, posting, or submitting a form, take one more screenshot\n"
+        "  and confirm from it that the result actually happened. If it\n"
+        "  didn't, adjust and try again rather than reporting success."
     ),
     "clipboard": (
         "- clipboard to read what they just copied, or to hand back a result\n"
@@ -78,10 +87,22 @@ _TOOL_GUIDANCE = {
         "- run_command only for things no other skill covers. It cannot be\n"
         "  undone, so prefer read_file, write_file, and search_files."
     ),
+    "scroll": (
+        "- scroll to bring something into view in a feed, chat/DM list,\n"
+        "  search results, or a long page — screenshot, scroll, then\n"
+        "  screenshot again rather than assuming the target is now visible\n"
+        "  or clicking where it would be after enough scrolling."
+    ),
     "wait": (
         "- wait between steps of a GUI task when something needs a moment to\n"
         "  load — after opening an app or a page, before you screenshot or\n"
         "  click into it."
+    ),
+    "read_email": (
+        "- read_email, send_email, list_events, create_event, and "
+        "delete_event for the user's connected account(s). If more than one "
+        "account is connected, ask which one rather than guessing which "
+        "inbox or calendar the user means."
     ),
     "deep_learn": (
         "- deep_learn to research a topic in depth and keep what it finds for\n"
@@ -486,21 +507,45 @@ class Brain:
         out[-1] = last
         return out
 
-    def _create(self, kwargs: dict):
-        """Send the request, dropping reasoning_effort if this model rejects it.
+    def _reasoning_kwargs(self) -> dict:
+        """Build the reasoning-effort kwarg in whatever shape the endpoint
+        actually understands.
 
-        The endpoint is whatever the user pointed BASE_URL at, and a model with
-        no reasoning control 400s on the parameter rather than ignoring it. One
-        retry costs a round trip on the first turn only — the flag is sticky for
-        the rest of the session.
+        OpenRouter's own reasoning control is the nested `reasoning:
+        {"effort": ...}` object, not OpenAI's flat `reasoning_effort` string
+        (the latter is used for a non-OpenRouter OpenAI-compatible endpoint,
+        e.g. Gemini's own OpenAI-compatibility layer, which does document
+        that flat field). Critically, `reasoning` is NOT part of the openai
+        SDK's typed create() signature the way `reasoning_effort` is, so
+        passing it as a normal kwarg raises a client-side TypeError before
+        any request is even sent — confirmed against the real SDK, not just
+        inferred. It has to ride in `extra_body`, which the SDK forwards into
+        the JSON payload verbatim without validating it.
+        """
+        effort = (config.EFFORT or "").strip().lower()
+        if not effort or effort == "off":
+            return {}
+        if "openrouter.ai" in (config.BASE_URL or ""):
+            return {"extra_body": {"reasoning": {"effort": effort}}}
+        return {"reasoning_effort": effort}
+
+    def _create(self, kwargs: dict):
+        """Send the request, dropping the reasoning kwarg if this model
+        rejects it outright.
+
+        Some endpoints 400 on an unrecognised reasoning parameter rather than
+        ignoring it. One retry costs a round trip on the first turn only —
+        the flag is sticky for the rest of the session.
         """
         try:
             return self.client.chat.completions.create(**kwargs)
         except openai.BadRequestError as e:
-            if "reasoning_effort" not in kwargs or "reasoning" not in str(e).lower():
+            has_reasoning = "reasoning_effort" in kwargs or "reasoning" in kwargs.get("extra_body", {})
+            if not has_reasoning or "reasoning" not in str(e).lower():
                 raise
             self._send_effort = False
-            kwargs.pop("reasoning_effort")
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("extra_body", None)
             if config.DEBUG:
                 print("[model] this model has no reasoning control; dropped the parameter")
             return self.client.chat.completions.create(**kwargs)
@@ -594,8 +639,8 @@ class Brain:
         # Reasoning endpoints map this to their native thinking level; low is
         # the right latency/cost tradeoff for short, tool-driven voice turns.
         # Models without a reasoning control reject it outright, hence _create.
-        if self._send_effort and config.EFFORT and config.EFFORT.lower() != "off":
-            kwargs["reasoning_effort"] = config.EFFORT
+        if self._send_effort:
+            kwargs.update(self._reasoning_kwargs())
 
         response_stream = self._create(kwargs)
 
@@ -696,7 +741,18 @@ class Brain:
                 continue
 
             tool_input = dict(block.input or {})
-            risk = skill.risk_for(**tool_input)
+            try:
+                risk = skill.risk_for(**tool_input)
+            except TypeError as e:
+                results.append(
+                    _tool_result(block.id, f"Invalid arguments for {block.name}: {e}", True)
+                )
+                continue
+            except Exception as e:
+                results.append(
+                    _tool_result(block.id, f"Error evaluating {block.name}: {e}", True)
+                )
+                continue
 
             if config.CONFIRM_DESTRUCTIVE and risk >= Risk.DANGEROUS:
                 if not self.confirm(skill, tool_input):
@@ -846,6 +902,36 @@ def _sdk_errors(*names: str) -> tuple[type, ...]:
 
 _DENIED = "My API key was rejected (401/403). Check API_KEY and its permissions in .env."
 
+# A provider's raw error body can run to several hundred characters — nested
+# JSON, repeated "previous_errors" from OpenRouter's upstream fallback
+# attempts, a credits-remaining essay. That's unreadable as a one-line chat
+# message, and in the GUI a single bubble that tall is what was pushing
+# content past the transcript panel into the input box below it. One
+# sentence is plenty for something the user just needs to act on.
+_ERROR_MESSAGE_LIMIT = 220
+
+
+def _short_message(exc: Exception) -> str:
+    """The human-readable part of an SDK error, not its full raw body.
+
+    openai's APIStatusError.body is the parsed JSON error payload (already
+    unwrapped from an outer "error" key by the SDK) when the provider
+    returned one — that's where the actual one-sentence explanation lives.
+    Falling back to str(exc) covers everything else, still length-capped so
+    an exotic exception can't reproduce the same problem another way.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("message"), str) and body["message"].strip():
+        return _truncate(body["message"])
+    return _truncate(str(exc))
+
+
+def _truncate(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _ERROR_MESSAGE_LIMIT:
+        return text
+    return text[:_ERROR_MESSAGE_LIMIT].rstrip() + "…"
+
 
 def friendly_error(exc: Exception) -> str:
     """Map an SDK exception to one short sentence a user can act on.
@@ -864,7 +950,7 @@ def friendly_error(exc: Exception) -> str:
     if isinstance(exc, _sdk_errors("APIStatusError")):
         if getattr(exc, "status_code", 0) >= 500:
             return "The API provider is having trouble. Try again in a moment."
-        return f"The API rejected that request: {exc}"
+        return f"The API rejected that request: {_short_message(exc)}"
     if isinstance(exc, _sdk_errors("APIConnectionError")):
         return "I can't reach the network right now."
-    return f"Something went wrong: {exc}"
+    return f"Something went wrong: {_short_message(exc)}"

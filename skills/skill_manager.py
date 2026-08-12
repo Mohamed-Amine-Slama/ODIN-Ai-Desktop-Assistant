@@ -21,7 +21,7 @@ from .web_skills import (
     WeatherSkill,
     WebFetchSkill,
     WebSearchSkill,
-    google_search_key,
+    web_search_available,
 )
 from .vision_skills import ScreenshotSkill
 from .file_skills import (
@@ -77,11 +77,11 @@ SKILL_CLASSES = [
 # and registering it without one would put a tool in the prompt that can only
 # ever answer "I can't" — build_system_prompt keys off the registered set.
 SKILL_CLASSES.append(WebFetchSkill)
-if google_search_key():
+if web_search_available():
     SKILL_CLASSES.append(WebSearchSkill)
 
-    # deep_learn hard-requires the same grounded search WebSearchSkill uses,
-    # so it is gated identically. list_learned_topics only reads what's
+    # deep_learn hard-requires the same DuckDuckGo search WebSearchSkill
+    # uses, so it is gated identically. list_learned_topics only reads what's
     # already stored locally and stays available either way.
     from .knowledge_skills import DeepLearnSkill
 
@@ -97,9 +97,29 @@ if getattr(config, "ENABLE_SHELL", True):
     SKILL_CLASSES.append(RunCommandSkill)
 
 if getattr(config, "ENABLE_INPUT_CONTROL", True):
-    from .input_skills import ClickSkill, PressKeysSkill, TypeTextSkill
+    from .input_skills import ClickSkill, PressKeysSkill, ScrollSkill, TypeTextSkill
 
-    SKILL_CLASSES.extend([TypeTextSkill, PressKeysSkill, ClickSkill])
+    SKILL_CLASSES.extend([TypeTextSkill, PressKeysSkill, ClickSkill, ScrollSkill])
+
+# Email/calendar skills need one interactive /connect (main.py) per account
+# before they're any use, so they're gated on either account already being
+# connected, or a client-secrets file / client ID being in place so /connect
+# has something to work with — never registered with nothing configured at
+# all, same reasoning as WebSearchSkill above.
+from core.email_providers import google_configured, microsoft_configured
+
+if google_configured() or microsoft_configured():
+    from .email_skills import (
+        CreateEventSkill,
+        DeleteEventSkill,
+        ListEventsSkill,
+        ReadEmailSkill,
+        SendEmailSkill,
+    )
+
+    SKILL_CLASSES.extend(
+        [ReadEmailSkill, SendEmailSkill, ListEventsSkill, CreateEventSkill, DeleteEventSkill]
+    )
 
 # Anthropic-hosted tools. These execute on Anthropic's servers and their results
 # arrive inline as content blocks — SkillManager never runs them and `execute()`

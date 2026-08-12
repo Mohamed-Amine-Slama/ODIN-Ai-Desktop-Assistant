@@ -160,6 +160,56 @@ def test_move_onto_existing_is_dangerous(journal, tmp_path):
     assert MoveFileSkill().risk_for(src=str(src), dst=str(dst)) == Risk.DANGEROUS
 
 
+def test_move_into_existing_directory_is_only_moderate(journal, tmp_path):
+    """Moving into a folder nests the file inside it — nothing is replaced,
+    so this should not trip the same 'replacing what's there?' prompt as a
+    genuine file-vs-file overwrite."""
+    src = tmp_path / "a.txt"
+    dest_dir = tmp_path / "folder"
+    src.write_text("a", encoding="utf-8")
+    dest_dir.mkdir()
+    assert MoveFileSkill().risk_for(src=str(src), dst=str(dest_dir)) == Risk.MODERATE
+    assert "replacing" not in MoveFileSkill().consequence(src=str(src), dst=str(dest_dir))
+
+
+def test_move_into_existing_directory_then_undo(journal, tmp_path):
+    src = tmp_path / "a.txt"
+    dest_dir = tmp_path / "folder"
+    other = dest_dir / "unrelated.txt"
+    src.write_text("data", encoding="utf-8")
+    dest_dir.mkdir()
+    other.write_text("leave me alone", encoding="utf-8")
+
+    MoveFileSkill().run(src=str(src), dst=str(dest_dir))
+    nested = dest_dir / "a.txt"
+    assert nested.exists() and not src.exists()
+
+    get_journal().undo(get_journal().latest().token)
+    assert src.read_text(encoding="utf-8") == "data"
+    assert not nested.exists()
+    # The rest of the destination directory must be untouched by the undo.
+    assert other.read_text(encoding="utf-8") == "leave me alone"
+
+
+def test_move_destination_sensitivity_checks_the_destination(journal, monkeypatch, tmp_path):
+    """Moving INTO a sensitive root is dangerous; moving FROM a location that
+    merely lives under one, to an ordinary destination, is not — risk is keyed
+    on the destination, matching WriteFileSkill/MakeDirSkill's convention."""
+    sensitive = tmp_path / "protected"
+    sensitive.mkdir()
+    monkeypatch.setattr("core.risk.SENSITIVE_ROOTS", [sensitive])
+
+    src = sensitive / "a.txt"
+    src.write_text("a", encoding="utf-8")
+    safe_dst = tmp_path / "safe" / "a.txt"
+    assert MoveFileSkill().risk_for(src=str(src), dst=str(safe_dst)) == Risk.MODERATE
+
+    other_src = tmp_path / "other.txt"
+    other_src.write_text("x", encoding="utf-8")
+    into_sensitive = sensitive / "b.txt"
+    assert MoveFileSkill().risk_for(src=str(other_src), dst=str(into_sensitive)) == Risk.DANGEROUS
+
+
 def test_make_dir_then_undo(journal, tmp_path):
     target = tmp_path / "fresh"
     MakeDirSkill().run(path=str(target))

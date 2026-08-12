@@ -4,6 +4,7 @@ import time
 import pytest
 
 from conftest import response, text_block, tool_use_block
+from core import memory_index
 from core.scheduler import ReminderScheduler
 from core.store import Store, set_store
 from skills.utility_skills import (
@@ -60,6 +61,28 @@ def test_legacy_notes_file_is_migrated(tmp_path, monkeypatch):
         assert any("an old note" in r["text"] for r in s.list_notes())
         assert not legacy.exists(), "legacy file should be renamed after migration"
         assert (tmp_path / "notes.txt.migrated").exists()
+    finally:
+        s.close()
+
+
+def test_migration_marker_prevents_reimport(tmp_path, monkeypatch):
+    """A stale .migrated marker existing alongside notes.txt (e.g. a restored
+    backup put the old file back) must stop re-migration on its own — the
+    old code only skipped migration when os.rename succeeded, which silently
+    re-imported (duplicated) every startup once that assumption broke."""
+    import config
+
+    legacy = tmp_path / "notes.txt"
+    marker = tmp_path / "notes.txt.migrated"
+    legacy.write_text("[2026-01-01 10:00] should not be reimported\n", encoding="utf-8")
+    marker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(config, "NOTES_FILE", str(legacy), raising=False)
+
+    s = Store(str(tmp_path / "m.db"))
+    try:
+        assert s.list_notes() == []
+        assert legacy.exists(), "left alone once already migrated, not re-consumed"
     finally:
         s.close()
 
@@ -157,6 +180,80 @@ def test_memory_forget_requires_a_target(store):
 
 def test_memory_recall_when_empty(store):
     assert "haven't been told anything" in MemorySkill().run(action="recall")
+
+
+def test_memory_recall_escapes_like_wildcards(store):
+    """A literal '%' or '_' in a query must not act as a SQL LIKE wildcard —
+    otherwise 'recall 50%' would also match completely unrelated memories."""
+    skill = MemorySkill()
+    skill.run(action="remember", text="uses 50% battery saver mode")
+    skill.run(action="remember", text="uses xyz battery saver mode")
+
+    out = skill.run(action="recall", text="50%")
+    assert "50% battery" in out
+    assert "xyz battery" not in out
+
+
+def test_memory_forget_escapes_like_wildcards(store):
+    skill = MemorySkill()
+    skill.run(action="remember", text="50% off coupon code")
+    skill.run(action="remember", text="xyz off coupon code")
+
+    skill.run(action="forget", text="50%")
+    assert store.recall() == ["xyz off coupon code"]
+
+
+# -- semantic memory index ---------------------------------------------------
+# core.memory_index degrades to no-ops when chromadb/sentence-transformers
+# aren't installed (not required for these tests), so its calls are mocked
+# here to test the store's wiring to it in isolation.
+
+def test_remember_indexes_the_new_row(store, monkeypatch):
+    calls = []
+    monkeypatch.setattr(memory_index, "index", lambda mid, text: calls.append((mid, text)))
+
+    MemorySkill().run(action="remember", text="likes dark roast coffee")
+
+    assert len(calls) == 1
+    memory_id, text = calls[0]
+    assert isinstance(memory_id, int)
+    assert text == "likes dark roast coffee"
+
+
+def test_recall_prefers_semantic_results_when_available(store, monkeypatch):
+    store.remember("has a Dell U2720Q monitor")
+    monkeypatch.setattr(memory_index, "search", lambda query, limit=20: ["semantic hit"])
+
+    assert store.recall("what display am I using") == ["semantic hit"]
+
+
+def test_recall_falls_back_to_like_when_semantic_search_finds_nothing(store, monkeypatch):
+    store.remember("has a Dell U2720Q monitor")
+    monkeypatch.setattr(memory_index, "search", lambda query, limit=20: [])
+
+    assert store.recall("Dell") == ["has a Dell U2720Q monitor"]
+
+
+def test_recall_with_no_query_never_calls_semantic_search(store, monkeypatch):
+    """Nothing to embed a similarity search against — listing everything must
+    stay a plain LIKE-free scan, not silently return zero results."""
+    store.remember("fact one")
+
+    def boom(*a, **k):
+        raise AssertionError("search() should not be called for an empty query")
+
+    monkeypatch.setattr(memory_index, "search", boom)
+    assert store.recall() == ["fact one"]
+
+
+def test_forget_removes_matching_rows_from_the_index(store, monkeypatch):
+    removed = []
+    monkeypatch.setattr(memory_index, "remove", lambda mid: removed.append(mid))
+    store.remember("temporary fact")
+
+    store.forget("temporary")
+
+    assert len(removed) == 1
 
 
 # -- conversation persistence ---------------------------------------------
