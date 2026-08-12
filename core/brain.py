@@ -189,12 +189,14 @@ class Brain:
             self.client = anthropic.Anthropic(
                 api_key=config.API_KEY,
                 base_url=config.BASE_URL or None,
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
             )
             self.is_openai = False
         else:
             self.client = openai.OpenAI(
                 api_key=config.API_KEY,
                 base_url=config.BASE_URL or None,
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
             )
             self.is_openai = True
 
@@ -946,6 +948,15 @@ def friendly_error(exc: Exception) -> str:
         if getattr(exc, "status_code", 0) >= 500:
             return "The API provider is having trouble. Try again in a moment."
         return f"The API rejected that request: {_short_message(exc)}"
+    if isinstance(exc, _sdk_errors("APITimeoutError")):
+        # APITimeoutError subclasses APIConnectionError in both SDKs, so
+        # this has to come first — otherwise a slow/overloaded model (the
+        # network is fine, it just never answered) would get the
+        # "can't reach the network" message instead of this one.
+        return (
+            f"The model didn't respond within {config.REQUEST_TIMEOUT_SECONDS:g}s — "
+            "it may be overloaded. Try again, or try a different MODEL in .env."
+        )
     if isinstance(exc, _sdk_errors("APIConnectionError")):
         return "I can't reach the network right now."
     return f"Something went wrong: {_short_message(exc)}"

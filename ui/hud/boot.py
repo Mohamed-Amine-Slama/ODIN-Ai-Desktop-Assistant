@@ -1,17 +1,27 @@
-"""Boot sequence — ODIN-HUD.md §8's full orchestrated startup (~2.6s):
+"""Boot sequence — ODIN-HUD.md §8's full orchestrated startup, at an
+unhurried, deliberately lazy pace (~4.2s):
 
-  0.0s  A hairline expands across the vertical center.
-  0.4s  It splits vertically outward — an iris wipe revealing the grid
-        underneath, rather than a flat opacity fade.
-  0.7s  Every panel (and the four gauges flanking the orb) fades up with a
-        3px rise, staggered outward from screen center.
-  ~1.7s The orb scales in from 0.85x and fades in.
-  ~2.1s The core ignites — a flash to white settling back to the idle
-        gradient — and the rings begin rotating for the first time.
+  0.0s   A hairline expands across the vertical center.
+  0.65s  It splits vertically outward — an iris wipe revealing the grid
+         underneath, rather than a flat opacity fade.
+  1.15s  Every panel (and the four gauges flanking the orb) fades up with a
+         3px rise, staggered outward from screen center.
+  ~2.8s  The orb scales in from 0.85x and fades in.
+  ~3.5s  The core ignites — a flash to white settling back to the idle
+         gradient — and the rings begin rotating for the first time.
 
 Skipped entirely under `config.HUD_REDUCED_MOTION`, per §8's own escape
 hatch — the window is simply shown at its final state, nothing hidden or
 offset first.
+
+Perf note: every widget involved is plain `.hide()`/`.show()`'d while
+waiting for its own turn, not kept visible-but-transparent via a
+QGraphicsOpacityEffect the whole time — an attached opacity effect forces
+that widget through an offscreen-composited repaint on every update, and
+the orb alone repaints at ~30fps (ui/hud/window.py's shared animation
+loop) for the couple of seconds it sits waiting its turn. A hidden widget
+costs Qt nothing to keep hidden; the effect is only ever attached for the
+handful of hundred milliseconds a widget is actually fading in.
 """
 from __future__ import annotations
 
@@ -25,12 +35,12 @@ from PyQt6.QtWidgets import QGraphicsOpacityEffect, QWidget
 import config
 from . import tokens
 
-HAIRLINE_MS = 400
-IRIS_MS = 300
-PANEL_STAGGER_MS = 40
-PANEL_REVEAL_MS = 320
-ORB_REVEAL_MS = 420
-FLASH_MS = 500
+HAIRLINE_MS = 650
+IRIS_MS = 500
+PANEL_STAGGER_MS = 65
+PANEL_REVEAL_MS = 520
+ORB_REVEAL_MS = 650
+FLASH_MS = 750
 
 
 def _safe(fn: Callable) -> Callable:
@@ -110,7 +120,7 @@ class _BootCover(QWidget):
 def run_boot_sequence(window: QWidget) -> None:
     """`window`: the OdinHudWindow, already shown full-screen. Every
     animation/effect object involved is kept alive in `window._boot_anims`
-    for the whole ~2.6s sequence, cleared only once it's fully done."""
+    for the whole sequence, cleared only once it's fully done."""
     if config.HUD_REDUCED_MOTION:
         return
 
@@ -121,10 +131,10 @@ def run_boot_sequence(window: QWidget) -> None:
     if orb is not None:
         orb.boot_frozen = True
         orb.bootScale = 0.85
-        orb_effect = QGraphicsOpacityEffect(orb)
-        orb_effect.setOpacity(0.0)
-        orb.setGraphicsEffect(orb_effect)
-        keepalive.append(orb_effect)
+        # Hidden outright, not shown-but-transparent — see the module
+        # docstring's perf note. _reveal_orb() attaches the opacity effect
+        # and shows it only once its own stage actually starts.
+        orb.hide()
 
     cover = _BootCover(window)
     cover.setGeometry(window.rect())
@@ -193,6 +203,8 @@ def _reveal_panels(window: QWidget, keepalive: list[object], on_done: Callable) 
         return math.hypot(c.x() - center.x(), c.y() - center.y())
 
     widgets.sort(key=distance)
+    for w in widgets:
+        w.hide()  # see the module docstring's perf note
 
     remaining = len(widgets)
 
@@ -203,46 +215,50 @@ def _reveal_panels(window: QWidget, keepalive: list[object], on_done: Callable) 
             on_done()
 
     for i, widget in enumerate(widgets):
-        effect = QGraphicsOpacityEffect(widget)
-        effect.setOpacity(0.0)
-        widget.setGraphicsEffect(effect)
-        keepalive.append(effect)
-
         natural_pos = widget.pos()
         start_pos = QPoint(natural_pos.x(), natural_pos.y() + 3)
-
-        opacity_anim = QPropertyAnimation(effect, b"opacity", widget)
-        opacity_anim.setDuration(PANEL_REVEAL_MS)
-        opacity_anim.setStartValue(0.0)
-        opacity_anim.setEndValue(1.0)
-        opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        keepalive.append(opacity_anim)
-
-        pos_anim = QPropertyAnimation(widget, b"pos", widget)
-        pos_anim.setDuration(PANEL_REVEAL_MS)
-        pos_anim.setStartValue(start_pos)
-        pos_anim.setEndValue(natural_pos)
-        pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        keepalive.append(pos_anim)
 
         def cleanup(w=widget) -> None:
             w.setGraphicsEffect(None)
             one_done()
 
-        opacity_anim.finished.connect(_safe(cleanup))
+        def start(w=widget, sp=start_pos, np=natural_pos) -> None:
+            effect = QGraphicsOpacityEffect(w)
+            effect.setOpacity(0.0)
+            w.setGraphicsEffect(effect)
+            keepalive.append(effect)
 
-        def start(o=opacity_anim, p=pos_anim, w=widget, sp=start_pos) -> None:
+            opacity_anim = QPropertyAnimation(effect, b"opacity", w)
+            opacity_anim.setDuration(PANEL_REVEAL_MS)
+            opacity_anim.setStartValue(0.0)
+            opacity_anim.setEndValue(1.0)
+            opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            opacity_anim.finished.connect(_safe(cleanup))
+            keepalive.append(opacity_anim)
+
+            pos_anim = QPropertyAnimation(w, b"pos", w)
+            pos_anim.setDuration(PANEL_REVEAL_MS)
+            pos_anim.setStartValue(sp)
+            pos_anim.setEndValue(np)
+            pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            keepalive.append(pos_anim)
+
             w.move(sp)
-            o.start()
-            p.start()
+            w.show()
+            opacity_anim.start()
+            pos_anim.start()
 
         QTimer.singleShot(i * PANEL_STAGGER_MS, _safe(start))
 
 
 def _reveal_orb(orb, keepalive: list[object], on_done: Callable) -> None:
     """Rings scale in 0.85 -> 1.0 from the orb's own center, fading in at
-    the same time (§8, ~1.6s beat)."""
-    effect = orb.graphicsEffect()
+    the same time (§8's "orb rings scale in" beat)."""
+    effect = QGraphicsOpacityEffect(orb)
+    effect.setOpacity(0.0)
+    orb.setGraphicsEffect(effect)
+    keepalive.append(effect)
+    orb.show()
 
     opacity_anim = QPropertyAnimation(effect, b"opacity", orb)
     opacity_anim.setDuration(ORB_REVEAL_MS)
@@ -269,7 +285,7 @@ def _reveal_orb(orb, keepalive: list[object], on_done: Callable) -> None:
 
 def _ignite_core(orb, keepalive: list[object], on_done: Callable) -> None:
     """White flash settling back to the idle gradient; the rings start
-    rotating from here, not from frame one (§8, ~2.1s beat)."""
+    rotating from here, not from frame one (§8's core-ignition beat)."""
     orb.boot_frozen = False
 
     flash_anim = QPropertyAnimation(orb, b"bootFlash", orb)
