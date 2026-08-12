@@ -47,6 +47,13 @@ EFFORT = os.getenv("EFFORT", "low")
 # Brevity comes from the system prompt.
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
+# How long to wait for the model before giving up on a request. Without
+# this, the SDK's own default (minutes) applies — and a slow/overloaded
+# provider (free-tier models in particular) can leave a turn hanging with
+# no error and no way to send another message until it resolves, since
+# only one turn is ever allowed in flight at a time.
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
+
 # How many tool-use round trips before we give up on a single turn. A compound
 # request ("open X, find Y, message them") can easily chain a dozen-plus calls
 # — open/navigate, several wait+see_screen+click cycles, type, send — so this

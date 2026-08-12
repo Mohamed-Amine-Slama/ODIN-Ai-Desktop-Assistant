@@ -67,14 +67,17 @@ def test_full_sequence_ends_with_everything_cleaned_up_and_orb_unfrozen(qapp, mo
 
     run_boot_sequence(window)
 
-    # Immediately after kicking off: orb held still, scaled down, invisible.
+    # Immediately after kicking off: orb held still, scaled down, hidden
+    # outright (cheaper than shown-but-transparent — see boot.py's perf
+    # note) until its own reveal stage.
     assert orb.boot_frozen is True
     assert orb.bootScale == 0.85
-    assert orb.graphicsEffect() is not None
+    assert orb.isVisible() is False
+    assert orb.graphicsEffect() is None
 
     last_stagger = 5 * PANEL_STAGGER_MS  # 6 panels -> indexes 0..5
     total_ms = HAIRLINE_MS + IRIS_MS + last_stagger + PANEL_REVEAL_MS + ORB_REVEAL_MS + FLASH_MS
-    QTest.qWait(total_ms + 500)  # generous margin past the last stage
+    QTest.qWait(total_ms + 2000)  # generous margin past the last stage
 
     assert window._boot_anims is None
     assert orb.boot_frozen is False
@@ -83,6 +86,47 @@ def test_full_sequence_ends_with_everything_cleaned_up_and_orb_unfrozen(qapp, mo
     assert orb.graphicsEffect() is None
     for panel in window._boot_reveal_widgets:
         assert panel.graphicsEffect() is None
+
+    window.deleteLater()
+
+
+def test_widgets_waiting_their_turn_are_hidden_not_opacity_effected(qapp, monkeypatch):
+    """A QGraphicsOpacityEffect forces its widget through an offscreen-
+    composited repaint on every update — cheap to pay for the few hundred
+    ms a widget is actually fading in, wasteful to pay for the whole
+    multi-second sequence while it's just sitting there invisible waiting
+    its turn. A plain hide() costs nothing until shown again."""
+    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
+    window = QWidget()
+    window.resize(800, 600)
+    window.show()
+
+    near = QLabel("near", window)
+    near.setGeometry(390, 290, 20, 20)  # right at center -> starts first (delay 0)
+    near.show()
+    far = QLabel("far", window)
+    far.setGeometry(0, 0, 20, 20)  # far corner -> starts several stagger steps later
+    far.show()
+    window._boot_reveal_widgets = [near, far]
+    window.orb = None
+
+    QTest.qWaitForWindowExposed(window)
+
+    run_boot_sequence(window)
+
+    # Before _reveal_panels() has even run (still mid hairline+iris), both
+    # widgets are exactly as constructed — untouched.
+    assert near.isVisible() is True
+    assert far.isVisible() is True
+
+    # Just past the cover finishing: _reveal_panels() has hidden both, and
+    # the nearest one (delay 0) has already picked its opacity effect back
+    # up and started revealing — the far one hasn't reached its turn yet.
+    QTest.qWait(HAIRLINE_MS + IRIS_MS + 30)
+    assert near.isVisible() is True
+    assert near.graphicsEffect() is not None
+    assert far.isVisible() is False
+    assert far.graphicsEffect() is None
 
     window.deleteLater()
 

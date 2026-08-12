@@ -374,6 +374,48 @@ def test_friendly_error_truncates_a_very_long_message():
     assert len(message) < 300
 
 
+def test_openai_client_is_built_with_a_request_timeout(monkeypatch):
+    """Without an explicit timeout, the SDK's own default (minutes) applies
+    — a slow/overloaded provider can then leave a turn hanging with no
+    error, and since only one turn is ever allowed in flight
+    (current_worker in ui/hud/window.py), that silently blocks every
+    later message too, not just the stuck one."""
+    import config
+    from core.brain import Brain
+
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    monkeypatch.setattr(config, "MODEL", "gemini-2.5-flash", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
+    monkeypatch.setattr(config, "API_KEY", "key", raising=False)
+    monkeypatch.setattr(config, "REQUEST_TIMEOUT_SECONDS", 42.0, raising=False)
+
+    Brain()
+
+    assert captured.get("timeout") == 42.0
+
+
+def test_friendly_error_distinguishes_timeout_from_connection_failure():
+    """openai.APITimeoutError (and anthropic's) subclasses
+    APIConnectionError in both SDKs — without a check ordered ahead of the
+    generic one, a request that reached the provider fine but never got an
+    answer back (the network is up; the model just never responded) would
+    be misreported as "I can't reach the network right now.", which sends
+    a confused user chasing the wrong problem."""
+    import openai
+
+    from core.brain import friendly_error
+
+    message = friendly_error(_http_error(openai.APITimeoutError, None))
+    assert "didn't respond" in message
+    assert "reach the network" not in message
+
+
 def test_friendly_error_handles_anthropic_errors_when_the_sdk_is_present():
     """The Anthropic SDK is optional. When it is installed its exception types
     must be recognised too, and when it isn't, nothing may break."""
