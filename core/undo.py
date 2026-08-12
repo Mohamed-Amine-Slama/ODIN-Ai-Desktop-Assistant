@@ -59,6 +59,7 @@ class UndoJournal:
         result = entry.action()
         with self._lock:
             self._entries.pop(token, None)
+            self._discard_order(token)
         return result
 
     def expire(self) -> int:
@@ -67,7 +68,15 @@ class UndoJournal:
             stale = [t for t, e in self._entries.items() if e.created < cutoff]
             for token in stale:
                 del self._entries[token]
+                self._discard_order(token)
         return len(stale)
+
+    def _discard_order(self, token: str) -> None:
+        """Remove token from _order if present. Caller holds self._lock."""
+        try:
+            self._order.remove(token)
+        except ValueError:
+            pass
 
 
 _JOURNAL: UndoJournal | None = None

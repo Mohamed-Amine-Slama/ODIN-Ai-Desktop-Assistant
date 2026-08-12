@@ -253,7 +253,20 @@ QPushButton#declineBtn {
 
 
 _BUBBLE_MIN_WIDTH = 48
+# Ceiling for a roomy window; the real cap applied at creation time is
+# whatever's actually available (see JarvisMainWindow._bubble_max_width) —
+# this is only the upper bound of that, and the fallback before the window
+# has been laid out even once.
 _BUBBLE_MAX_WIDTH = 680
+# Left unreserved on the stretch side so a bubble never claims the row's full
+# width — without this, a bubble capped at exactly the available width has no
+# room left for the stretch that's supposed to push it to one side, and a
+# "right-aligned" bubble ends up flush with the left edge instead.
+_BUBBLE_SIDE_RESERVE = 60
+# Below this, the scroll area hasn't been through a real layout pass yet —
+# comfortably above Qt's small pre-layout placeholder size, comfortably below
+# the smallest viewport the enforced window minimum size can ever produce.
+_BUBBLE_NOT_YET_LAID_OUT = 200
 _BUBBLE_MARGINS = (16, 11, 16, 11)
 
 # Matches HUD_STYLESHEET's QWidget rule. A freshly built bubble isn't parented
@@ -265,20 +278,28 @@ _BUBBLE_FONT = QFont("Segoe UI")
 _BUBBLE_FONT.setPixelSize(14)
 
 
-def _bubble_width_for(text: str) -> int:
+def _bubble_width_for(text: str, max_width: int = _BUBBLE_MAX_WIDTH) -> int:
     """Content-hugging bubble width: measured directly from the text and
     clamped between a sensible floor and the wrap width long messages need,
     rather than a share of the row's width — a stretch-based width made a
     two-letter reply ("hi") stretch to match a paragraph's box, leaving most
     of it empty. A word-wrapped QLabel's sizeHint() alone isn't a usable
-    substitute (it reports close to its narrowest word with no stretch)."""
+    substitute (it reports close to its narrowest word with no stretch).
+
+    max_width must reflect what the window can actually show right now — a
+    caller passing the bare _BUBBLE_MAX_WIDTH constant on a panel narrower
+    than that (a smaller window, a lower-resolution or scaled display) is
+    exactly what let a long message overflow straight past the panel's own
+    edge instead of wrapping within it.
+    """
     metrics = QFontMetrics(_BUBBLE_FONT)
     longest_line = max((metrics.horizontalAdvance(line) for line in text.splitlines()), default=0)
     padding = _BUBBLE_MARGINS[0] + _BUBBLE_MARGINS[2]
-    return max(_BUBBLE_MIN_WIDTH, min(longest_line + padding + 8, _BUBBLE_MAX_WIDTH))
+    ceiling = max(_BUBBLE_MIN_WIDTH, min(max_width, _BUBBLE_MAX_WIDTH))
+    return max(_BUBBLE_MIN_WIDTH, min(longest_line + padding + 8, ceiling))
 
 
-def _resize_bubble(label: QLabel, text: str) -> None:
+def _resize_bubble(label: QLabel, text: str, max_width: int = _BUBBLE_MAX_WIDTH) -> None:
     """Re-fit a bubble already on screen to new text.
 
     A streamed reply or a placeholder ("…") swapped for an error message both
@@ -289,10 +310,10 @@ def _resize_bubble(label: QLabel, text: str) -> None:
     """
     frame = label.parentWidget()
     if frame is not None:
-        frame.setFixedWidth(_bubble_width_for(text))
+        frame.setFixedWidth(_bubble_width_for(text, max_width))
 
 
-def _bubble(text: str, object_name: str, rich: bool) -> QFrame:
+def _bubble(text: str, object_name: str, rich: bool, max_width: int = _BUBBLE_MAX_WIDTH) -> QFrame:
     """One chat bubble. Model output is rendered as plain text on purpose —
     anything Jarvis reads off the user's disk could otherwise inject markup."""
     frame = QFrame()
@@ -305,7 +326,7 @@ def _bubble(text: str, object_name: str, rich: bool) -> QFrame:
     layout.setContentsMargins(*_BUBBLE_MARGINS)
     layout.addWidget(label)
     frame.label = label
-    frame.setFixedWidth(_bubble_width_for(text))
+    frame.setFixedWidth(_bubble_width_for(text, max_width))
     return frame
 
 
@@ -499,6 +520,7 @@ class JarvisMainWindow(QMainWindow):
         self._pending_activity_row: QLabel | None = None
         self._voice_setup_worker: VoiceSetupWorker | None = None
         self._voice_loop_worker: VoiceListenWorker | None = None
+        self._shown_once = False
 
         self.setWindowTitle(f"{config.ASSISTANT_NAME} — Personal AI Desktop Assistant")
         self.resize(1180, 760)
@@ -519,10 +541,14 @@ class JarvisMainWindow(QMainWindow):
             self.bridge.tool_started.connect(self._on_tool_started)
             self.bridge.tool_finished.connect(self._on_tool_finished)
 
-        self.append_jarvis_message(
-            f"{config.ASSISTANT_NAME} online. I have the run of this machine — "
-            "files, windows, the shell, and the keyboard. Ask away."
-        )
+        # Deliberately NOT appended here: the scroll area's viewport has no
+        # real geometry until the window has actually been shown at least
+        # once (Qt does not lay out hidden widgets), so a bubble sized now
+        # would use a fallback width wider than this app's viewport ever
+        # legitimately is — the exact overflow bug _bubble_max_width exists
+        # to prevent, just hitting the one bubble created before any show().
+        # show_and_activate() sends it the first time the HUD is actually
+        # shown, when its real width is known.
 
     # -- construction ------------------------------------------------------
 
@@ -701,6 +727,19 @@ class JarvisMainWindow(QMainWindow):
         self.activateWindow()
         self.orb.start()
         self.input_field.setFocus()
+        if not self._shown_once:
+            self._shown_once = True
+            # showFullScreen() only requests the show; the resize/layout it
+            # triggers is delivered through the event loop, not synchronously.
+            # Without pumping it here, the scroll area still has no real
+            # geometry yet at this point, same as before any show() at all.
+            QApplication.processEvents()
+            # Sent here rather than in __init__: only now does the scroll
+            # area have real geometry to size the bubble against.
+            self.append_jarvis_message(
+                f"{config.ASSISTANT_NAME} online. I have the run of this machine — "
+                "files, windows, the shell, and the keyboard. Ask away."
+            )
 
     def dismiss(self) -> None:
         """Hide the HUD and stop repainting it. The orb stays on the desktop."""
@@ -791,8 +830,29 @@ class JarvisMainWindow(QMainWindow):
         shadow.setColor(QColor(2, 6, 16, 160))
         widget.setGraphicsEffect(shadow)
 
+    def _bubble_max_width(self) -> int:
+        """The widest a bubble can be right now without overflowing the
+        actual conversation panel.
+
+        _BUBBLE_MAX_WIDTH is only ever an upper bound; on a window/screen
+        where the panel is narrower than that (a smaller HUD window, a
+        lower-resolution or scaled display), capping at the bare constant let
+        a long message overflow straight past the panel's own edge instead of
+        wrapping within it. Falls back to the constant before the scroll area
+        has ever been through a real layout pass — a not-yet-shown widget
+        reports some small placeholder size (not reliably 0), which is why
+        this checks against a threshold rather than an exact value. The
+        window's enforced setMinimumSize(720, 520) puts the smallest possible
+        REAL viewport width well above this threshold, so nothing legitimate
+        can be mistaken for "not laid out yet".
+        """
+        viewport_width = self.scroll_area.viewport().width()
+        if viewport_width < _BUBBLE_NOT_YET_LAID_OUT:
+            return _BUBBLE_MAX_WIDTH
+        return max(_BUBBLE_MIN_WIDTH, viewport_width - _BUBBLE_SIDE_RESERVE)
+
     def append_user_message(self, text: str) -> QLabel:
-        bubble = _bubble(text, "userBubble", rich=False)
+        bubble = _bubble(text, "userBubble", rich=False, max_width=self._bubble_max_width())
         # share=0: the bubble is already fixed-width (see _bubble); giving a
         # fixed-size widget a nonzero stretch factor alongside a
         # heightForWidth (word-wrapped) child is what was producing the
@@ -801,7 +861,7 @@ class JarvisMainWindow(QMainWindow):
         return bubble.label
 
     def append_jarvis_message(self, text: str, rich: bool = False) -> QLabel:
-        bubble = _bubble(text, "jarvisBubble", rich=rich)
+        bubble = _bubble(text, "jarvisBubble", rich=rich, max_width=self._bubble_max_width())
         self._insert(bubble, align_right=False, share=0)
         return bubble.label
 
@@ -990,14 +1050,44 @@ class JarvisMainWindow(QMainWindow):
     def _on_chunk(self, sentence: str) -> None:
         if self._live_label is None:
             self._live_label = self.append_jarvis_message("")
+            # A fresh bubble starts a fresh chronological block: the next
+            # tool call should open its own activity widget after this text,
+            # not keep appending to one left over from before this bubble
+            # existed (which would put it out of chronological order).
+            self._activity_widget = None
         self.set_status("speaking")
         self._live_text.append(sentence)
         full_text = " ".join(self._live_text)
         self._live_label.setText(full_text)
-        _resize_bubble(self._live_label, full_text)
+        _resize_bubble(self._live_label, full_text, self._bubble_max_width())
         self._scroll_to_bottom()
 
+    def _retire_live_bubble(self) -> None:
+        """Close out the current streaming bubble so the next narration
+        starts a new one instead of growing this one for the rest of the
+        turn.
+
+        Without this, a single bubble accumulated every sentence spoken
+        across an ENTIRE multi-tool-call task — sometimes dozens of
+        sentences, including the model narrating its own mistakes and
+        corrections — into one unbounded wall of text with no chronological
+        relationship to the activity log entries interleaved between them.
+        A widget that can grow to hundreds of lines, resized repeatedly, in a
+        translucent frameless window with fade-in effects on every new row,
+        is exactly the kind of thing that produces a garbled, overlapping
+        layout.
+        """
+        if self._live_label is not None and not self._live_text:
+            # Nothing was ever said into it (still the "…" placeholder, or
+            # blank) — collapse it rather than leave a stray empty bubble.
+            frame = self._live_label.parentWidget()
+            if frame is not None:
+                frame.setVisible(False)
+        self._live_label = None
+        self._live_text = []
+
     def _on_tool_started(self, skill_name: str, args_brief: str) -> None:
+        self._retire_live_bubble()
         if self._activity_widget is None:
             self._activity_widget = ActivityLogWidget(self)
             self._insert(self._activity_widget, align_right=False, share=5)
@@ -1038,15 +1128,28 @@ class JarvisMainWindow(QMainWindow):
         banner.answered.connect(answered)
 
     def _on_turn_finished(self, reply: str) -> None:
-        if reply and not self._live_text and self._live_label is not None:
-            self._live_label.setText(reply)
-            _resize_bubble(self._live_label, reply)
+        if reply and not self._live_text:
+            # _live_label can be None here — the turn's last tool call
+            # retired it and nothing streamed afterward — so the final reply
+            # needs its own fresh bubble rather than being dropped.
+            if self._live_label is None:
+                self._live_label = self.append_jarvis_message(reply)
+            else:
+                self._live_label.setText(reply)
+                _resize_bubble(self._live_label, reply, self._bubble_max_width())
+                # append_jarvis_message (the branch above) already scrolls via
+                # _insert; setText growing an existing bubble doesn't, so a
+                # long final reply could otherwise land partly out of view.
+                self._scroll_to_bottom()
         self._finish_turn()
 
     def _on_turn_error(self, message: str) -> None:
-        if self._live_label is not None:
+        if self._live_label is None:
+            self._live_label = self.append_jarvis_message(message)
+        else:
             self._live_label.setText(message)
-            _resize_bubble(self._live_label, message)
+            _resize_bubble(self._live_label, message, self._bubble_max_width())
+            self._scroll_to_bottom()
         self._finish_turn()
 
     def _finish_turn(self) -> None:

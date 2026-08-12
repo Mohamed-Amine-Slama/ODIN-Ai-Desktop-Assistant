@@ -1,25 +1,32 @@
 """Agentic research pipeline behind the deep_learn skill.
 
-topic -> subtopics -> grounded web research per subtopic -> notes chunked and
-embedded into the local vector store (core.knowledge) -> a self-check pass
-that asks what a learner would need to answer to prove mastery, and researches
-whatever the stored notes can't already answer.
+topic -> subtopics -> web research per subtopic (DuckDuckGo search +
+synthesis) -> notes chunked and embedded into the local vector store
+(core.knowledge) -> a
+self-check pass that asks what a learner would need to answer to prove
+mastery, and researches whatever the stored notes can't already answer.
 
 This is the only place that runs multiple LLM calls outside of a normal brain
-turn, so it talks to Gemini directly via skills.web_skills.gemini_generate
-rather than going through core.brain.Brain — a research run has its own
-control flow (loops, branches, no user waiting on each step) that doesn't fit
-the tool-calling turn loop.
+turn, so it talks to a model directly via _llm_complete rather than going
+through core.brain.Brain — a research run has its own control flow (loops,
+branches, no user waiting on each step) that doesn't fit the tool-calling
+turn loop.
 
-Requires Google Search grounding (skills.web_skills.google_search_key()) —
-that's the only web-search capability this codebase implements locally.
+Two ingredients, from two different places: DuckDuckGo search
+(skills.web_skills, via the `ddgs` package — no key needed) for raw results,
+and whatever LLM Jarvis itself is configured with (config.API_KEY/BASE_URL/
+MODEL) to decompose topics, synthesize notes from those raw results, and
+self-check for gaps. Search and reasoning are deliberately decoupled — unlike
+the old Gemini-grounding approach, this works with any provider Jarvis is
+already configured to use, and needs no separate API key at all for search.
 """
 import json
 import re
 
-from core import knowledge
+import config
+from core import knowledge, learning_status
 from core.store import get_store
-from skills.web_skills import gemini_generate, google_search_key
+from skills.web_skills import web_search, web_search_available
 
 DEPTH_SUBTOPICS = {"quick": 3, "standard": 5, "deep": 8}
 SEARCHES_PER_SUBTOPIC = 2
@@ -34,11 +41,8 @@ class ResearchError(Exception):
 
 def preflight() -> str | None:
     """Return a user-facing reason deep_learn can't run, or None if it can."""
-    if not google_search_key():
-        return (
-            "Deep learning needs Google Search grounding. Set GOOGLE_API_KEY "
-            "in .env, or point BASE_URL at Gemini."
-        )
+    if not web_search_available():
+        return "Deep learning needs the 'ddgs' package. Run: pip install ddgs"
     if not knowledge.available():
         return (
             "Deep learning needs the local knowledge packages. "
@@ -57,7 +61,6 @@ def run_deep_learn(topic: str, depth: str = "standard", progress=None) -> dict:
     problem = preflight()
     if problem:
         raise ResearchError(problem)
-    key = google_search_key()
 
     def note(msg: str) -> None:
         if progress is not None:
@@ -66,28 +69,41 @@ def run_deep_learn(topic: str, depth: str = "standard", progress=None) -> dict:
             except Exception:
                 pass
 
+    def report(subtopic: str, done: int, total: int) -> None:
+        """Structured progress for anything watching (the HUD's voice orb) —
+        independent of `progress` above, so it fires for every deep_learn
+        run regardless of who's calling it, not just callers that pass a
+        `progress` callback."""
+        if total > 0:
+            learning_status.report(topic, subtopic, min(1.0, done / total))
+
     n = DEPTH_SUBTOPICS.get(depth, DEPTH_SUBTOPICS["standard"])
     note(f"Breaking '{topic}' down into subtopics...")
-    subtopics = _decompose(topic, n, key)
+    subtopics = _decompose(topic, n)
+    total_steps = len(subtopics) + MAX_GAP_FILLS
 
     covered: list[str] = []
     added_chunks = 0
-    for sub in subtopics:
+    for i, sub in enumerate(subtopics):
         note(f"Researching: {sub}")
-        chunks = _research_and_store(topic, sub, key)
+        report(sub, i, total_steps)
+        chunks = _research_and_store(topic, sub)
         added_chunks += chunks
         if chunks:
             covered.append(sub)
 
     note("Checking for gaps...")
-    gaps = _find_gaps(topic, covered, key)
+    gaps = _find_gaps(topic, covered)
     filled: list[str] = []
-    for gap in gaps[:MAX_GAP_FILLS]:
+    for i, gap in enumerate(gaps[:MAX_GAP_FILLS]):
         note(f"Filling a gap: {gap}")
-        chunks = _research_and_store(topic, gap, key)
+        report(gap, len(subtopics) + i, total_steps)
+        chunks = _research_and_store(topic, gap)
         added_chunks += chunks
         if chunks:
             filled.append(gap)
+
+    report(topic, total_steps, total_steps)
 
     store = get_store()
     previous = store.get_knowledge_topic(topic)
@@ -104,7 +120,7 @@ def run_deep_learn(topic: str, depth: str = "standard", progress=None) -> dict:
     }
 
 
-def _decompose(topic: str, n: int, key: str) -> list[str]:
+def _decompose(topic: str, n: int) -> list[str]:
     prompt = (
         f'List exactly {n} distinct subtopics a learner needs to study to build '
         f'a solid working understanding of "{topic}". Order them from '
@@ -112,7 +128,7 @@ def _decompose(topic: str, n: int, key: str) -> list[str]:
         "subtopic strings, nothing else."
     )
     try:
-        raw = gemini_generate(prompt, key, grounded=False)
+        raw = _llm_complete(prompt)
     except RuntimeError:
         raw = ""
     subtopics = _parse_json_list(raw)
@@ -121,22 +137,36 @@ def _decompose(topic: str, n: int, key: str) -> list[str]:
     return subtopics[:n] if subtopics else [topic]
 
 
-def _research_and_store(topic: str, subtopic: str, key: str) -> int:
+def _research_and_store(topic: str, subtopic: str) -> int:
     queries = [
-        f"{subtopic}, in the context of {topic} — explain clearly with examples",
-        f"{subtopic} ({topic}): common mistakes, best practices, and advanced tips",
+        f"{subtopic} {topic} explained examples",
+        f"{subtopic} {topic} common mistakes best practices advanced tips",
     ][:SEARCHES_PER_SUBTOPIC]
 
     parts: list[str] = []
     sources: list[str] = []
     for q in queries:
         try:
-            answer = gemini_generate(q, key, grounded=True)
+            results = web_search(q)
+        except RuntimeError:
+            continue
+        if not results:
+            continue
+
+        digest = "\n".join(f"- {r['title']}: {r['snippet']} ({r['url']})" for r in results)
+        prompt = (
+            f'Using ONLY the search results below, write a clear, accurate '
+            f'explanation of "{subtopic}" in the context of "{topic}", with '
+            f"examples where useful. Cite sources inline as (url).\n\n"
+            f"Search results:\n{digest}"
+        )
+        try:
+            answer = _llm_complete(prompt)
         except RuntimeError:
             continue
         if answer:
             parts.append(answer)
-            sources.extend(_URL_RE.findall(answer))
+            sources.extend(r["url"] for r in results if r.get("url"))
 
     if not parts:
         return 0
@@ -144,7 +174,7 @@ def _research_and_store(topic: str, subtopic: str, key: str) -> int:
     return knowledge.store_notes(topic, subtopic, notes, _dedupe(sources))
 
 
-def _find_gaps(topic: str, covered_subtopics: list[str], key: str) -> list[str]:
+def _find_gaps(topic: str, covered_subtopics: list[str]) -> list[str]:
     """What a mastery quiz would ask, filtered down to what's NOT already well
     covered by what's stored (a poor vector-store match stands in for "the
     self-check answer wasn't confident")."""
@@ -161,7 +191,7 @@ def _find_gaps(topic: str, covered_subtopics: list[str], key: str) -> list[str]:
         "strings, nothing else."
     )
     try:
-        raw = gemini_generate(prompt, key, grounded=False)
+        raw = _llm_complete(prompt)
     except RuntimeError:
         return []
 
@@ -170,6 +200,45 @@ def _find_gaps(topic: str, covered_subtopics: list[str], key: str) -> list[str]:
         if knowledge.best_distance(question, topic=topic) > knowledge.RELEVANCE_DISTANCE_MAX:
             gaps.append(question.strip().rstrip("?")[:80])
     return gaps
+
+
+def _llm_complete(prompt: str) -> str:
+    """One-off, non-streaming completion using whatever provider Jarvis
+    itself is configured with. Decomposing a topic, synthesizing notes from
+    search results, and self-checking for gaps are all plain reasoning over
+    material already in hand — they don't need Brain's tool loop, streaming,
+    or a specific provider's search grounding, just a text-in/text-out call.
+
+    Mirrors core.brain.Brain's own provider selection (native Anthropic when
+    MODEL names a Claude or BASE_URL is unset, OpenAI-compatible otherwise)
+    in miniature, rather than depending on Brain itself.
+    """
+    if config.MODEL.startswith("claude") or not config.BASE_URL:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=config.API_KEY, base_url=config.BASE_URL or None)
+        try:
+            response = client.messages.create(
+                model=config.MODEL,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            raise RuntimeError(f"couldn't reach the model: {e}") from e
+        return "".join(b.text for b in response.content if b.type == "text").strip()
+
+    import openai
+
+    client = openai.OpenAI(api_key=config.API_KEY, base_url=config.BASE_URL or None)
+    try:
+        response = client.chat.completions.create(
+            model=config.MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+        )
+    except Exception as e:
+        raise RuntimeError(f"couldn't reach the model: {e}") from e
+    return (response.choices[0].message.content or "").strip()
 
 
 def _parse_json_list(text: str) -> list[str]:

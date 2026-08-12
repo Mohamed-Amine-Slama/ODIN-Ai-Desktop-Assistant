@@ -39,16 +39,29 @@ Hands-free voice is optional and pulls ~1GB of ML wheels:
 pip install -r requirements-voice.txt
 ```
 
+`web_search` needs no setup at all — it runs on DuckDuckGo via the `ddgs`
+package (already in `requirements.txt`), with no API key, signup, or billing.
+
 The `deep_learn` skill (research a topic in depth and remember it permanently)
-needs a local vector store and embedding model — also optional, also separate
-since `sentence-transformers` pulls in torch:
+and semantic recall for the `memory` skill both need a local vector store and
+embedding model — also optional, also separate since `sentence-transformers`
+pulls in torch:
 
 ```bat
 pip install -r requirements-rag.txt
 ```
 
-Without it, `deep_learn` just says what's missing instead of failing; nothing
-else in Jarvis is affected.
+Without it, `deep_learn` just says what's missing instead of failing, and
+`memory` recall falls back to plain-text search; nothing else in Jarvis is
+affected.
+
+Email and calendar (`read_email`, `send_email`, `list_events`, `create_event`,
+`delete_event`) are optional too, and need one Google or Microsoft account
+connected before they do anything — see section 9 below.
+
+```bat
+pip install -r requirements-email.txt
+```
 
 ## 2. Configure
 
@@ -89,7 +102,14 @@ tight ring when idle and scatters while it's working or speaking.
 - **Voice mode**: `/mode voice`, then just say **"Hey Jarvis"** — no key press.
   Falls back to press-Enter-to-talk if the wake-word model isn't available.
 
-Commands: `/undo`, `/mode voice`, `/mode text`, `/reset`, `/help`, `/quit`
+Commands: `/undo`, `/mode voice`, `/mode text`, `/reset`, `/connect google`,
+`/connect microsoft`, `/help`, `/quit`
+
+In voice mode, talking over Jarvis mid-reply cuts it off and is heard as the
+next thing you said — no need to wait for it to finish. This has no acoustic
+echo cancellation, so it works best with headphones; over open speakers,
+Jarvis's own voice coming back through the mic can occasionally trigger it
+(raise `BARGE_IN_THRESHOLD` if that happens).
 
 In the HUD, the **KNOWLEDGE** button opens a panel to browse what's been
 deep-learned and kick off research on a new topic in the background; **SETTINGS**
@@ -118,11 +138,15 @@ Jarvis/
     undo.py               undo journal and the trash behind file recovery
     store.py              SQLite: conversation, notes, reminders, memories, knowledge manifest
     knowledge.py           local vector store for deep_learn (chunk, embed, retrieve)
+    embeddings.py          shared sentence-embedding model (knowledge.py + memory_index.py)
+    memory_index.py        semantic search index behind the memory skill's recall
     research.py            deep_learn's agentic pipeline: decompose, research, self-check
+    email_providers.py     Gmail/Calendar and Outlook/Calendar OAuth + API backends
     env_file.py            .env read/update helper for the settings panel
     scheduler.py          durable reminders (survive restarts)
     audio.py              shared 16 kHz microphone stream
     wake.py               "Hey Jarvis" wake word (openWakeWord)
+    barge_in.py            interrupt Jarvis mid-sentence by talking over it
     speech_input.py       microphone -> text (faster-whisper, local)
     speech_output.py      text -> speech (edge-tts, SAPI fallback)
   skills/
@@ -132,12 +156,13 @@ Jarvis/
     file_skills.py        read, list, search, write, move, delete
     shell_skills.py       run_command (arbitrary shell)
     window_skills.py      list, focus, minimise/maximise, close windows
-    input_skills.py       type text, press keys, click
+    input_skills.py       type text, press keys, click, scroll
     web_skills.py         open website (optionally in a specific browser), browser search, fetch a page, weather, web_search
     vision_skills.py      screenshot -> the model can see your screen
     knowledge_skills.py    deep_learn, list_learned_topics
+    email_skills.py        read_email, send_email, list_events, create_event, delete_event
     utility_skills.py     time/date, notes, reminders, memory, clipboard, calculator, wait
-  tests/                  pytest suite (runs without voice or RAG deps, and on Linux)
+  tests/                  pytest suite (runs without voice, RAG, or email deps, and on Linux)
 ```
 
 ## 5. Safety
@@ -185,7 +210,7 @@ see `vision_skills.py` — and they're converted correctly for both providers.
 python -m pytest tests/ -v
 ```
 
-239 tests, no API key and no microphone needed. They also run on Linux/WSL,
+343 tests, no API key and no microphone needed. They also run on Linux/WSL,
 which is useful because the voice stack won't. The HUD tests use Qt's offscreen
 platform, so they need no display either.
 
@@ -204,7 +229,8 @@ platform, so they need no display either.
 | `KNOWLEDGE_CONTEXT_RESULTS` | `4` | deep_learn notes chunks injected per turn when relevant. `0` disables retrieval |
 | `HUD_HOTKEY` | `ctrl+alt+j` | Global summon key (needs the `keyboard` package). `off` to disable |
 | `CONFIRM_TIMEOUT_SECONDS` | `120` | HUD only: an unanswered confirmation counts as no |
-| `GOOGLE_API_KEY` | — | Enables `web_search` and `deep_learn` when `BASE_URL` isn't Gemini |
+| `MS_OAUTH_CLIENT_ID` | — | Enables the Microsoft-backed email/calendar skills once connected. See section 9 |
+| `MS_OAUTH_TENANT_ID` | `common` | Azure tenant for the Microsoft OAuth app; `common` covers both personal and work/school accounts |
 | `UNDO_WINDOW_SECONDS` | `900` | How long an action stays undoable |
 | `TRASH_MAX_ENTRIES` | `200` | Deleted-file backups kept, by count |
 | `TRASH_MAX_AGE_DAYS` | `7` | Deleted-file backups kept, by age |
@@ -214,15 +240,41 @@ platform, so they need no display either.
 | `TTS_ENGINE` | `auto` | `edge` (natural, needs net), `sapi` (offline), `off` |
 | `TTS_VOICE` | `en-GB-RyanNeural` | Any edge-tts voice |
 | `VAD_SILENCE_SECONDS` | `0.8` | Silence before Jarvis stops recording |
+| `BARGE_IN_THRESHOLD` | `0.05` | RMS level that counts as "the user is talking over Jarvis." No echo cancellation — raise this if playback through open speakers triggers it |
 | `DEBUG` | `0` | Print token usage and cache hit rates |
 
-## 9. Roadmap ideas
+## 9. Email and calendar setup
+
+`read_email`, `send_email`, `list_events`, `create_event`, and `delete_event`
+need `pip install -r requirements-email.txt` plus one connected account.
+Neither provider is registered as a skill at all until it's at least set up
+enough to attempt a connection — see `skill_manager.py`'s gating.
+
+**Google** (Gmail + Calendar):
+1. In [console.cloud.google.com](https://console.cloud.google.com), create an
+   OAuth client ID of type **Desktop app**, and enable the Gmail and Calendar
+   APIs for the project.
+2. Download the client JSON and save it as `data/oauth/google_credentials.json`.
+3. Run Jarvis and type `/connect google` — a browser window opens for consent.
+4. Restart Jarvis. The Google-backed skills are now available.
+
+**Microsoft** (Outlook + Calendar, via Graph):
+1. In [portal.azure.com](https://portal.azure.com), register an app as a
+   **public client** (no secret), and add the `Mail.Read`, `Mail.Send`, and
+   `Calendars.ReadWrite` delegated permissions.
+2. Set `MS_OAUTH_CLIENT_ID` in `.env` to the app's Application (client) ID.
+3. Run Jarvis and type `/connect microsoft` — it prints a URL and a code to
+   enter in a browser (device-code flow, so no redirect URI to configure).
+4. Restart Jarvis. The Microsoft-backed skills are now available.
+
+Both accounts can be connected at once — Jarvis asks which one to use for a
+given request only when it's genuinely ambiguous. Tokens live under
+`data/oauth/`, which is already covered by `.gitignore`.
+
+## 10. Roadmap ideas
 
 - **Smart home**: skills hitting Home Assistant / Hue / Govee APIs.
-- **Email/calendar**: Microsoft Graph or Google APIs.
-- **Barge-in**: interrupt Jarvis mid-sentence by speaking over it.
-- **Semantic memory**: swap the `LIKE` recall for embeddings, same as
-  `core/knowledge.py` already does for deep_learn, once the memories table
-  gets large.
+- **Scheduled re-learning**: periodically re-run `deep_learn` on stored
+  topics so fast-moving subjects don't go stale.
 - **Scheduled re-learning**: periodically re-run `deep_learn` on stored
   topics so fast-moving subjects don't go stale.

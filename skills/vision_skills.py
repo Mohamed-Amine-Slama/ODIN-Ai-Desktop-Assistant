@@ -8,6 +8,7 @@ import base64
 import io
 import sys
 
+from . import screen_state
 from .base_skill import BaseSkill, SkillResult
 
 IS_WINDOWS = sys.platform == "win32"
@@ -75,16 +76,39 @@ class ScreenshotSkill(BaseSkill):
         ]
 
 
+def _ensure_dpi_aware() -> None:
+    """Make this process report real (physical) pixel coordinates instead of
+    coordinates virtualized for Windows display scaling.
+
+    Without this, on any display running above 100% scaling, mss's
+    physical-pixel capture disagrees with the (possibly virtualized)
+    coordinates user32/pyautogui use for window rects and clicks, so a click
+    at a coordinate read straight off a screenshot lands offset from what was
+    actually shown. This is process-wide and idempotent, so calling it before
+    every capture is enough to fix window_skills and input_skills too for the
+    rest of the process's life.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 def _grab(monitor: int) -> bytes:
     """Capture and downscale. Raises ImportError if deps are missing."""
+    _ensure_dpi_aware()
     import mss
     with mss.mss() as sct:
         # sct.monitors[0] is the union of all displays; 1..n are individual.
         if monitor < 0 or monitor >= len(sct.monitors):
             raise IndexError(monitor)
-        shot = sct.grab(sct.monitors[monitor])
+        mon = sct.monitors[monitor]
+        shot = sct.grab(mon)
 
-    return _encode_shot(shot)
+    return _encode_shot(shot, mon["left"], mon["top"])
 
 
 def _grab_active_window() -> bytes:
@@ -92,6 +116,7 @@ def _grab_active_window() -> bytes:
     if not IS_WINDOWS:
         raise NotImplementedError
 
+    _ensure_dpi_aware()
     import ctypes
     import mss
 
@@ -104,10 +129,6 @@ def _grab_active_window() -> bytes:
         ]
 
     user32 = ctypes.windll.user32
-    try:
-        user32.SetProcessDPIAware()
-    except Exception:
-        pass
     hwnd = user32.GetForegroundWindow()
     rect = Rect()
     if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -118,20 +139,27 @@ def _grab_active_window() -> bytes:
         raise RuntimeError("the active window has no visible area")
     with mss.mss() as sct:
         shot = sct.grab({"left": rect.left, "top": rect.top, "width": width, "height": height})
-    return _encode_shot(shot)
+    return _encode_shot(shot, rect.left, rect.top)
 
 
-def _encode_shot(shot) -> bytes:
-    """Downscale an mss screenshot and encode a compact PNG."""
+def _encode_shot(shot, origin_x: int, origin_y: int) -> bytes:
+    """Downscale an mss screenshot, encode a compact PNG, and record how to
+    map coordinates read off the resulting image back to real screen pixels
+    (see screen_state) — this is what lets click/scroll take coordinates
+    straight from what the model just saw, regardless of any downscaling."""
     from PIL import Image
 
     image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    real_width = image.width
 
     longest = max(image.size)
     if longest > MAX_EDGE:
-        scale = MAX_EDGE / longest
-        new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+        factor = MAX_EDGE / longest
+        new_size = (max(1, int(image.width * factor)), max(1, int(image.height * factor)))
         image = image.resize(new_size, Image.LANCZOS)
+
+    scale = real_width / image.width
+    screen_state.record(scale, origin_x, origin_y)
 
     buf = io.BytesIO()
     image.save(buf, format="PNG", optimize=True)

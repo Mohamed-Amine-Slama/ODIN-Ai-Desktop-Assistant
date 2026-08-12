@@ -114,12 +114,14 @@ def test_openai_path_is_detected_from_the_client():
     assert Brain(client=FakeOpenAIClient([[]])).is_openai is True
 
 
-def test_openai_prompt_has_no_web_search():
-    """The integration of the two fixes: on the OpenAI path the tool list has
-    no web_search, so the prompt must not advertise one."""
+def test_openai_prompt_advertises_web_search_when_available():
+    """web_search is a local DuckDuckGo skill (ddgs ships as a core
+    dependency, no key/gating needed), so — unlike Anthropic's server-side
+    web_search, which SERVER_TOOLS keeps Anthropic-only — it's available on
+    the OpenAI-compatible path too, and the prompt must say so."""
     brain = Brain(client=FakeOpenAIClient([[]]))
-    assert "You have no search tool" in brain.system_prompt
-    assert "web_search when the answer depends" not in brain.system_prompt
+    assert "web_search when the answer depends" in brain.system_prompt
+    assert "You have no search tool" not in brain.system_prompt
 
 
 def test_anthropic_request_uses_native_streaming_thinking_and_caching(monkeypatch):
@@ -166,7 +168,7 @@ def test_cache_breakpoint_handles_sdk_content_blocks():
 
 
 class _RejectsEffort:
-    """An endpoint that 400s on reasoning_effort, the way a model with no
+    """An endpoint that 400s on a reasoning parameter, the way a model with no
     reasoning control does. Records every request it was sent."""
 
     def __init__(self, script):
@@ -178,9 +180,10 @@ class _RejectsEffort:
         import openai
 
         self.calls.append(kwargs)
-        if "reasoning_effort" in kwargs:
+        has_reasoning = "reasoning_effort" in kwargs or "reasoning" in kwargs.get("extra_body", {})
+        if has_reasoning:
             raise openai.BadRequestError(
-                "Unrecognized request argument supplied: reasoning_effort",
+                "Unrecognized request argument supplied: reasoning",
                 response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
                 body=None,
             )
@@ -188,12 +191,14 @@ class _RejectsEffort:
 
 
 def test_effort_is_dropped_and_retried_when_the_model_rejects_it(monkeypatch):
-    """The endpoint is whatever BASE_URL points at. A model with no reasoning
-    control must not turn every single turn into a hard failure."""
+    """A non-OpenRouter OpenAI-compatible endpoint (e.g. Gemini's own) uses the
+    flat `reasoning_effort` field. A model with no reasoning control must not
+    turn every single turn into a hard failure."""
     import config
     from core.brain import Brain
 
     monkeypatch.setattr(config, "EFFORT", "low", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/", raising=False)
     client = _RejectsEffort([])
     brain = Brain(client=client)
 
@@ -208,9 +213,54 @@ def test_effort_off_is_never_sent(monkeypatch):
     from core.brain import Brain
 
     monkeypatch.setattr(config, "EFFORT", "off", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/", raising=False)
     client = _RejectsEffort([])
     brain = Brain(client=client)
 
     assert brain.ask("hello") == "Hi."
     assert len(client.calls) == 1, "no retry should have been needed"
     assert "reasoning_effort" not in client.calls[0]
+
+
+def test_openrouter_uses_the_nested_reasoning_object_via_extra_body(monkeypatch):
+    """Regression, in two layers:
+
+    1. OpenRouter's actual reasoning control is the nested `reasoning:
+       {"effort": ...}` object, not OpenAI's flat `reasoning_effort` string —
+       sending the flat field gets silently dropped rather than rejected, so
+       a reasoning-capable model (e.g. Gemini 2.5 Flash) ran at its own
+       default thinking depth on every call instead of config.EFFORT, with no
+       error to signal it.
+    2. `reasoning` is not part of the real openai SDK's typed create()
+       signature the way `reasoning_effort` is, so it has to travel inside
+       `extra_body` — passing it as a bare kwarg raises a client-side
+       TypeError before any request reaches the network (this fake, being a
+       plain function, wouldn't itself catch that mistake; it was only caught
+       by testing against the real SDK directly).
+    """
+    import config
+    from core.brain import Brain
+
+    monkeypatch.setattr(config, "EFFORT", "low", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
+    client = _RejectsEffort([])
+    brain = Brain(client=client)
+
+    assert brain.ask("hello") == "Hi."
+    assert client.calls[0]["extra_body"] == {"reasoning": {"effort": "low"}}
+    assert "reasoning_effort" not in client.calls[0]
+
+
+def test_openrouter_effort_is_dropped_and_retried_when_rejected(monkeypatch):
+    import config
+    from core.brain import Brain
+
+    monkeypatch.setattr(config, "EFFORT", "low", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "https://openrouter.ai/api/v1", raising=False)
+    client = _RejectsEffort([])
+    brain = Brain(client=client)
+
+    assert brain.ask("hello") == "Hi."
+    assert "extra_body" in client.calls[0]
+    assert "extra_body" not in client.calls[1]
+    assert brain._send_effort is False

@@ -84,6 +84,17 @@ CONFIRM_TIMEOUT_SECONDS = float(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120"))
 TRASH_MAX_ENTRIES = int(os.getenv("TRASH_MAX_ENTRIES", "200"))
 TRASH_MAX_AGE_DAYS = float(os.getenv("TRASH_MAX_AGE_DAYS", "7"))
 
+# --- Instrument HUD (ODIN-HUD.md) ------------------------------------------
+HUD_TELEMETRY_INTERVAL_MS = int(os.getenv("HUD_TELEMETRY_INTERVAL_MS", "1000"))
+HUD_DISK_POLL_SECONDS = float(os.getenv("HUD_DISK_POLL_SECONDS", "15"))
+# "" lets wttr.in auto-locate from the requesting IP instead of a named city.
+WEATHER_CITY = os.getenv("WEATHER_CITY", "")
+HUD_WEATHER_POLL_SECONDS = float(os.getenv("HUD_WEATHER_POLL_SECONDS", "600"))
+# loopback | mic | off — see ui/hud/spectrum.py for the fallback chain when
+# the chosen source isn't actually available.
+HUD_SPECTRUM_SOURCE = os.getenv("HUD_SPECTRUM_SOURCE", "loopback")
+HUD_REDUCED_MOTION = os.getenv("HUD_REDUCED_MOTION", "0") not in ("0", "false", "False")
+
 # --- Voice ----------------------------------------------------------------
 # Wake word. openWakeWord ships a pretrained "hey_jarvis" model, so this works
 # with no API key and no training. Set WAKE_WORD=off for push-to-talk.
@@ -105,6 +116,14 @@ TTS_RATE = int(os.getenv("TTS_RATE", "180"))  # SAPI only
 # Recording: stop after this much silence, and never record longer than max.
 VAD_SILENCE_SECONDS = float(os.getenv("VAD_SILENCE_SECONDS", "0.8"))
 VAD_MAX_SECONDS = float(os.getenv("VAD_MAX_SECONDS", "20"))
+
+# Barge-in: interrupt Jarvis mid-sentence by talking over it. Same RMS-energy
+# scale as the VAD floor in speech_input (typical speech clears ~0.02-0.05);
+# lower catches interruptions faster but risks tripping on room noise. This
+# has no acoustic echo cancellation, so it works best with headphones —
+# without them, Jarvis's own voice coming back through the mic from the
+# speakers can trigger a false interruption.
+BARGE_IN_THRESHOLD = float(os.getenv("BARGE_IN_THRESHOLD", "0.05"))
 
 # --- Paths ----------------------------------------------------------------
 NOTES_FILE = os.path.join(DATA_DIR, "notes.txt")

@@ -62,6 +62,8 @@ def test_ordinary_commands_are_moderate(cmd):
     "dd if=/dev/zero of=/dev/sda",
     "fsutil usn deletejournal",
     "schtasks /create /tn evil /tr evil.exe",
+    "Stop-Process -Name chrome -Force",
+    "kill 1234",
 ])
 def test_destructive_commands_are_dangerous(cmd):
     assert classify_command(cmd) == Risk.DANGEROUS

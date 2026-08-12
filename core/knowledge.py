@@ -15,6 +15,7 @@ import re
 import time
 
 import config
+from core.embeddings import get_embedder
 
 COLLECTION_NAME = "knowledge"
 DB_DIR_NAME = "knowledge_db"
@@ -30,23 +31,8 @@ CHUNK_OVERLAP_WORDS = 30
 # genuine gap rather than something already covered.
 RELEVANCE_DISTANCE_MAX = 0.85
 
-_embedder = None
 _client = None
 _collection = None
-
-
-def _get_embedder():
-    global _embedder
-    if _embedder is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as e:
-            raise ImportError(
-                "Local knowledge needs the 'sentence-transformers' package. "
-                "Run: pip install -r requirements-rag.txt"
-            ) from e
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedder
 
 
 def _get_collection():
@@ -110,7 +96,7 @@ def store_notes(topic: str, subtopic: str, notes: str, sources: list[str]) -> in
         return 0
 
     collection = _get_collection()
-    embeddings = _get_embedder().encode(chunks).tolist()
+    embeddings = get_embedder().encode(chunks).tolist()
     source_str = " | ".join(sources[:5])
     ts = time.time()
     base_id = f"{_slug(topic)}::{_slug(subtopic)}::{int(ts * 1000)}"
@@ -136,7 +122,7 @@ def query(query_text: str, topic: str | None = None, n_results: int = 5) -> list
         collection = _get_collection()
         if collection.count() == 0:
             return []
-        embedding = _get_embedder().encode([query_text]).tolist()
+        embedding = get_embedder().encode([query_text]).tolist()
     except ImportError:
         return []
 

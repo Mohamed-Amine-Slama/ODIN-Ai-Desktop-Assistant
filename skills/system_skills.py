@@ -165,7 +165,8 @@ class CloseAppSkill(BaseSkill):
     name = "close_app"
     description = (
         "Close/terminate a running application by its process name, e.g. "
-        "'chrome', 'notepad', 'spotify'. Requires the user's confirmation."
+        "'chrome', 'notepad', 'spotify'. Requires the user's confirmation. "
+        "Cannot be undone, and any unsaved work in that app is lost."
     )
     input_schema = {
         "type": "object",
@@ -293,7 +294,10 @@ class VolumeControlSkill(BaseSkill):
 
 class PowerControlSkill(BaseSkill):
     name = "power_control"
-    description = "Shut down, restart, sleep, or lock the PC."
+    description = (
+        "Shut down, restart, sleep, or lock the PC. Shutting down or "
+        "restarting cannot be undone."
+    )
     input_schema = {
         "type": "object",
         "properties": {

@@ -60,6 +60,28 @@ class SpeechOutput:
         if self.enabled:
             self._idle.wait(timeout)
 
+    def is_speaking(self) -> bool:
+        """Whether the worker is actively playing or has a backlog queued."""
+        return self.enabled and not self._idle.is_set()
+
+    def stop(self) -> None:
+        """Cut off whatever is currently playing and drop anything still
+        queued. Used for barge-in: once the user starts talking, the rest of
+        a queued reply is no longer worth finishing."""
+        if not self.enabled:
+            return
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self._engine is not None:
+            try:
+                self._engine.stop()
+            except Exception as e:  # never let a TTS glitch propagate
+                print(f"[tts] {e}")
+        self._idle.set()
+
     def shutdown(self) -> None:
         self._stop.set()
         self._queue.put(_SENTINEL)

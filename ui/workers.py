@@ -10,12 +10,26 @@ It blocks on an Event that the GUI sets when a button is clicked, and defaults
 to declining if nobody ever answers.
 """
 import threading
+import time
+from dataclasses import dataclass
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 import config
 from core.brain import friendly_error
 from core.undo import get_journal
+
+
+@dataclass
+class SkillLogEntry:
+    """One row for the HUD's skill-activity panel (ODIN-HUD.md §6.5, zone
+    E2) — everything ActionCardWidget/ActivityLogWidget used to render
+    inline in the chat feed, now carried as data instead of a widget."""
+
+    ts: float
+    skill: str
+    ok: bool
+    ms: float
 
 
 def _brief_args(tool_input: dict) -> str:
@@ -48,11 +62,19 @@ class UiBridge(QObject):
     tool_started = pyqtSignal(str, str)          # skill name, brief args
     tool_finished = pyqtSignal(str, bool, str)   # skill name, is_error, brief result
 
+    # HUD-only additions (ODIN-HUD.md §7.1's "odin" message, decomposed into
+    # per-field signals instead of one dict-shaped payload).
+    mic_rms = pyqtSignal(float)                       # ~20Hz while listening
+    learning_progress = pyqtSignal(str, str, float)    # topic, subtopic, 0..1
+    skill_logged = pyqtSignal(object)                  # SkillLogEntry
+    kb_changed = pyqtSignal()                          # a deep_learn run just completed
+
     def __init__(self, speaker=None, parent=None):
         super().__init__(parent)
         self.speaker = speaker
         self._answer = False
         self._answered = threading.Event()
+        self._tool_start_ts: float | None = None
 
     # -- called on the worker thread --------------------------------------
 
@@ -74,13 +96,29 @@ class UiBridge(QObject):
     def on_tool_activity(self, phase, skill_name, tool_input, outcome=None) -> None:
         """Every tool call, start and end — the live trace of a multi-step
         turn. Unlike on_action, this fires regardless of risk tier or whether
-        the call produced anything undoable."""
+        the call produced anything undoable.
+
+        Tool calls within one turn run strictly sequentially (Brain._run_tools
+        iterates its response blocks one at a time), so a single stashed
+        start timestamp is enough to time each call — no dict keyed by call
+        ID needed.
+        """
         if phase == "start":
+            self._tool_start_ts = time.monotonic()
             self.tool_started.emit(skill_name, _brief_args(tool_input))
         else:
             is_error = bool(outcome.is_error) if outcome is not None else False
             content = outcome.content if outcome is not None else ""
             self.tool_finished.emit(skill_name, is_error, _brief_result(content))
+            ms = (time.monotonic() - self._tool_start_ts) * 1000 if self._tool_start_ts is not None else 0.0
+            self.skill_logged.emit(SkillLogEntry(ts=time.time(), skill=skill_name, ok=not is_error, ms=ms))
+            if skill_name == "deep_learn" and not is_error:
+                self.kb_changed.emit()
+
+    def report_learning_progress(self, topic: str, subtopic: str, progress: float) -> None:
+        """Wired to core.learning_status.set_callback() once at startup — a
+        thin re-emit so core/ stays Qt-free (see core/learning_status.py)."""
+        self.learning_progress.emit(topic, subtopic, progress)
 
     def confirm(self, skill, tool_input) -> bool:
         """Block the worker until the HUD answers. Defaults to no."""

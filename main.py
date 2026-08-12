@@ -24,13 +24,15 @@ from core.store import get_store
 from core.undo import get_journal, prune_trash
 
 COMMANDS = """Commands:
-  /mode voice   switch to voice mode
-  /mode text    switch to text mode
-  /undo         reverse the last undoable action
-  /reset        clear conversation memory (including saved history)
-  /forget       same as /reset
-  /help         show this list
-  /quit         exit"""
+  /mode voice        switch to voice mode
+  /mode text         switch to text mode
+  /undo              reverse the last undoable action
+  /reset             clear conversation memory (including saved history)
+  /forget            same as /reset
+  /connect google    one-time browser sign-in for Gmail/Calendar skills
+  /connect microsoft one-time browser sign-in for Outlook/Calendar skills
+  /help              show this list
+  /quit              exit"""
 
 
 YES_WORDS = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it", "go ahead",
@@ -53,6 +55,11 @@ class Session:
         self.mic = None
         self.listener = None
         self.wake = None
+        self.barge_in = None
+        # Set by _on_barge_in (a background thread) when the interrupting
+        # utterance has been captured; read_input() drains it before falling
+        # back to waiting on the wake word.
+        self._pending_utterance: str | None = None
 
     # -- mode switching ----------------------------------------------------
 
@@ -67,6 +74,7 @@ class Session:
         if self.listener is None:
             try:
                 from core.audio import Microphone
+                from core.barge_in import make_watcher
                 from core.speech_input import SpeechInput
                 from core.wake import make_detector
 
@@ -75,6 +83,7 @@ class Session:
                 self.mic.start()
                 self.listener = SpeechInput(mic=self.mic)
                 self.wake = make_detector(self.mic)
+                self.barge_in = make_watcher(self.mic, on_interrupt=self._on_barge_in)
             except Exception as e:
                 self._teardown_audio()
                 return f"I couldn't start voice mode ({e}). Staying in text mode."
@@ -85,6 +94,11 @@ class Session:
         return "Voice mode on (push-to-talk — press Enter, then speak)."
 
     def _teardown_audio(self) -> None:
+        if self.barge_in is not None:
+            try:
+                self.barge_in.stop()
+            except Exception:
+                pass
         if self.mic is not None:
             try:
                 self.mic.stop()
@@ -93,15 +107,52 @@ class Session:
         self.mic = None
         self.listener = None
         self.wake = None
+        self.barge_in = None
 
     def shutdown(self) -> None:
         self._teardown_audio()
         self.speaker.shutdown()
 
+    # -- barge-in ------------------------------------------------------------
+
+    def speak(self, text: str) -> None:
+        """The on_text callback given to Brain. Starts the barge-in watcher
+        on the first sentence of a turn (start() is a no-op once running),
+        then speaks as normal — stop_barge_in() ends it once the turn is
+        fully done speaking."""
+        if self.barge_in is not None:
+            self.barge_in.start()
+        self.speaker.say(text)
+
+    def stop_barge_in(self) -> None:
+        if self.barge_in is not None:
+            self.barge_in.stop()
+
+    def _on_barge_in(self) -> None:
+        """Runs on the watcher's own thread. Cuts Jarvis off immediately,
+        then captures what the user said so read_input() can hand it back as
+        the next turn without waiting for the wake word again.
+
+        Best-effort ordering note: if the current turn finishes and
+        stop_barge_in() runs before this capture completes, its 1s join
+        timeout won't wait around for a listen() that can take up to
+        VAD_MAX_SECONDS — the utterance still lands in _pending_utterance
+        and gets picked up on the loop iteration after next, just later than
+        ideal, rather than lost."""
+        self.speaker.stop()
+        if self.listener is not None:
+            text = self.listener.listen()
+            if text:
+                self._pending_utterance = text
+
     # -- input -------------------------------------------------------------
 
     def read_input(self) -> str | None:
         """Return the next utterance, or None if nothing usable was captured."""
+        if self._pending_utterance is not None:
+            text, self._pending_utterance = self._pending_utterance, None
+            return text
+
         if self.mode != "voice" or self.listener is None:
             try:
                 return input("You: ").strip()
@@ -194,10 +245,30 @@ def handle_command(cmd: str, brain: Brain, session: Session) -> None:
     if cmd == "/mode text":
         print(session.set_mode("text"))
         return
+    if cmd in ("/connect google", "/connect microsoft"):
+        _run_connect(cmd.split()[1])
+        return
     if cmd == "/help":
         print(COMMANDS)
         return
     print(f"Unknown command '{cmd}'.\n{COMMANDS}")
+
+
+def _run_connect(account: str) -> None:
+    """One-time interactive OAuth for an email/calendar account. Registration
+    of the resulting skills is decided once at startup (skill_manager.py) —
+    the system prompt is frozen for the whole process to keep the cached
+    prefix stable (see core.brain), so a fresh connection needs a restart
+    before the model can actually use it."""
+    from core.email_providers import ProviderError, get_provider
+
+    try:
+        print(get_provider(account).connect())
+        print("Restart Jarvis for the new skills to become available.")
+    except ProviderError as e:
+        print(str(e))
+    except Exception as e:  # noqa: BLE001 - a failed connect must not kill the loop
+        print(f"Couldn't connect {account}: {e}")
 
 
 def main() -> None:
@@ -217,7 +288,7 @@ def main() -> None:
     # spoken as they generate rather than after the whole reply lands.
     brain = Brain(
         confirm=session.confirm,
-        on_text=speaker.say,
+        on_text=session.speak,
         store=store,
         on_action=session.announce,
         on_tool_activity=session.on_tool_activity,
@@ -270,6 +341,7 @@ def main() -> None:
         if not brain.spoke_during_last_turn:
             speaker.say(reply)
         speaker.wait(timeout=60)
+        session.stop_barge_in()
 
 
 if __name__ == "__main__":

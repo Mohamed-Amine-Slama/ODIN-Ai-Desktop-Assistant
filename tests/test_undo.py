@@ -48,6 +48,21 @@ def test_entries_expire(journal):
     assert "no longer undoable" in journal.undo(token)
 
 
+def test_undo_removes_the_token_from_order_not_just_entries(journal):
+    """A long-running session must not accumulate a permanently-growing
+    _order list of tokens that were already undone."""
+    token = journal.record("x", lambda: "ok")
+    journal.undo(token)
+    assert token not in journal._order
+
+
+def test_expire_removes_the_token_from_order_not_just_entries(journal):
+    token = journal.record("old", lambda: "a")
+    journal._entries[token].created = time.time() - 1000
+    journal.expire()
+    assert token not in journal._order
+
+
 def test_a_failing_undo_keeps_the_entry_for_retry(journal):
     """If the target path is now occupied, the user should be able to fix it
     and try again rather than losing the ability to reverse."""

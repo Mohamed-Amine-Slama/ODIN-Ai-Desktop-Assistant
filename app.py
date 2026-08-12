@@ -18,7 +18,8 @@ from core.speech_output import SpeechOutput
 from core.store import get_store
 from core.undo import prune_trash
 from main import Session
-from ui.app_window import JarvisMainWindow, OrbWindow
+from ui.app_window import OrbWindow
+from ui.hud.window import OdinHudWindow
 from ui.workers import UiBridge
 
 
@@ -96,7 +97,7 @@ def main() -> None:
     missed = scheduler.fire_due()
     scheduler.start()
 
-    hud = JarvisMainWindow(brain, session, bridge=bridge)
+    hud = OdinHudWindow(brain, session, bridge)
     orb = OrbWindow()
     orb.summoned.connect(hud.show_and_activate)
     hud.state_changed.connect(orb.set_state)
@@ -110,14 +111,16 @@ def main() -> None:
     hud.show_and_activate()
 
     if restored:
-        hud.append_jarvis_message(f"Picked up {restored} messages from your last session.")
+        hud.announce(f"Picked up {restored} messages from your last session.")
     if missed:
-        hud.append_jarvis_message(f"Fired {missed} reminder(s) that came due while I was closed.")
+        hud.announce(f"Fired {missed} reminder(s) that came due while I was closed.")
     if bound:
-        hud.append_jarvis_message(f"Press {config.HUD_HOTKEY} any time to summon me.")
+        hud.announce(f"Press {config.HUD_HOTKEY} any time to summon me.")
 
     def shutdown():
         hud._stop_voice_loop()
+        hud.telemetry.stop()
+        hud.telemetry.wait(2000)
         bridge.release()  # let a worker parked on a confirmation fall through
         scheduler.stop()
         session.shutdown()

@@ -38,6 +38,8 @@ DANGEROUS_PATTERNS = [
         r"\breg\s+delete\b",
         r"\bregedit\b",
         r"\btaskkill\b",
+        r"\bstop-process\b",
+        r"\bkill\b",
         r"\bshutdown\b",
         r"\brestart-computer\b",
         r"\bstop-computer\b",

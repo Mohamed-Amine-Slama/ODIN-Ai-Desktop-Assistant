@@ -141,6 +141,29 @@ def test_unknown_tool_is_flagged(make_brain):
     assert "Unknown skill" in result["content"]
 
 
+def test_risk_for_exception_does_not_abort_the_turn(make_brain):
+    """A malformed tool argument that blows up risk_for() (e.g. a None where
+    a path string is expected) must come back as an is_error tool_result and
+    let the turn continue — not propagate out of ask() uncaught, which would
+    violate the invariant that a bad tool call can never corrupt/abort a turn."""
+    brain = make_brain(
+        [
+            response(
+                [tool_use_block("write_file", {"path": None, "content": "x"})],
+                stop_reason="tool_use",
+            ),
+            response([text_block("Couldn't do that.")]),
+        ]
+    )
+
+    reply = brain.ask("write something")
+
+    result = brain.history[2]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["is_error"] is True
+    assert reply == "Couldn't do that."
+
+
 def test_pause_turn_resumes_without_extra_message(make_brain):
     """Server-side tools pause; resuming must re-send as-is, with no synthetic
     'continue' message appended."""
@@ -292,6 +315,42 @@ def test_friendly_error_maps_every_tier_without_raising():
     assert "rate limited" in friendly_error(_http_error(openai.RateLimitError, 429))
     assert "trouble" in friendly_error(_http_error(openai.InternalServerError, 500))
     assert "Something went wrong" in friendly_error(ValueError("plain"))
+
+
+def test_friendly_error_extracts_the_message_from_a_provider_error_body():
+    """Regression: a 402/etc. error's full raw body — nested JSON, repeated
+    'previous_errors' from OpenRouter's upstream fallback attempts — used to
+    be dumped verbatim into the reply. In the GUI that produced a single chat
+    bubble tall enough to overflow past the transcript panel into the input
+    box below it. Only the actual one-sentence message should surface."""
+    import openai
+
+    from core.brain import friendly_error
+
+    exc = _http_error(openai.APIStatusError, 402)
+    exc.body = {
+        "message": "This request requires more credits, or fewer max_tokens.",
+        "code": 402,
+        "metadata": {"limit_source": "openrouter_credits"},
+        "previous_errors": [{"code": 402, "message": "This request requires more credits..."}] * 3,
+    }
+
+    message = friendly_error(exc)
+    assert "This request requires more credits, or fewer max_tokens." in message
+    assert "previous_errors" not in message
+    assert "metadata" not in message
+
+
+def test_friendly_error_truncates_a_very_long_message():
+    import openai
+
+    from core.brain import friendly_error
+
+    exc = _http_error(openai.APIStatusError, 402)
+    exc.body = {"message": "x" * 1000}
+
+    message = friendly_error(exc)
+    assert len(message) < 300
 
 
 def test_friendly_error_handles_anthropic_errors_when_the_sdk_is_present():

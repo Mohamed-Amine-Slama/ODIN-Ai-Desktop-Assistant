@@ -5,6 +5,8 @@ installed in CI, so these cover the logic that surrounds them: graceful
 degradation, the confirmation parser, and the speech queue.
 """
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +98,60 @@ def test_tts_failure_does_not_kill_the_worker(monkeypatch):
         speaker.shutdown()
 
 
+def test_stop_drains_the_queue_and_stops_the_engine(monkeypatch):
+    stopped = []
+    spoken = []
+
+    class ControllableEngine:
+        name = "fake"
+
+        def speak(self, text):
+            spoken.append(text)
+
+        def stop(self):
+            stopped.append(True)
+
+    monkeypatch.setattr("core.speech_output._make_engine", lambda *a: ControllableEngine())
+    speaker = SpeechOutput()
+    try:
+        speaker.say("one.")
+        speaker.say("two.")
+        speaker.say("three.")
+        speaker.stop()
+        assert stopped == [True]
+        speaker.wait(timeout=1)  # must not hang on drained backlog
+    finally:
+        speaker.shutdown()
+
+
+def test_is_speaking_reflects_playback_state(monkeypatch):
+    gate = threading.Event()
+
+    class SlowEngine:
+        name = "fake"
+
+        def speak(self, text):  # noqa: ARG002
+            gate.wait(timeout=2)
+
+        def stop(self):
+            gate.set()
+
+    monkeypatch.setattr("core.speech_output._make_engine", lambda *a: SlowEngine())
+    speaker = SpeechOutput()
+    try:
+        assert speaker.is_speaking() is False
+        speaker.say("hang on.")
+        deadline = time.time() + 2
+        while not speaker.is_speaking() and time.time() < deadline:
+            time.sleep(0.01)
+        assert speaker.is_speaking() is True
+        speaker.stop()
+        speaker.wait(timeout=2)
+        assert speaker.is_speaking() is False
+    finally:
+        speaker.shutdown()
+
+
 # -- spoken confirmation ---------------------------------------------------
 
 class _Listener:
@@ -180,6 +236,69 @@ def test_wake_word_off_returns_no_detector(monkeypatch):
     from core.wake import make_detector
 
     assert make_detector(mic=None) is None
+
+
+# -- barge-in ---------------------------------------------------------------
+
+def test_speak_starts_the_barge_in_watcher_and_still_speaks():
+    started = []
+    spoken = []
+
+    class _Watcher:
+        def start(self):
+            started.append(True)
+
+    session = Session(SpeechOutput(engine="off"))
+    session.speaker.say = spoken.append
+    session.barge_in = _Watcher()
+
+    session.speak("hello.")
+
+    assert started == [True]
+    assert spoken == ["hello."]
+
+
+def test_speak_without_a_watcher_still_speaks():
+    """Text mode / push-to-talk without barge-in wired up must not break."""
+    spoken = []
+    session = Session(SpeechOutput(engine="off"))
+    session.speaker.say = spoken.append
+
+    session.speak("hello.")
+
+    assert spoken == ["hello."]
+
+
+def test_on_barge_in_stops_speech_and_captures_the_interruption():
+    stopped = []
+    session = Session(SpeechOutput(engine="off"))
+    session.speaker = SimpleNamespace(stop=lambda: stopped.append(True))
+    session.listener = _Listener("wait, stop")
+
+    session._on_barge_in()
+
+    assert stopped == [True]
+    assert session._pending_utterance == "wait, stop"
+
+
+def test_on_barge_in_with_nothing_heard_leaves_no_pending_utterance():
+    session = Session(SpeechOutput(engine="off"))
+    session.speaker = SimpleNamespace(stop=lambda: None)
+    session.listener = _Listener("")
+
+    session._on_barge_in()
+
+    assert session._pending_utterance is None
+
+
+def test_read_input_drains_a_pending_utterance_first():
+    """A captured interruption must be handled before waiting on the wake
+    word again, and only once."""
+    session = Session(SpeechOutput(engine="off"))
+    session._pending_utterance = "interrupting utterance"
+
+    assert session.read_input() == "interrupting utterance"
+    assert session._pending_utterance is None
 
 
 def test_missing_wake_model_degrades_to_push_to_talk(monkeypatch, capsys):
