@@ -45,7 +45,7 @@ def _load_model(wake_word: str):
         import openwakeword
     except ImportError as e:
         raise WakeWordUnavailable(
-            "openwakeword isn't installed. Run: pip install -r requirements-voice.txt"
+            "openwakeword isn't installed. Run: pip install -r requirements.txt"
         ) from e
 
     # Pretrained weights are fetched once and cached by the package.

@@ -28,6 +28,10 @@ def _looks_binary(data: bytes) -> bool:
     return b"\x00" in data[:8192]
 
 
+def _blank(path: str) -> bool:
+    return not path or not path.strip()
+
+
 class ReadFileSkill(BaseSkill):
     name = "read_file"
     description = (
@@ -48,6 +52,8 @@ class ReadFileSkill(BaseSkill):
     risk = Risk.SAFE
 
     def run(self, path: str, max_bytes: int = READ_LIMIT) -> str:
+        if _blank(path):
+            return "I need a path to work with."
         target = Path(path).expanduser()
         if not target.exists():
             return f"There is no file at {path}."
@@ -82,6 +88,8 @@ class ListDirSkill(BaseSkill):
     risk = Risk.SAFE
 
     def run(self, path: str) -> str:
+        if _blank(path):
+            return "I need a path to work with."
         target = Path(path).expanduser()
         if not target.exists():
             return f"There is no directory at {path}."
@@ -139,6 +147,8 @@ class SearchFilesSkill(BaseSkill):
 
     def run(self, root: str, pattern: str, contains: str = "",
             max_results: int = SEARCH_RESULT_LIMIT) -> str:
+        if _blank(root):
+            return "I need a directory to search under."
         start = Path(root).expanduser()
         if not start.is_dir():
             return f"There is no directory at {root}."
@@ -210,6 +220,8 @@ class WriteFileSkill(BaseSkill):
         return f"Create {path}?"
 
     def run(self, path: str, content: str) -> str:
+        if _blank(path):
+            return "I need a path to work with."
         target = Path(path).expanduser()
         existed = target.exists()
 
@@ -220,20 +232,38 @@ class WriteFileSkill(BaseSkill):
             except OSError as e:
                 return f"I couldn't back up {path} before writing, so I stopped: {e}"
 
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-        except PermissionError:
-            return f"I don't have permission to write {path}."
-        except OSError as e:
-            return f"I couldn't write {path}: {e}"
-
-        if existed:
+            # Recorded now, before the write is even attempted: write_text()
+            # opens in "w" mode, which truncates the file immediately, before
+            # a single byte of new content lands. If the write then fails
+            # partway (disk full, I/O error, AV lock), the backup taken above
+            # is the only copy of the original left — recording its restore
+            # only after a successful write would leave that backup orphaned
+            # and undiscoverable, with the original already destroyed.
             def restore(dest=target, source=backup):
                 shutil.copy2(source, dest)
                 return f"Restored the previous {dest.name}."
 
             get_journal().record(f"Restore the previous {target.name}", restore)
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except PermissionError:
+            if existed:
+                return (
+                    f"I don't have permission to write {path}. The previous "
+                    "version is safely backed up and still recoverable."
+                )
+            return f"I don't have permission to write {path}."
+        except OSError as e:
+            if existed:
+                return (
+                    f"I couldn't write {path}: {e}. The previous version is "
+                    "safely backed up and still recoverable."
+                )
+            return f"I couldn't write {path}: {e}"
+
+        if existed:
             return f"Updated {path} ({len(content)} characters). The previous version is recoverable."
 
         def remove(dest=target):
@@ -261,6 +291,8 @@ class MakeDirSkill(BaseSkill):
         return f"Create the folder {path}?"
 
     def run(self, path: str) -> str:
+        if _blank(path):
+            return "I need a path to work with."
         target = Path(path).expanduser()
         if target.exists():
             return f"{path} already exists."
@@ -316,6 +348,8 @@ class MoveFileSkill(BaseSkill):
         return f"Move {src} to {dst}?"
 
     def run(self, src: str, dst: str) -> str:
+        if _blank(src) or _blank(dst):
+            return "I need both a source and a destination path."
         source = Path(src).expanduser()
         destination = Path(dst).expanduser()
 
@@ -375,6 +409,12 @@ class DeleteFileSkill(BaseSkill):
         return f"Delete {path}?"
 
     def run(self, path: str) -> str:
+        if _blank(path):
+            # Path("").expanduser() silently resolves to the process's own
+            # working directory rather than erroring — without this check,
+            # a blank path here would try to trash-then-delete Jarvis's own
+            # cwd instead of failing loudly.
+            return "I need a path to work with."
         target = Path(path).expanduser()
         if not target.exists():
             return f"There is no file or folder at {path}."

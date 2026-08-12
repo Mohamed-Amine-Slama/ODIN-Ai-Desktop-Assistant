@@ -23,7 +23,7 @@ def get_embedder():
         except ImportError as e:
             raise ImportError(
                 "This needs the 'sentence-transformers' package. "
-                "Run: pip install -r requirements-rag.txt"
+                "Run: pip install -r requirements.txt"
             ) from e
         _embedder = SentenceTransformer(_MODEL_NAME)
     return _embedder

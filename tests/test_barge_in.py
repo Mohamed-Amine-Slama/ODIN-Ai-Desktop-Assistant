@@ -1,7 +1,7 @@
 """Tests for core/barge_in.py's sustained-energy interrupt watcher.
 
 No real audio hardware or numpy dependency: the microphone and rms() are both
-faked, so these run without requirements-voice.txt installed.
+faked, so these run without the voice packages installed.
 """
 import queue
 import time

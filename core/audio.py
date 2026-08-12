@@ -86,7 +86,7 @@ def _import_sounddevice():
     except (ImportError, OSError) as e:
         # OSError here means PortAudio is missing, which is common in WSL.
         raise MicrophoneUnavailable(
-            "sounddevice is unavailable — install requirements-voice.txt "
+            "sounddevice is unavailable — install requirements.txt "
             f"and check your audio device ({e})"
         ) from e
     return sounddevice

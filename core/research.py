@@ -46,7 +46,7 @@ def preflight() -> str | None:
     if not knowledge.available():
         return (
             "Deep learning needs the local knowledge packages. "
-            "Run: pip install -r requirements-rag.txt"
+            "Run: pip install -r requirements.txt"
         )
     return None
 
@@ -236,9 +236,18 @@ def _llm_complete(prompt: str) -> str:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1024,
         )
+        # A gateway can legitimately return zero choices (content filtered,
+        # malformed upstream response) — treated as "nothing useful came
+        # back" like any other empty completion, not a failure to reach the
+        # model. Reading choices[0] unconditionally would raise IndexError
+        # outside this try, which every caller here only catches as
+        # RuntimeError — an uncaught IndexError would abort the whole
+        # deep_learn run instead of just skipping this one step.
+        if not response.choices:
+            return ""
+        return (response.choices[0].message.content or "").strip()
     except Exception as e:
         raise RuntimeError(f"couldn't reach the model: {e}") from e
-    return (response.choices[0].message.content or "").strip()
 
 
 def _parse_json_list(text: str) -> list[str]:

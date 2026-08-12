@@ -104,7 +104,7 @@ def _load_model():
         from faster_whisper import WhisperModel
     except ImportError as e:
         raise MicrophoneUnavailable(
-            "faster-whisper isn't installed. Run: pip install -r requirements-voice.txt"
+            "faster-whisper isn't installed. Run: pip install -r requirements.txt"
         ) from e
 
     try:

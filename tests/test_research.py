@@ -20,7 +20,7 @@ def test_preflight_needs_web_search(monkeypatch):
 def test_preflight_needs_rag_deps(monkeypatch):
     monkeypatch.setattr("core.research.web_search_available", lambda: True)
     monkeypatch.setattr("core.research.knowledge.available", lambda: False)
-    assert "requirements-rag.txt" in research.preflight()
+    assert "requirements.txt" in research.preflight()
 
 
 def test_preflight_passes_when_both_are_ready(monkeypatch):

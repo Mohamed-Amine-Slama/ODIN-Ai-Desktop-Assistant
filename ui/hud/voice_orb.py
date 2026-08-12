@@ -275,7 +275,7 @@ class VoiceOrb(QWidget):
         rect = QRectF(self.CENTER - self.R_LAUNCHER, self.CENTER - self.R_LAUNCHER, self.R_LAUNCHER * 2, self.R_LAUNCHER * 2)
         gap_deg = 6.0
         seg_span = 45.0 - gap_deg
-        painter.setFont(tokens.font_label(tokens.T_MICRO))
+        painter.setFont(tokens.font_label(tokens.T_LABEL, bold=True))
         for i, label in enumerate(self.LAUNCHER_LABELS):
             center_angle = 90 - i * 45
             start = center_angle + seg_span / 2
@@ -296,18 +296,18 @@ class VoiceOrb(QWidget):
             ang = math.radians(center_angle)
             tx = self.CENTER + self.R_LAUNCHER * math.cos(ang)
             ty = self.CENTER - self.R_LAUNCHER * math.sin(ang)
-            painter.setPen(tokens.CY_100 if hovered else tokens.CY_500)
-            painter.drawText(QRectF(tx - 26, ty - 8, 52, 16), Qt.AlignmentFlag.AlignCenter, label)
+            painter.setPen(tokens.CY_100 if hovered else tokens.CY_200)
+            painter.drawText(QRectF(tx - 30, ty - 8, 60, 16), Qt.AlignmentFlag.AlignCenter, label)
 
     def _paint_tick_ring(self, painter: QPainter) -> None:
         n = 120
-        color = QColor(tokens.CY_600)
-        color.setAlphaF(0.4)
-        painter.setPen(QPen(color, 1))
+        color = QColor(tokens.CY_400)
+        color.setAlphaF(0.55)
+        painter.setPen(QPen(color, 1.2))
         for i in range(n):
             ang = math.radians(self._tick_phase + i * 360.0 / n)
-            x0 = self.CENTER + (self.R_TICK - 4) * math.cos(ang)
-            y0 = self.CENTER - (self.R_TICK - 4) * math.sin(ang)
+            x0 = self.CENTER + (self.R_TICK - 6) * math.cos(ang)
+            y0 = self.CENTER - (self.R_TICK - 6) * math.sin(ang)
             x1 = self.CENTER + self.R_TICK * math.cos(ang)
             y1 = self.CENTER - self.R_TICK * math.sin(ang)
             painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))

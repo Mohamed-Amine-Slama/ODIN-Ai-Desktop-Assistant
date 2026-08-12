@@ -43,7 +43,7 @@ def _get_collection():
         except ImportError as e:
             raise ImportError(
                 "Local knowledge needs the 'chromadb' package. "
-                "Run: pip install -r requirements-rag.txt"
+                "Run: pip install -r requirements.txt"
             ) from e
         config.ensure_dirs()
         db_path = os.path.join(config.DATA_DIR, DB_DIR_NAME)

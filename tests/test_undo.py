@@ -107,6 +107,26 @@ def test_move_to_trash_handles_directories(tmp_path, monkeypatch):
     assert (backup / "a.txt").read_text(encoding="utf-8") == "a"
 
 
+def test_move_to_trash_handles_a_source_with_an_empty_name(tmp_path, monkeypatch):
+    """A bare drive root ('C:/') has Path.name == "" — `bucket / ""` is a
+    no-op join, so dest would silently collapse onto the (empty) bucket dir
+    itself rather than holding a real copy inside it. shutil.copytree is
+    faked out here so this never actually touches a real drive root."""
+    import config
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path / "jarvisdata"))
+
+    calls = []
+    monkeypatch.setattr("shutil.copytree", lambda src, dst: calls.append(dst))
+
+    drive_root = Path("C:/")
+    assert drive_root.name == ""
+
+    backup = move_to_trash(drive_root)
+    assert backup.name != ""
+    assert backup != backup.parent, "dest must not collapse onto the (empty) bucket dir itself"
+    assert calls == [backup]
+
+
 def test_prune_trash_by_count(tmp_path, monkeypatch):
     import config
     monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))

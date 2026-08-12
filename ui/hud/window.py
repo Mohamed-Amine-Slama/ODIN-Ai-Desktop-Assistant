@@ -13,7 +13,7 @@ from collections import deque
 from datetime import datetime
 
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QRadialGradient
 from PyQt6.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
+    QPushButton,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -92,7 +93,7 @@ class _CoreStrip(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._values: list[float] = []
-        self.setFixedHeight(40)
+        self.setFixedHeight(14)
 
     def set_values(self, values: list[float]) -> None:
         self._values = values
@@ -113,6 +114,40 @@ class _CoreStrip(QWidget):
             h = rect.height() * frac
             x = i * (bar_w + gap)
             painter.fillRect(QRectF(x, rect.height() - h, bar_w, h), tokens.threshold_color(frac))
+        painter.end()
+
+
+class _Backdrop(QWidget):
+    """The background layer stack from ODIN-HUD.md §4: void fill, a radial
+    vignette pulling the eye to the orb, a faint grid mesh, and scanlines.
+    Previously only the flat void fill was implemented (a plain stylesheet
+    background-color) — the missing three layers are most of what makes the
+    reference imagery read as a dense instrument rather than flat black."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        rect = self.rect()
+
+        painter.fillRect(rect, tokens.VOID)
+
+        vignette = QRadialGradient(rect.width() * 0.5, rect.height() * 0.45, rect.width() * 0.62)
+        vignette.setColorAt(0.0, QColor(10, 60, 90, 56))
+        vignette.setColorAt(1.0, QColor(10, 60, 90, 0))
+        painter.fillRect(rect, vignette)
+
+        painter.setPen(QPen(QColor(11, 95, 135, 14), 1))
+        for x in range(0, rect.width(), 40):
+            painter.drawLine(x, 0, x, rect.height())
+        for y in range(0, rect.height(), 40):
+            painter.drawLine(0, y, rect.width(), y)
+
+        painter.setPen(QPen(QColor(0, 0, 0, 56), 1))
+        for y in range(0, rect.height(), 3):
+            painter.drawLine(0, y, rect.width(), y)
         painter.end()
 
 
@@ -200,6 +235,10 @@ class OdinHudWindow(QMainWindow):
         self.setWindowTitle(f"{config.ASSISTANT_NAME} HUD")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setFixedSize(1920, 1080)
+        # NoFocus is QWidget's default — without this, self.setFocus() in
+        # show_and_activate() would silently do nothing and keyboard focus
+        # would stay wherever Qt's initial auto-focus put it.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.telemetry = TelemetryWorker(self)
         self.telemetry.frame_ready.connect(self._on_frame)
@@ -226,12 +265,18 @@ class OdinHudWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget(self)
-        root.setStyleSheet(f"background-color: {tokens.VOID.name()};")
         self.setCentralWidget(root)
+
+        self._backdrop = _Backdrop(root)
+        self._backdrop.setGeometry(0, 0, self.width(), self.height())
 
         self._circuit_traces = _CircuitTraces(root)
         self._circuit_traces.setGeometry(0, 0, self.width(), self.height())
+        # Stacking order, bottom to top: backdrop, then circuit traces, then
+        # the grid of panels — lower() each in reverse so the last call
+        # (backdrop) ends up at the very bottom.
         self._circuit_traces.lower()
+        self._backdrop.lower()
 
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -309,6 +354,21 @@ class OdinHudWindow(QMainWindow):
         self.link_pip = QLabel("●", row)
         self.link_pip.setStyleSheet(f"color: {tokens.CY_600.name()}; font-size: 10px;")
         h.addWidget(self.link_pip, 0)
+
+        # A real, always-clickable way to hide the HUD. Esc does the same
+        # thing, but a frameless always-on-top window can't be relied on to
+        # always hold keyboard focus, so this must not be the only way out.
+        close_btn = QPushButton("✕ HIDE", row)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setFont(tokens.font_label(tokens.T_MICRO))
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background: rgba(53,200,245,20); border: 1px solid {tokens.CY_500.name()};"
+            f" color: {tokens.CY_200.name()}; padding: 4px 12px; }}"
+            f"QPushButton:hover {{ background: rgba(255,68,68,60); border: 1px solid {tokens.CRIT.name()};"
+            f" color: {tokens.CY_100.name()}; }}"
+        )
+        close_btn.clicked.connect(self.dismiss)
+        h.addWidget(close_btn, 0)
         return row
 
     def _build_zone_b(self) -> QWidget:
@@ -321,7 +381,7 @@ class OdinHudWindow(QMainWindow):
         panel.body_layout.addWidget(self.core_strip)
         self.cpu_processes = Readout("PROCESSES")
         panel.body_layout.addWidget(self.cpu_processes)
-        self.cpu_top_rows = [Readout("--") for _ in range(3)]
+        self.cpu_top_rows = [Readout("--") for _ in range(1)]
         for row in self.cpu_top_rows:
             panel.body_layout.addWidget(row)
         panel.body_layout.addStretch(1)
@@ -435,18 +495,15 @@ class OdinHudWindow(QMainWindow):
         self.weather_condition.setStyleSheet(f"color: {tokens.CY_500.name()};")
         panel.body_layout.addWidget(self.weather_condition)
 
-        self.weather_humidity = Readout("HUMIDITY")
-        self.weather_feels = Readout("FEELS LIKE")
-        self.weather_wind = Readout("WIND")
-        self.weather_pressure = Readout("PRESSURE")
+        # Humidity/feels-like and wind/pressure are paired into one row each
+        # — five separate Readouts didn't fit this panel's real budget
+        # (§4's zone table gives it one row's worth of pixels; see
+        # ui/hud/layout.py's rebalancing note).
+        self.weather_humidity_feels = Readout("HUMID/FEELS")
+        self.weather_wind_pressure = Readout("WIND/PRESS")
         self.weather_sun = Readout("SUN")
-        for row in (self.weather_humidity, self.weather_feels, self.weather_wind, self.weather_pressure, self.weather_sun):
+        for row in (self.weather_humidity_feels, self.weather_wind_pressure, self.weather_sun):
             panel.body_layout.addWidget(row)
-
-        self.weather_forecast = QLabel("", panel.body)
-        self.weather_forecast.setFont(tokens.font_data(tokens.T_MICRO))
-        self.weather_forecast.setStyleSheet(f"color: {tokens.CY_400.name()};")
-        panel.body_layout.addWidget(self.weather_forecast)
         panel.body_layout.addStretch(1)
         return panel
 
@@ -546,10 +603,44 @@ class OdinHudWindow(QMainWindow):
 
     # -- window lifecycle --------------------------------------------------
 
+    def _size_to_screen(self) -> None:
+        """Match the real primary screen instead of the 1920x1080 fallback
+        set at construction. setFixedSize() and showFullScreen() otherwise
+        fight each other on any monitor that isn't exactly 1920x1080 — Qt
+        can't actually resize a fixed-size window to fill the real screen,
+        which left background layers (sized from the stale 1920x1080) out
+        of sync with the window's real geometry. Safe to call repeatedly;
+        it's a no-op once the size already matches."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        size = screen.geometry().size()
+        if size == self.size():
+            return
+        self.setFixedSize(size)
+        self._backdrop.setGeometry(0, 0, size.width(), size.height())
+        self._circuit_traces.setGeometry(0, 0, size.width(), size.height())
+        self.console.move((size.width() - self.console.width()) // 2, (size.height() - self.console.height()) // 2)
+
     def show_and_activate(self) -> None:
+        self._size_to_screen()
         self.showFullScreen()
         self.raise_()
         self.activateWindow()
+        # Qt hands keyboard focus to the first tab-focusable child (the
+        # EXP dock button) the moment the window is shown, unless something
+        # else claims it explicitly. Left that way, every keystroke —
+        # including Esc — goes to that button instead of the window, which
+        # is why Esc silently did nothing. Claiming focus on the window
+        # itself here (not a specific child) is what makes Esc reach
+        # keyPressEvent below.
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        # Belt-and-suspenders: on Windows, activateWindow() on a frameless
+        # always-on-top window launched from a terminal can lose a race with
+        # the OS's foreground-lock — the window paints but doesn't actually
+        # take OS-level keyboard focus until a beat later. A second attempt
+        # after the event loop has spun costs nothing and closes that gap.
+        QTimer.singleShot(150, lambda: (self.activateWindow(), self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)))
         if not self.telemetry.isRunning():
             self.telemetry.start()
         if not self._anim_timer.isActive():
@@ -689,25 +780,24 @@ class OdinHudWindow(QMainWindow):
         if sample is None:
             self.weather_temp.setText("--°")
             self.weather_condition.setText("NO SIGNAL")
-            for row in (
-                self.weather_humidity, self.weather_feels, self.weather_wind,
-                self.weather_pressure, self.weather_sun,
-            ):
-                row.set_value("--")
-            self.weather_forecast.setText("")
+            self.weather_humidity_feels.set_value("--")
+            self.weather_wind_pressure.set_value("--")
+            self.weather_sun.set_value("--")
             return
 
         self.weather_temp.setText("--°" if sample.temp_c is None else f"{sample.temp_c:.0f}°C")
         self.weather_condition.setText((sample.condition or "--").strip().upper())
-        self.weather_humidity.set_value("--" if sample.humidity is None else f"{sample.humidity:.0f}%")
-        self.weather_feels.set_value("--" if sample.feels_like_c is None else f"{sample.feels_like_c:.0f}°C")
-        self.weather_wind.set_value("--" if sample.wind_kph is None else f"{sample.wind_kph:.0f} KM/H")
-        self.weather_pressure.set_value("--" if sample.pressure_mb is None else f"{sample.pressure_mb:.0f} MB")
+
+        humidity = "--" if sample.humidity is None else f"{sample.humidity:.0f}%"
+        feels = "--" if sample.feels_like_c is None else f"{sample.feels_like_c:.0f}°C"
+        self.weather_humidity_feels.set_value(f"{humidity} / {feels}")
+
+        wind = "--" if sample.wind_kph is None else f"{sample.wind_kph:.0f}KM/H"
+        pressure = "--" if sample.pressure_mb is None else f"{sample.pressure_mb:.0f}MB"
+        self.weather_wind_pressure.set_value(f"{wind} / {pressure}")
+
         sun = f"{sample.sunrise} / {sample.sunset}" if sample.sunrise and sample.sunset else "--"
         self.weather_sun.set_value(sun)
-        self.weather_forecast.setText(
-            "   ".join(f"{day}: {lo:.0f}/{hi:.0f}°" for day, lo, hi in sample.forecast)
-        )
 
     # -- notes / reminders -------------------------------------------------
 
@@ -731,7 +821,16 @@ class OdinHudWindow(QMainWindow):
             self._notes_rows.append(empty)
             return
 
-        for reminder in reminders[:4]:
+        # This panel gets one grid row's worth of pixels (§4's spec table
+        # gave it two; see ui/hud/layout.py's rebalancing note) — reminders
+        # win the limited space since they're time-sensitive, notes fill
+        # whatever's left.
+        max_items = 2
+        shown_reminders = reminders[:max_items]
+        remaining_slots = max_items - len(shown_reminders)
+        shown_notes = notes[-remaining_slots:] if remaining_slots > 0 else []
+
+        for reminder in shown_reminders:
             remaining = reminder["fire_at"] - now
             overdue = remaining < 0
             text = f"{reminder['message']} — {_relative_time(remaining)}"
@@ -742,7 +841,7 @@ class OdinHudWindow(QMainWindow):
             panel.body_layout.addWidget(label)
             self._notes_rows.append(label)
 
-        for note in notes[-4:]:
+        for note in shown_notes:
             label = QLabel(note["text"], panel.body)
             label.setWordWrap(True)
             label.setFont(tokens.font_data(tokens.T_MICRO))
@@ -836,7 +935,7 @@ class OdinHudWindow(QMainWindow):
         self._knowledge_rows.append(header)
 
         max_chunks = max((r["chunk_count"] for r in rows), default=1) or 1
-        for row in rows[:6]:
+        for row in rows[:3]:  # this panel's real budget fits ~3 bars; see layout.py's note
             topic = row["topic"]
             if self._active_learning and self._active_learning[0] == topic:
                 _, subtopic, fraction = self._active_learning
@@ -951,10 +1050,18 @@ class OdinHudWindow(QMainWindow):
     def _on_turn_finished(self, reply: str) -> None:
         if reply and not self._odin_reply_parts:
             self.transcript_odin.setText(reply)
+        # The transcript ticker (zone E) is ODIN's primary output, but the
+        # console is a self-contained typed-input surface (console.py) —
+        # without this, a reply only ever appeared elsewhere on the HUD,
+        # so anyone watching just the console saw their message echoed
+        # and then nothing.
+        if self.transcript_odin.text():
+            self.console.echo(self.transcript_odin.text())
         self._finish_turn()
 
     def _on_turn_error(self, message: str) -> None:
         self.transcript_odin.setText(message)
+        self.console.echo(message)
         self._finish_turn()
 
     def _finish_turn(self) -> None:

@@ -115,10 +115,17 @@ def test_disk_usage_failure_is_skipped_not_fatal(monkeypatch):
     assert disks == []  # skipped, not a crash — and never a fabricated reading
 
 
-def test_thermals_default_to_none_when_backends_are_unavailable():
-    """Neither pynvml nor wmi is installed in this environment — every
-    thermal field must come back None (rendered as "--"), never a
-    fabricated number (ODIN-HUD.md §10)."""
+def test_thermals_default_to_none_when_backends_are_unavailable(monkeypatch):
+    """Every thermal field must come back None (rendered as "--"), never a
+    fabricated number (ODIN-HUD.md §10), when neither optional sensor
+    backend is available — forced here via sys.modules rather than relying
+    on the dev/CI machine actually lacking pynvml/wmi (this one has both,
+    plus a real GPU, once requirements.txt is fully installed)."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+    monkeypatch.setitem(sys.modules, "wmi", None)
+
     worker = TelemetryWorker()
     thermals = worker._thermals()
     assert thermals.cpu_c is None

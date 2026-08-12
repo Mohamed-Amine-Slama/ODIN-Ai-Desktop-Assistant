@@ -194,7 +194,13 @@ class CloseWindowSkill(BaseSkill):
     risk = Risk.DANGEROUS
 
     def consequence(self, title: str = "", **_) -> str:
-        return f"Close the '{title}' window? Any unsaved work in it will be lost."
+        # Resolve the substring to the real title before asking — otherwise
+        # a short/ambiguous-looking title (e.g. "cord" matching only
+        # "Discord") gets confirmed blind, without the user ever seeing what
+        # they actually agreed to close.
+        matches, _ = _match(title)
+        shown = matches[0][1] if len(matches) == 1 else title
+        return f"Close the '{shown}' window? Any unsaved work in it will be lost."
 
     def run(self, title: str) -> str:
         if not IS_WINDOWS:

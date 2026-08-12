@@ -1,4 +1,10 @@
-# Core - everything Jarvis needs to run in text mode.
+# All of Jarvis's dependencies, in one file: pip install -r requirements.txt
+#
+# Sections below that say "optional" mean the corresponding skill/feature
+# degrades gracefully without it (falls back, or reports what's missing)
+# rather than crashing Jarvis as a whole — see each section's own comment.
+
+# --- Core: everything Jarvis needs to run in text mode ----------------------
 openai>=1.0.0
 python-dotenv>=1.0.0
 psutil>=5.9.0
@@ -19,7 +25,7 @@ ddgs>=9.0.0
 pycaw>=20240210; sys_platform == "win32"
 comtypes>=1.2.0; sys_platform == "win32"
 
-# Offline TTS fallback (the main voice pipeline is in requirements-voice.txt)
+# Offline TTS fallback (the main voice pipeline is in the Voice section below)
 pyttsx3>=2.90
 
 # Synthetic keyboard and mouse (type_text / press_keys / click). Without this
@@ -33,3 +39,67 @@ keyboard>=0.13.5; sys_platform == "win32"
 
 # Tests
 pytest>=8.0.0
+
+# --- HUD: optional thermal/GPU sensors (see ODIN-HUD.md §7.4) ---------------
+# Neither package is required — without them, the HUD's thermal readouts
+# render "--" instead of a fabricated value, per the HUD's own rule against
+# inventing numbers a sensor didn't actually report.
+
+# GPU temp / load / VRAM. NVIDIA only. nvidia-ml-py is NVIDIA's official
+# package for the `pynvml` module — the standalone `pynvml` package on PyPI
+# is a deprecated third-party shim that now warns on import.
+nvidia-ml-py>=12.535.0; sys_platform == "win32"
+
+# CPU temp / fan RPM. Needs LibreHardwareMonitor running with its WMI
+# provider enabled — this package only talks to it, it doesn't ship it.
+wmi>=1.5.1; sys_platform == "win32"
+
+# --- Email and calendar: optional (read_email, send_email, list_events, ----
+# create_event, delete_event). Jarvis runs fine without any of this — the
+# skills just stay unregistered until an account is connected (see README
+# section on email/calendar setup).
+
+# Google: Gmail + Calendar APIs, OAuth via a Desktop-app client you register
+# yourself at console.cloud.google.com.
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.100.0
+
+# Microsoft: Mail + Calendar via Graph, OAuth via a public-client app you
+# register yourself at portal.azure.com. No separate Graph SDK needed —
+# Graph is called directly over HTTPS with `requests`, already a core dep.
+msal>=1.28.0
+
+# --- RAG: optional local knowledge base for deep_learn, and semantic -------
+# search for the memory skill's recall (core/memory_index.py) — both share
+# one embedding model via core/embeddings.py. sentence-transformers pulls in
+# torch, which is a large install (hundreds of MB to a couple GB depending on
+# platform). Jarvis runs fine without any of this — deep_learn just reports
+# what's missing, and memory recall quietly falls back to plain-text search.
+
+# Local embeddings — no API key, no per-chunk cost, works offline after the
+# first run (which downloads the ~90MB all-MiniLM-L6-v2 model).
+sentence-transformers>=3.0.0
+
+# Local vector store, persisted under data/knowledge_db and data/memory_db.
+chromadb>=0.5.0
+
+# --- Voice: optional hands-free pipeline ------------------------------------
+# Pulls ~1GB of ML wheels and model weights. Jarvis runs fine in text mode
+# without any of it.
+
+# Audio capture. sounddevice ships working Windows wheels, unlike PyAudio.
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Wake word: openWakeWord ships a pretrained "hey_jarvis" model.
+# No API key, no Picovoice account, no training.
+openwakeword>=0.6.0
+onnxruntime>=1.16.0
+
+# Speech-to-text: local Whisper. Offline, accurate, and your audio never
+# leaves the machine (the old SpeechRecognition backend posted it to Google).
+faster-whisper>=1.0.0
+
+# Text-to-speech: Edge neural voices (free, no key) + playback.
+edge-tts>=6.1.0
+pygame>=2.5.0

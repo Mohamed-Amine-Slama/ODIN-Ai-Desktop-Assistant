@@ -4,6 +4,7 @@ no QSS, no child-widget assembly beyond what a component itself needs.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from PyQt6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRectF, QTimer, Qt, pyqtProperty
@@ -12,7 +13,13 @@ from PyQt6.QtWidgets import QAbstractButton, QVBoxLayout, QWidget
 
 from . import tokens
 
-_TITLE_H = 26
+_TITLE_H = 20
+# Every panel's body starts at this spacing rather than Qt's style-default
+# (6-11px, varying by platform) — with 4-8 rows packed into a ~130px or even
+# ~40px budget (see ui/hud/layout.py's rebalancing note), the unset default
+# was worth 20-50+ extra px per panel on its own and was a real, measured
+# contributor to the content overlapping its container.
+_BODY_SPACING = 3
 
 
 class Panel(QWidget):
@@ -26,11 +33,12 @@ class Panel(QWidget):
         self._status = status  # None | "ok" | "warn" | "crit"
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, _TITLE_H, 10, 10)
+        outer.setContentsMargins(8, _TITLE_H, 8, 6)
         outer.setSpacing(0)
         self.body = QWidget(self)
         self.body_layout = QVBoxLayout(self.body)
         self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(_BODY_SPACING)
         outer.addWidget(self.body)
 
     def set_status(self, status: str | None) -> None:
@@ -47,7 +55,7 @@ class Panel(QWidget):
         tokens.corner_ticks(painter, rect, tokens.CY_600, alpha=255)
 
         sq = 6
-        tx, ty = 10, 9
+        tx, ty = 8, 6
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(tokens.CY_300)
         painter.drawRect(tx, ty, sq, sq)
@@ -85,7 +93,7 @@ class Readout(QWidget):
         super().__init__(parent)
         self._label = label.upper()
         self._value = value
-        self.setFixedHeight(20)
+        self.setFixedHeight(16)
 
     def set_value(self, value: str) -> None:
         if value != self._value:
@@ -103,8 +111,8 @@ class Readout(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect()
 
-        label_font = tokens.font_label(tokens.T_LABEL)
-        value_font = tokens.font_data(tokens.T_BODY)
+        label_font = tokens.font_label(tokens.T_MICRO)
+        value_font = tokens.font_data(tokens.T_MICRO + 2)
         label_metrics = QFontMetrics(label_font)
         value_metrics = QFontMetrics(value_font)
 
@@ -140,7 +148,7 @@ class BarMeter(QWidget):
         self._fraction = 0.0
         self._display = "--"
         self._peak = 0.0
-        self.setFixedHeight(34)
+        self.setFixedHeight(26)
 
     def set_value(self, fraction: float | None, display_text: str) -> None:
         self._fraction = 0.0 if fraction is None else max(0.0, min(1.0, fraction))
@@ -153,17 +161,17 @@ class BarMeter(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         w = self.width()
 
-        label_font = tokens.font_label(tokens.T_LABEL)
-        value_font = tokens.font_data(tokens.T_DATA)
+        label_font = tokens.font_label(tokens.T_MICRO)
+        value_font = tokens.font_data(tokens.T_MICRO + 2)
         painter.setFont(label_font)
         painter.setPen(tokens.CY_500)
-        painter.drawText(0, 12, self._label)
+        painter.drawText(0, 9, self._label)
         painter.setFont(value_font)
         painter.setPen(tokens.CY_200)
         value_w = QFontMetrics(value_font).horizontalAdvance(self._display)
-        painter.drawText(w - value_w, 14, self._display)
+        painter.drawText(w - value_w, 10, self._display)
 
-        bar_rect = QRectF(0, 20, w, 8)
+        bar_rect = QRectF(0, 14, w, 7)
         painter.fillRect(bar_rect, tokens.CY_700)
 
         color = tokens.threshold_color(self._fraction)
@@ -247,13 +255,13 @@ class DockButton(QAbstractButton):
     from QAbstractButton) carries no payload — callers distinguish buttons
     by object identity/closure, same as any other Qt button."""
 
-    DIAMETER = 64
+    DIAMETER = 76
 
     def __init__(self, glyph: str, label: str, parent=None):
         super().__init__(parent)
         self._glyph = glyph
         self._label = label.upper()
-        self.setFixedSize(self.DIAMETER + 24, self.DIAMETER + 24)
+        self.setFixedSize(self.DIAMETER + 24, self.DIAMETER + 44)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setToolTip(self._label)
@@ -303,31 +311,42 @@ class DockButton(QAbstractButton):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(QPointF(cx, cy), r, r)
 
-        if hovered:
-            tokens.draw_glow(painter, stroke_ring, ring_color, 2.0, passes=2)
-        else:
-            stroke_ring(QPen(ring_color, 2))
+        # Always-on glow, brighter on hover — reads as "powered" at rest
+        # rather than a bare outline, matching the reference imagery's
+        # instrument density instead of a plain flat ring.
+        tokens.draw_glow(painter, stroke_ring, ring_color, 2.0, passes=3 if hovered else 1)
 
-        inner = QColor(tokens.CY_600) if pressed else QColor(6, 28, 48, 128)
+        # A thin secondary ring plus a handful of tick marks just outside
+        # it — a compact echo of RadialGauge's tick scale, giving the
+        # button real instrument detail instead of a single bare circle.
+        painter.setPen(QPen(QColor(tokens.CY_600), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r + 5, r + 5)
+        for i in range(12):
+            ang = math.radians(i * 30)
+            x0, y0 = cx + (r + 5) * math.cos(ang), cy + (r + 5) * math.sin(ang)
+            x1, y1 = cx + (r + 8) * math.cos(ang), cy + (r + 8) * math.sin(ang)
+            painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+
+        inner = QColor(tokens.CY_600) if pressed else QColor(6, 28, 48, 160)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(inner)
         painter.drawEllipse(QPointF(cx, cy), r - 3, r - 3)
 
         painter.setPen(tokens.CY_100 if hovered else tokens.CY_200)
-        painter.setFont(tokens.font_label(tokens.T_BODY, bold=True))
+        painter.setFont(tokens.font_label(tokens.T_DATA, bold=True))
         painter.drawText(QRectF(cx - r, cy - r, 2 * r, 2 * r), Qt.AlignmentFlag.AlignCenter, self._glyph)
 
-        if hovered:
-            painter.setFont(tokens.font_label(tokens.T_MICRO))
-            painter.setPen(tokens.CY_300)
-            painter.drawText(
-                QRectF(0, self.DIAMETER + 8, self.width(), 14),
-                Qt.AlignmentFlag.AlignHCenter,
-                self._label,
-            )
+        painter.setFont(tokens.font_label(tokens.T_MICRO))
+        painter.setPen(tokens.CY_100 if hovered else tokens.CY_500)
+        painter.drawText(
+            QRectF(0, self.DIAMETER + 14, self.width(), 16),
+            Qt.AlignmentFlag.AlignHCenter,
+            self._label,
+        )
 
         if self.hasFocus():
             painter.setPen(QPen(tokens.OK, 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QPointF(cx, cy), r + 3, r + 3)
+            painter.drawEllipse(QPointF(cx, cy), r + 10, r + 10)
         painter.end()

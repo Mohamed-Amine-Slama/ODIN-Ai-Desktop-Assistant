@@ -7,10 +7,41 @@ pyautogui's corner failsafe is left enabled deliberately: slamming the mouse
 into a screen corner aborts an in-flight automation, which is the only runtime
 escape hatch once Jarvis is driving the machine.
 """
+import sys
+
 from core.risk import Risk
 
 from . import screen_state
 from .base_skill import BaseSkill
+
+IS_WINDOWS = sys.platform == "win32"
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+
+def _virtual_screen_bounds(gui) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the full virtual desktop — spans every
+    monitor, which can sit left of / above the primary at negative
+    coordinates. `gui.size()` alone only reports the primary monitor, so
+    using it as the whole bounds would wrongly reject a valid click on a
+    second monitor placed to the left of or above the primary."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            width = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            height = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            if width > 0 and height > 0:
+                left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+                top = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+                return left, top, left + width, top + height
+        except Exception:
+            pass
+    width, height = gui.size()
+    return 0, 0, width, height
 
 
 def _gui():
@@ -86,7 +117,21 @@ class PressKeysSkill(BaseSkill):
         if problem:
             return problem
 
-        parts = [p.strip().lower() for p in (keys or "").split("+") if p.strip()]
+        raw = (keys or "").strip()
+        if raw == "+":
+            # The single-key case: "+" is both the delimiter and a valid key
+            # name, and a plain split() has no other way to tell "just the
+            # plus key" from "nothing here."
+            parts = ["+"]
+        elif raw.endswith("++"):
+            # A trailing "++" means "..., then a literal + key" (e.g.
+            # "ctrl++" to zoom in) — split() alone would swallow that
+            # trailing "+" as an empty token and silently drop it.
+            parts = [p.strip().lower() for p in raw[:-1].split("+") if p.strip()]
+            parts.append("+")
+        else:
+            parts = [p.strip().lower() for p in raw.split("+") if p.strip()]
+
         if not parts:
             return "There were no keys to press."
 
@@ -121,8 +166,24 @@ class ClickSkill(BaseSkill):
         gui, problem = _gui()
         if problem:
             return problem
+        if screen_state.is_stale():
+            return "That screenshot is too old to click from safely — take a fresh one with see_screen first."
         real_x, real_y = screen_state.to_real(x, y)
-        gui.click(x=real_x, y=real_y, button=button, clicks=max(1, int(clicks)))
+        # A coordinate mapped from a stale or since-resized screenshot can
+        # land off the live screen — check rather than hand pyautogui an
+        # out-of-range point, which would either mis-click at a clamped
+        # edge or throw FailSafeException (corner failsafe) straight past
+        # this skill as a raw, unfriendly error.
+        left, top, right, bottom = _virtual_screen_bounds(gui)
+        if not (left <= real_x < right and top <= real_y < bottom):
+            return (
+                f"({x}, {y}) maps outside the current screen — take a fresh "
+                "screenshot with see_screen and try again."
+            )
+        try:
+            gui.click(x=real_x, y=real_y, button=button, clicks=max(1, int(clicks)))
+        except gui.FailSafeException:
+            return "That click was aborted by the mouse failsafe (cursor hit a screen corner)."
         return f"Clicked at ({x}, {y})."
 
 
@@ -165,11 +226,22 @@ class ScrollSkill(BaseSkill):
         if amount == 0:
             return "There was nothing to scroll."
 
-        if x is not None and y is not None:
-            real_x, real_y = screen_state.to_real(x, y)
-            gui.scroll(amount, x=real_x, y=real_y)
-        else:
-            gui.scroll(amount)
+        try:
+            if x is not None and y is not None:
+                if screen_state.is_stale():
+                    return "That screenshot is too old to scroll from safely — take a fresh one with see_screen first."
+                real_x, real_y = screen_state.to_real(x, y)
+                left, top, right, bottom = _virtual_screen_bounds(gui)
+                if not (left <= real_x < right and top <= real_y < bottom):
+                    return (
+                        f"({x}, {y}) maps outside the current screen — take a "
+                        "fresh screenshot with see_screen and try again."
+                    )
+                gui.scroll(amount, x=real_x, y=real_y)
+            else:
+                gui.scroll(amount)
+        except gui.FailSafeException:
+            return "That scroll was aborted by the mouse failsafe (cursor hit a screen corner)."
 
         direction = "up" if amount >= 0 else "down"
         return f"Scrolled {direction} {abs(amount)} notch(es)."

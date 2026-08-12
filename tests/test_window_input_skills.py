@@ -33,11 +33,17 @@ def windows(monkeypatch):
     return listing
 
 
+class _FailSafeException(Exception):
+    pass
+
+
 @pytest.fixture
 def gui(monkeypatch):
     calls = []
     fake = SimpleNamespace(
         FAILSAFE=True,
+        FailSafeException=_FailSafeException,
+        size=lambda: (1920, 1080),
         write=lambda text, interval=0: calls.append(("write", text)),
         hotkey=lambda *keys: calls.append(("hotkey", keys)),
         click=lambda x=None, y=None, button="left", clicks=1: calls.append(
@@ -47,6 +53,17 @@ def gui(monkeypatch):
         scroll=lambda amount, x=None, y=None: calls.append(("scroll", amount, x, y)),
     )
     monkeypatch.setitem(sys.modules, "pyautogui", fake)
+    # Click/scroll bounds-check against the real virtual-desktop size on
+    # Windows (skills.input_skills._virtual_screen_bounds) — pinned here to
+    # a generous fixed box so the coordinate math in these tests (which
+    # deliberately includes an off-primary-monitor origin) isn't at the
+    # mercy of whatever monitor layout the machine running the suite
+    # actually has. Bounds-rejection itself gets its own tests below, with
+    # this patched to a deliberately small box instead.
+    monkeypatch.setattr(
+        "skills.input_skills._virtual_screen_bounds",
+        lambda gui: (-100_000, -100_000, 100_000, 100_000),
+    )
     return calls
 
 
@@ -95,6 +112,22 @@ def test_close_window_records_no_undo(windows, monkeypatch, journal):
     assert get_journal().latest() is None
 
 
+def test_close_window_confirmation_shows_the_resolved_title(windows):
+    """A short substring that happens to uniquely match must be confirmed
+    against the real window it resolves to, not echoed back verbatim — the
+    user has to know what they're actually agreeing to close."""
+    out = CloseWindowSkill().consequence(title="spot")
+    assert "Spotify" in out
+    assert "'spot'" not in out
+
+
+def test_close_window_confirmation_falls_back_to_the_raw_title_when_unresolved(windows):
+    """No match / an ambiguous match can't be resolved yet at confirm time —
+    must not raise, and should still show something sensible."""
+    out = CloseWindowSkill().consequence(title="nonexistent app")
+    assert "nonexistent app" in out
+
+
 def test_set_window_state_records_undo(windows, monkeypatch, journal):
     states = []
     monkeypatch.setattr("skills.window_skills.window_state", lambda h: "normal")
@@ -122,6 +155,19 @@ def test_type_text(gui):
 def test_press_keys_splits_a_combo(gui):
     PressKeysSkill().run(keys="ctrl+shift+s")
     assert ("hotkey", ("ctrl", "shift", "s")) in gui
+
+
+def test_press_keys_handles_a_trailing_literal_plus(gui):
+    """'+' is both the delimiter and a valid key (e.g. ctrl++ to zoom in) —
+    a plain split() silently drops the trailing literal +."""
+    out = PressKeysSkill().run(keys="ctrl++")
+    assert ("hotkey", ("ctrl", "+")) in gui
+    assert "ctrl+++" not in out  # i.e. it wasn't just echoed back unparsed
+
+
+def test_press_keys_handles_the_bare_plus_key(gui):
+    PressKeysSkill().run(keys="+")
+    assert ("hotkey", ("+",)) in gui
 
 
 def test_click_passes_coordinates(gui):
@@ -196,3 +242,78 @@ def test_scroll_is_moderate_and_irreversible(gui, journal):
     assert ScrollSkill().risk_for(amount=1) == Risk.MODERATE
     ScrollSkill().run(amount=1)
     assert get_journal().latest() is None
+
+
+def test_click_refuses_a_stale_screenshot_mapping(gui, monkeypatch):
+    """A click read off a screenshot from long enough ago that the screen
+    may no longer match it must be refused, not silently aimed at whatever
+    now occupies that stale coordinate."""
+    screen_state.record(scale=1.0, origin_x=0, origin_y=0)
+    monkeypatch.setattr(screen_state, "is_stale", lambda: True)
+    out = ClickSkill().run(x=100, y=50)
+    assert "old" in out.lower()
+    assert gui == []
+
+
+def test_scroll_refuses_a_stale_screenshot_mapping(gui, monkeypatch):
+    screen_state.record(scale=1.0, origin_x=0, origin_y=0)
+    monkeypatch.setattr(screen_state, "is_stale", lambda: True)
+    out = ScrollSkill().run(amount=1, x=100, y=50)
+    assert "old" in out.lower()
+    assert gui == []
+
+
+def test_scroll_without_coordinates_ignores_staleness(gui, monkeypatch):
+    """Staleness only matters for a *positioned* scroll — one with no x/y
+    doesn't touch the mapping at all."""
+    monkeypatch.setattr(screen_state, "is_stale", lambda: True)
+    ScrollSkill().run(amount=1)
+    assert ("scroll", 1, None, None) in gui
+
+
+def test_click_rejects_coordinates_outside_the_virtual_screen(gui, monkeypatch):
+    monkeypatch.setattr(
+        "skills.input_skills._virtual_screen_bounds", lambda gui: (0, 0, 1920, 1080)
+    )
+    out = ClickSkill().run(x=5000, y=5000)
+    assert "outside the current screen" in out
+    assert gui == []
+
+
+def test_scroll_rejects_coordinates_outside_the_virtual_screen(gui, monkeypatch):
+    monkeypatch.setattr(
+        "skills.input_skills._virtual_screen_bounds", lambda gui: (0, 0, 1920, 1080)
+    )
+    out = ScrollSkill().run(amount=1, x=5000, y=5000)
+    assert "outside the current screen" in out
+    assert gui == []
+
+
+def test_click_reports_a_clean_message_when_the_failsafe_fires(gui, monkeypatch):
+    def _raise(*a, **k):
+        raise sys.modules["pyautogui"].FailSafeException("boom")
+
+    monkeypatch.setattr(sys.modules["pyautogui"], "click", _raise)
+    out = ClickSkill().run(x=1, y=1)
+    assert "failsafe" in out.lower()
+
+
+def test_scroll_reports_a_clean_message_when_the_failsafe_fires(gui, monkeypatch):
+    def _raise(*a, **k):
+        raise sys.modules["pyautogui"].FailSafeException("boom")
+
+    monkeypatch.setattr(sys.modules["pyautogui"], "scroll", _raise)
+    out = ScrollSkill().run(amount=1)
+    assert "failsafe" in out.lower()
+
+
+def test_virtual_screen_bounds_covers_a_monitor_left_of_the_primary(monkeypatch):
+    """pyautogui.size() alone only ever reports the primary monitor — a
+    real second monitor placed to the left of it sits at negative
+    coordinates, which a naive (0, 0, width, height) box would wrongly
+    reject. On non-Windows this falls back to gui.size() at origin (0, 0)."""
+    from skills.input_skills import _virtual_screen_bounds
+
+    monkeypatch.setattr("skills.input_skills.IS_WINDOWS", False)
+    fake_gui = SimpleNamespace(size=lambda: (1920, 1080))
+    assert _virtual_screen_bounds(fake_gui) == (0, 0, 1920, 1080)

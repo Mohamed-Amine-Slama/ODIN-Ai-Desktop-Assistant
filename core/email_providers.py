@@ -91,7 +91,7 @@ class GoogleProvider:
             raise ProviderError(
                 "Google needs the 'google-auth-oauthlib' and "
                 "'google-api-python-client' packages. Run: "
-                "pip install -r requirements-email.txt"
+                "pip install -r requirements.txt"
             ) from e
 
         secrets = _google_credentials_path()
@@ -116,7 +116,7 @@ class GoogleProvider:
             raise ProviderError(
                 "Google needs the 'google-auth-oauthlib' and "
                 "'google-api-python-client' packages. Run: "
-                "pip install -r requirements-email.txt"
+                "pip install -r requirements.txt"
             ) from e
 
         token_path = _google_token_path()
@@ -138,7 +138,7 @@ class GoogleProvider:
                 raise ProviderError(
                     "Google needs the 'google-auth-oauthlib' and "
                     "'google-api-python-client' packages. Run: "
-                    "pip install -r requirements-email.txt"
+                    "pip install -r requirements.txt"
                 ) from e
 
             self._service_cache[name] = build(
@@ -260,7 +260,7 @@ class MicrosoftProvider:
             except ImportError as e:
                 raise ProviderError(
                     "Microsoft needs the 'msal' package. Run: "
-                    "pip install -r requirements-email.txt"
+                    "pip install -r requirements.txt"
                 ) from e
 
             cache = msal.SerializableTokenCache()
