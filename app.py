@@ -118,7 +118,7 @@ def main() -> None:
         hud.announce(f"Press {config.HUD_HOTKEY} any time to summon me.")
 
     def shutdown():
-        hud._stop_voice_loop()
+        hud.voice.shutdown()
         hud.telemetry.stop()
         hud.telemetry.wait(2000)
         # dismiss() (the window-close path) already stops this; aboutToQuit

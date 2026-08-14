@@ -12,6 +12,7 @@ never show a dead flat analyser.
 """
 from __future__ import annotations
 
+import itertools
 import math
 import random
 import threading
@@ -86,7 +87,15 @@ class _AudioCapture:
         with self._lock:
             if len(self._buffer) < FFT_WINDOW:
                 return [0.0] * n
-            window = self._np.array(list(self._buffer)[-FFT_WINDOW:], dtype=self._np.float32)
+            # Only the newest FFT_WINDOW samples matter for the FFT below.
+            # reversed() on a deque is O(1) to start and O(FFT_WINDOW) to
+            # drain, vs. O(len(buffer)) (up to 4x more) for list(self._buffer)
+            # — this runs on the UI thread's 30fps tick under a lock shared
+            # with the realtime audio callback in _on_block, so keeping the
+            # critical section short matters more than the sample count alone
+            # would suggest.
+            tail = list(itertools.islice(reversed(self._buffer), FFT_WINDOW))
+        window = self._np.array(tail[::-1], dtype=self._np.float32)
         magnitudes = self._np.abs(self._np.fft.rfft(window))
         usable = magnitudes[: len(magnitudes) // 2 or 1]  # drop the top bins — mostly empty (§5.6)
         bars = []

@@ -222,7 +222,17 @@ def _reveal_panels(window: QWidget, keepalive: list[object], on_done: Callable) 
             w.setGraphicsEffect(None)
             one_done()
 
-        def start(w=widget, sp=start_pos, np=natural_pos) -> None:
+        # cleanup is passed in as a default arg, not left as a free
+        # variable start() would look up by closure — start() only runs
+        # later, via QTimer.singleShot, by which point this whole for loop
+        # has already finished and the bare name `cleanup` (like `widget`
+        # itself, which is why w/sp/np are already defaulted below) would
+        # have been rebound to the *last* iteration's copy. Every widget's
+        # opacity_anim.finished ended up wired to the same last widget's
+        # cleanup — so nothing but the last panel's own reveal ever
+        # completed, remaining never reached 0, and the boot sequence
+        # never advanced past the panel stage.
+        def start(w=widget, sp=start_pos, np=natural_pos, cleanup=cleanup) -> None:
             effect = QGraphicsOpacityEffect(w)
             effect.setOpacity(0.0)
             w.setGraphicsEffect(effect)

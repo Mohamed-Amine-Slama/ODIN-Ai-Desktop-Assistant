@@ -5,71 +5,36 @@ OrbWindow (ui/app_window.py) is unrelated and untouched.
 """
 from __future__ import annotations
 
-import getpass
-import queue
-import threading
-import time
 from collections import deque
 from datetime import datetime
 
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QRadialGradient
+from PyQt6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
-    QGridLayout,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
-    QPushButton,
     QSystemTrayIcon,
-    QVBoxLayout,
     QWidget,
 )
-
-import random
 
 import config
 from core import learning_status
 from core.store import get_store
 from core.undo import get_journal
-from ui.hud import layout, tokens
+from ui.hud import tokens
 from ui.hud.boot import run_boot_sequence
 from ui.hud.confirm import ConfirmationBannerWidget
-from ui.hud.console import ConsoleOverlay
-from ui.hud.radial_gauge import RadialGauge
-from ui.hud.sparkline import Sparkline
-from ui.hud.spectrum import Spectrum
 from ui.hud.telemetry import TelemetryFrame, TelemetryWorker
-from ui.hud.voice_orb import VoiceOrb
+from ui.hud.telemetry_view import TelemetryPresenter
+from ui.hud.voice_loop import VoiceLoopController
 from ui.hud.weather import WeatherSample, WeatherWorker
-from ui.hud.widgets import BarMeter, DockButton, Panel, Readout, TickRuler
-from ui.workers import BrainWorker, SkillLogEntry, UiBridge, VoiceListenWorker, VoiceSetupWorker
+from ui.hud.widgets import BarMeter
+from ui.hud.zones import ZoneBuilderMixin
+from ui.workers import BrainWorker, SkillLogEntry, UiBridge
 
 ANIMATION_FPS = 30
-STATUS_FOR_STATE = {
-    "idle": "STANDING BY",
-    "listening": "LISTENING",
-    "thinking": "PROCESSING",
-    "speaking": "SPEAKING",
-    "learning": "LEARNING",
-    "error": "ERROR",
-    "confirm": "AWAITING AUTHORISATION",
-}
-
-# (glyph, label, preset command) — None means "handled locally", never sent
-# to Brain.ask() (ODIN-HUD.md §6.10).
-DOCK_ITEMS = [
-    ("EXP", "Explorer", "open file explorer"),
-    ("WEB", "Browser", "open my default browser"),
-    ("TERM", "Terminal", "open a terminal"),
-    ("CODE", "Code", "open vs code"),
-    ("MUS", "Music", "open spotify"),
-    ("SET", "Settings", None),
-    ("SYS", "Task Manager", "open task manager"),
-    ("SNAP", "Screenshot", "take a screenshot"),
-    ("CON", "ODIN Console", None),
-]
 
 # Orb ring launchers (§6.7) — a different 8-label set from the dock.
 LAUNCHER_PRESETS = {
@@ -84,127 +49,7 @@ LAUNCHER_PRESETS = {
 }
 
 
-class _CoreStrip(QWidget):
-    """A compact multi-core load meter (§6.2's "per-core BarMeter stack",
-    condensed to fit zone B's real footprint): one thin vertical bar per
-    core, height-encoded, threshold-colored — not 16 full-width BarMeters,
-    which would not fit the panel's allotted height."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._values: list[float] = []
-        self.setFixedHeight(14)
-
-    def set_values(self, values: list[float]) -> None:
-        self._values = values
-        self.update()
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        rect = self.rect()
-        painter.fillRect(rect, tokens.CY_700)
-        if not self._values:
-            painter.end()
-            return
-        n = len(self._values)
-        gap = 2
-        bar_w = max(1.0, (rect.width() - gap * (n - 1)) / n)
-        for i, v in enumerate(self._values):
-            frac = max(0.0, min(1.0, v / 100.0))
-            h = rect.height() * frac
-            x = i * (bar_w + gap)
-            painter.fillRect(QRectF(x, rect.height() - h, bar_w, h), tokens.threshold_color(frac))
-        painter.end()
-
-
-class _Backdrop(QWidget):
-    """The background layer stack from ODIN-HUD.md §4: void fill, a radial
-    vignette pulling the eye to the orb, a faint grid mesh, and scanlines.
-    Previously only the flat void fill was implemented (a plain stylesheet
-    background-color) — the missing three layers are most of what makes the
-    reference imagery read as a dense instrument rather than flat black."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        rect = self.rect()
-
-        painter.fillRect(rect, tokens.VOID)
-
-        vignette = QRadialGradient(rect.width() * 0.5, rect.height() * 0.45, rect.width() * 0.62)
-        vignette.setColorAt(0.0, QColor(10, 60, 90, 56))
-        vignette.setColorAt(1.0, QColor(10, 60, 90, 0))
-        painter.fillRect(rect, vignette)
-
-        painter.setPen(QPen(QColor(11, 95, 135, 14), 1))
-        for x in range(0, rect.width(), 40):
-            painter.drawLine(x, 0, x, rect.height())
-        for y in range(0, rect.height(), 40):
-            painter.drawLine(0, y, rect.width(), y)
-
-        painter.setPen(QPen(QColor(0, 0, 0, 56), 1))
-        for y in range(0, rect.height(), 3):
-            painter.drawLine(0, y, rect.width(), y)
-        painter.end()
-
-
-class _CircuitTraces(QWidget):
-    """The background circuit-trace layer (§4 background stack, layer 5):
-    ~12 hairline 45deg/90deg polylines, purely graphic. Positions are
-    seeded-random rather than snapped to actual panel corners — the spec
-    calls this "purely graphic" chrome, and it's the lowest-priority layer
-    in the whole build order (§9 step 8)."""
-
-    SEGMENT_COUNT = 12
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._segments: list[tuple[float, float, float, float]] = []
-
-    def resizeEvent(self, event) -> None:
-        rng = random.Random(11)
-        w, h = self.width(), self.height()
-        self._segments = []
-        for _ in range(self.SEGMENT_COUNT):
-            x0, y0 = rng.uniform(0.05, 0.95) * w, rng.uniform(0.08, 0.92) * h
-            length = rng.uniform(40, 140)
-            sign = rng.choice((-1, 1))
-            if rng.random() < 0.5:
-                x1, y1 = x0 + sign * length, y0
-            else:
-                x1, y1 = x0, y0 + sign * length
-            self._segments.append((x0, y0, x1, y1))
-        super().resizeEvent(event)
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setPen(QPen(tokens.CY_600, 1))
-        for x0, y0, x1, y1 in self._segments:
-            painter.drawLine(int(x0), int(y0), int(x1), int(y1))
-        painter.end()
-
-
-def _relative_time(delta_seconds: float) -> str:
-    """§6.9's `IN 12M` format. Negative deltas (overdue/fired) render as
-    `3M AGO` instead."""
-    overdue = delta_seconds < 0
-    seconds = abs(delta_seconds)
-    if seconds < 60:
-        value, unit = int(seconds), "S"
-    elif seconds < 3600:
-        value, unit = int(seconds // 60), "M"
-    elif seconds < 86400:
-        value, unit = int(seconds // 3600), "H"
-    else:
-        value, unit = int(seconds // 86400), "D"
-    return f"{value}{unit} AGO" if overdue else f"IN {value}{unit}"
-
-
-class OdinHudWindow(QMainWindow):
+class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
     """The full-screen instrument HUD."""
 
     state_changed = pyqtSignal(str)  # mirrors the old JarvisMainWindow signal, for OrbWindow
@@ -216,18 +61,11 @@ class OdinHudWindow(QMainWindow):
         self.bridge = bridge
 
         self.current_worker: BrainWorker | None = None
-        self._voice_setup_worker: VoiceSetupWorker | None = None
-        self._voice_loop_worker: VoiceListenWorker | None = None
+        self.voice = VoiceLoopController(session, bridge, parent=self)
         self._skill_log: deque[SkillLogEntry] = deque(maxlen=6)
         self._confirm_banner: ConfirmationBannerWidget | None = None
         self._odin_reply_parts: list[str] = []
-        self._mic_queue = None
-        self._mic_timer: QTimer | None = None
-        self._mic_smoothed = 0.0
-        self._latest_frame: TelemetryFrame | None = None
-        self._disk_bars: dict[str, BarMeter] = {}
         self._knowledge_rows: list[QWidget] = []
-        self._notes_rows: list[QWidget] = []
         self._active_learning: tuple[str, str, float] | None = None
         self._boot_anims = None
         self._shown_once = False
@@ -251,326 +89,22 @@ class OdinHudWindow(QMainWindow):
 
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._on_animation_tick)
-        self._last_tick = time.monotonic()
+
+        # _build_zone_f (ui/hud/zones.py) calls self._on_clock_tick()
+        # synchronously during _build_ui() to paint the clock once before
+        # its 1s timer's first tick — telemetry_view must exist first.
+        self.telemetry_view = TelemetryPresenter(self)
 
         self._build_ui()
         self._init_tray()
         self._wire_bridge()
+        self._wire_voice()
         self._refresh_knowledge_panel()
         self._refresh_notes_panel()
 
         learning_status.set_callback(self.bridge.report_learning_progress)
 
     # -- construction --------------------------------------------------
-
-    def _build_ui(self) -> None:
-        root = QWidget(self)
-        self.setCentralWidget(root)
-
-        self._backdrop = _Backdrop(root)
-        self._backdrop.setGeometry(0, 0, self.width(), self.height())
-
-        self._circuit_traces = _CircuitTraces(root)
-        self._circuit_traces.setGeometry(0, 0, self.width(), self.height())
-        # Stacking order, bottom to top: backdrop, then circuit traces, then
-        # the grid of panels — lower() each in reverse so the last call
-        # (backdrop) ends up at the very bottom.
-        self._circuit_traces.lower()
-        self._backdrop.lower()
-
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        self._confirm_slot = QVBoxLayout()
-        self._confirm_slot.setContentsMargins(*layout.GRID_MARGINS)
-        outer.addLayout(self._confirm_slot)
-
-        grid_host = QWidget(root)
-        outer.addWidget(grid_host, 1)
-        grid = QGridLayout(grid_host)
-        grid.setContentsMargins(*layout.GRID_MARGINS)
-        grid.setHorizontalSpacing(layout.GRID_GAP)
-        grid.setVerticalSpacing(layout.GRID_GAP)
-        for col in range(layout.GRID_COLUMNS):
-            grid.setColumnStretch(col, 1)
-        for row in range(layout.GRID_ROWS):
-            grid.setRowStretch(row, 1)
-
-        # Collected for the boot sequence's staggered per-panel reveal
-        # (ui/hud/boot.py, ODIN-HUD.md §8) — every zone panel except D,
-        # which is the orb column: the orb gets its own dedicated
-        # scale-in + ignition animation, but the four gauges flanking it
-        # join the normal panel stagger individually.
-        self._boot_reveal_widgets: list[QWidget] = []
-        for zone, builder in (
-            ("A", self._build_zone_a),
-            ("B", self._build_zone_b),
-            ("C", self._build_zone_c),
-            ("C2", self._build_zone_c2),
-            ("E", self._build_zone_e),
-            ("E2", self._build_zone_e2),
-            ("F", self._build_zone_f),
-            ("G", self._build_zone_g),
-            ("H", self._build_zone_h),
-            ("I", self._build_zone_i),
-            ("J", self._build_zone_j),
-            ("K", self._build_zone_k),
-            ("L", self._build_zone_l),
-            ("M", self._build_zone_m),
-        ):
-            widget = builder()
-            self._boot_reveal_widgets.append(widget)
-            layout.place(grid, widget, zone)
-
-        layout.place(grid, self._build_zone_d(), "D")
-        self._boot_reveal_widgets.extend(
-            [self.gauge_cpu, self.gauge_ram, self.gauge_disk, self.gauge_gpu, self.orb_status_label]
-        )
-
-        self._root = root
-        self.console = ConsoleOverlay(root)
-        self.console.submitted.connect(self._launch_preset)
-        self.console.slash_command.connect(self._handle_slash_command)
-        self.console.move(
-            (self.width() - self.console.width()) // 2,
-            (self.height() - self.console.height()) // 2,
-        )
-
-    def _build_zone_a(self) -> QWidget:
-        row = QWidget(self)
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(16)
-
-        wordmark = QLabel(config.ASSISTANT_NAME.upper(), row)
-        wordmark.setFont(tokens.font_display())
-        wordmark.setStyleSheet(f"color: {tokens.CY_100.name()};")
-        h.addWidget(wordmark, 0)
-
-        version = QLabel("v2.0", row)
-        version.setFont(tokens.font_label(tokens.T_MICRO))
-        version.setStyleSheet(f"color: {tokens.CY_500.name()};")
-        h.addWidget(version, 0)
-
-        self.ruler = TickRuler(row)
-        h.addWidget(self.ruler, 1)
-
-        self.user_label = QLabel(f"USER: {getpass.getuser().upper()}", row)
-        self.user_label.setFont(tokens.font_data(tokens.T_MICRO))
-        self.user_label.setStyleSheet(f"color: {tokens.CY_500.name()};")
-        h.addWidget(self.user_label, 0)
-
-        self.uptime_label = QLabel("UP --", row)
-        self.uptime_label.setFont(tokens.font_data(tokens.T_MICRO))
-        self.uptime_label.setStyleSheet(f"color: {tokens.CY_500.name()};")
-        h.addWidget(self.uptime_label, 0)
-
-        self.link_pip = QLabel("●", row)
-        self.link_pip.setStyleSheet(f"color: {tokens.CY_600.name()}; font-size: 10px;")
-        h.addWidget(self.link_pip, 0)
-
-        # A real, always-clickable way to hide the HUD. Esc does the same
-        # thing, but a frameless always-on-top window can't be relied on to
-        # always hold keyboard focus, so this must not be the only way out.
-        close_btn = QPushButton("✕ HIDE", row)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setFont(tokens.font_label(tokens.T_MICRO))
-        close_btn.setStyleSheet(
-            f"QPushButton {{ background: rgba(53,200,245,20); border: 1px solid {tokens.CY_500.name()};"
-            f" color: {tokens.CY_200.name()}; padding: 4px 12px; }}"
-            f"QPushButton:hover {{ background: rgba(255,68,68,60); border: 1px solid {tokens.CRIT.name()};"
-            f" color: {tokens.CY_100.name()}; }}"
-        )
-        close_btn.clicked.connect(self.dismiss)
-        h.addWidget(close_btn, 0)
-        return row
-
-    def _build_zone_b(self) -> QWidget:
-        panel = Panel("CPU", self)
-        self.cpu_bar = BarMeter("CPU")
-        panel.body_layout.addWidget(self.cpu_bar)
-        self.cpu_freq = Readout("FREQ")
-        panel.body_layout.addWidget(self.cpu_freq)
-        self.core_strip = _CoreStrip(panel.body)
-        panel.body_layout.addWidget(self.core_strip)
-        self.cpu_processes = Readout("PROCESSES")
-        panel.body_layout.addWidget(self.cpu_processes)
-        self.cpu_top_rows = [Readout("--") for _ in range(1)]
-        for row in self.cpu_top_rows:
-            panel.body_layout.addWidget(row)
-        panel.body_layout.addStretch(1)
-        return panel
-
-    def _build_zone_c(self) -> QWidget:
-        panel = Panel("MEMORY", self)
-        self.ram_bar = BarMeter("RAM")
-        panel.body_layout.addWidget(self.ram_bar)
-        self.ram_spark = Sparkline("%")
-        panel.body_layout.addWidget(self.ram_spark, 1)
-        self.swap_bar = BarMeter("SWAP")
-        panel.body_layout.addWidget(self.swap_bar)
-        return panel
-
-    def _build_zone_c2(self) -> QWidget:
-        panel = Panel("STORAGE", self)
-        self._storage_panel = panel
-        self.disk_io_read = Readout("READ")
-        self.disk_io_write = Readout("WRITE")
-        panel.body_layout.addWidget(self.disk_io_read)
-        panel.body_layout.addWidget(self.disk_io_write)
-        panel.body_layout.addStretch(1)
-        return panel
-
-    def _build_zone_d(self) -> QWidget:
-        # The orb plus its four flanking corner gauges (§5.2's "four gauges
-        # flanking the orb"), laid out as a 3-col grid: gauges in the outer
-        # columns' top/bottom rows, the orb spanning the full height of the
-        # center column.
-        column = QWidget(self)
-        grid = QGridLayout(column)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(10)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 3)
-        grid.setColumnStretch(2, 1)
-        for r in range(3):
-            grid.setRowStretch(r, 1)
-
-        self.gauge_cpu = RadialGauge("CPU")
-        self.gauge_ram = RadialGauge("RAM")
-        self.gauge_disk = RadialGauge("DISK")
-        self.gauge_gpu = RadialGauge("GPU")
-        grid.addWidget(self.gauge_cpu, 0, 0)
-        grid.addWidget(self.gauge_disk, 0, 2)
-        grid.addWidget(self.gauge_ram, 2, 0)
-        grid.addWidget(self.gauge_gpu, 2, 2)
-
-        self.orb = VoiceOrb(column)
-        self.orb.status_changed.connect(self._on_orb_status)
-        self.orb.launcher_clicked.connect(self._on_launcher_clicked)
-        grid.addWidget(self.orb, 0, 1, 3, 1)
-
-        self.orb_status_label = QLabel(STATUS_FOR_STATE["idle"], column)
-        self.orb_status_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.orb_status_label.setFont(tokens.font_label(tokens.T_LABEL))
-        self.orb_status_label.setStyleSheet(f"color: {tokens.CY_300.name()};")
-        grid.addWidget(self.orb_status_label, 3, 0, 1, 3)
-        return column
-
-    def _build_zone_e(self) -> QWidget:
-        panel = Panel("TRANSCRIPT", self)
-        self.transcript_user = QLabel("", panel.body)
-        self.transcript_user.setWordWrap(True)
-        self.transcript_user.setFont(tokens.font_data(tokens.T_BODY))
-        self.transcript_user.setStyleSheet(f"color: {tokens.CY_500.name()};")
-        panel.body_layout.addWidget(self.transcript_user)
-
-        self.transcript_odin = QLabel("", panel.body)
-        self.transcript_odin.setWordWrap(True)
-        self.transcript_odin.setFont(tokens.font_data(tokens.T_BODY))
-        self.transcript_odin.setStyleSheet(f"color: {tokens.CY_200.name()};")
-        self.transcript_odin.setProperty("aria-live", "polite")
-        panel.body_layout.addWidget(self.transcript_odin)
-        panel.body_layout.addStretch(1)
-        return panel
-
-    def _build_zone_e2(self) -> QWidget:
-        panel = Panel("SKILL ACTIVITY", self)
-        self._skill_log_panel = panel
-        self._skill_log_rows: list[QLabel] = []
-        return panel
-
-    def _build_zone_f(self) -> QWidget:
-        panel = Panel("CLOCK", self)
-        self.clock_label = QLabel("--:--:--", panel.body)
-        self.clock_label.setFont(tokens.font_data(tokens.T_XL))
-        self.clock_label.setStyleSheet(f"color: {tokens.CY_100.name()};")
-        panel.body_layout.addWidget(self.clock_label)
-        self.date_label = QLabel("", panel.body)
-        self.date_label.setFont(tokens.font_label(tokens.T_LABEL))
-        self.date_label.setStyleSheet(f"color: {tokens.CY_500.name()};")
-        panel.body_layout.addWidget(self.date_label)
-
-        self._clock_timer = QTimer(self)
-        self._clock_timer.timeout.connect(self._on_clock_tick)
-        self._clock_timer.start(1000)
-        self._on_clock_tick()
-        return panel
-
-    def _build_zone_g(self) -> QWidget:
-        panel = Panel("WEATHER", self)
-        self.weather_temp = QLabel("--°", panel.body)
-        self.weather_temp.setFont(tokens.font_data(tokens.T_LG))
-        self.weather_temp.setStyleSheet(f"color: {tokens.CY_100.name()};")
-        panel.body_layout.addWidget(self.weather_temp)
-
-        self.weather_condition = QLabel("--", panel.body)
-        self.weather_condition.setFont(tokens.font_label(tokens.T_LABEL))
-        self.weather_condition.setStyleSheet(f"color: {tokens.CY_500.name()};")
-        panel.body_layout.addWidget(self.weather_condition)
-
-        # Humidity/feels-like and wind/pressure are paired into one row each
-        # — five separate Readouts didn't fit this panel's real budget
-        # (§4's zone table gives it one row's worth of pixels; see
-        # ui/hud/layout.py's rebalancing note).
-        self.weather_humidity_feels = Readout("HUMID/FEELS")
-        self.weather_wind_pressure = Readout("WIND/PRESS")
-        self.weather_sun = Readout("SUN")
-        for row in (self.weather_humidity_feels, self.weather_wind_pressure, self.weather_sun):
-            panel.body_layout.addWidget(row)
-        panel.body_layout.addStretch(1)
-        return panel
-
-    def _build_zone_h(self) -> QWidget:
-        panel = Panel("THERMALS", self)
-        self.temp_cpu = Readout("CPU TEMP")
-        self.temp_gpu = Readout("GPU TEMP")
-        self.temp_gpu_load = Readout("GPU LOAD")
-        self.temp_vram = Readout("GPU VRAM")
-        self.temp_fan = Readout("FAN")
-        for row in (self.temp_cpu, self.temp_gpu, self.temp_gpu_load, self.temp_vram, self.temp_fan):
-            panel.body_layout.addWidget(row)
-        return panel
-
-    def _build_zone_i(self) -> QWidget:
-        panel = Panel("NETWORK", self)
-        self.net_ip = Readout("IP")
-        panel.body_layout.addWidget(self.net_ip)
-        self.net_up_spark = Sparkline("KB/S")
-        panel.body_layout.addWidget(self.net_up_spark, 1)
-        self.net_down_spark = Sparkline("KB/S")
-        panel.body_layout.addWidget(self.net_down_spark, 1)
-        return panel
-
-    def _build_zone_j(self) -> QWidget:
-        panel = Panel("KNOWLEDGE BASE", self)
-        self._knowledge_panel = panel
-        return panel
-
-    def _build_zone_k(self) -> QWidget:
-        panel = Panel("AUDIO", self)
-        self.spectrum = Spectrum(panel.body)
-        panel.body_layout.addWidget(self.spectrum, 1)
-        return panel
-
-    def _build_zone_l(self) -> QWidget:
-        panel = Panel("NOTES", self)
-        self._notes_panel = panel
-        return panel
-
-    def _build_zone_m(self) -> QWidget:
-        row = QWidget(self)
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(20)
-        h.addStretch(1)
-        for glyph, label, preset in DOCK_ITEMS:
-            button = DockButton(glyph, label, row)
-            button.clicked.connect(lambda checked=False, g=glyph, p=preset: self._on_dock_clicked(g, p))
-            h.addWidget(button)
-        h.addStretch(1)
-        return row
 
     def _init_tray(self) -> None:
         self.tray_icon = QSystemTrayIcon(self)
@@ -590,7 +124,7 @@ class OdinHudWindow(QMainWindow):
         menu = QMenu(self)
         for text, slot in (
             (f"Show {config.ASSISTANT_NAME}", self.show_and_activate),
-            ("Toggle voice / text mode", self._toggle_mode),
+            ("Toggle voice / text mode", self.voice.toggle_mode),
             ("Clear conversation", self.trigger_reset),
         ):
             action = QAction(text, self)
@@ -615,6 +149,16 @@ class OdinHudWindow(QMainWindow):
         self.bridge.mic_rms.connect(self.orb.set_mic_level)
         self.bridge.learning_progress.connect(self._on_learning_progress)
         self.bridge.kb_changed.connect(self._on_kb_changed)
+
+    def _wire_voice(self) -> None:
+        self.voice.heard.connect(self._on_voice_heard)
+        self.voice.state_changed.connect(self._on_voice_state)
+        self.voice.status_message.connect(self.console.echo)
+        self.voice.greeting_ready.connect(self._on_voice_greeting)
+
+    def _on_voice_greeting(self, text: str) -> None:
+        self.transcript_odin.setText(text)
+        self.console.echo(text)
 
     # -- window lifecycle --------------------------------------------------
 
@@ -659,7 +203,7 @@ class OdinHudWindow(QMainWindow):
         if not self.telemetry.isRunning():
             self.telemetry.start()
         if not self._anim_timer.isActive():
-            self._last_tick = time.monotonic()
+            self.telemetry_view.reset_animation_clock()
             self._anim_timer.start(int(1000 / ANIMATION_FPS))
         if not self.weather.isRunning():
             self.weather.start()
@@ -668,8 +212,9 @@ class OdinHudWindow(QMainWindow):
         self.spectrum.start_capture()
         if not self._shown_once:
             self._shown_once = True
-            self.transcript_odin.setText(f"{config.ASSISTANT_NAME} online. Say the word, or open the console.")
+            self.transcript_odin.setText(f"{config.ASSISTANT_NAME} is waking up…")
             run_boot_sequence(self)
+            self.voice.start_on_boot()
 
     def dismiss(self) -> None:
         self.telemetry.stop()
@@ -679,7 +224,7 @@ class OdinHudWindow(QMainWindow):
         self._notes_timer.stop()
         self._anim_timer.stop()
         self.spectrum.stop_capture()
-        self._stop_mic_meter()
+        self.voice.stop_mic_meter()
         self.hide()
 
     def keyPressEvent(self, event) -> None:
@@ -705,164 +250,25 @@ class OdinHudWindow(QMainWindow):
     # -- shared ~30fps animation loop (ODIN-HUD.md §10) ---------------------
 
     def _on_animation_tick(self) -> None:
-        now = time.monotonic()
-        dt = now - self._last_tick
-        self._last_tick = now
-        self.orb.advance(dt)
-        self.spectrum.advance(dt)
+        self.telemetry_view.advance_animation()
 
     # -- telemetry -----------------------------------------------------
 
     def _on_frame(self, frame: TelemetryFrame) -> None:
-        self._latest_frame = frame
-
-        self.cpu_bar.set_value(frame.cpu.percent / 100, f"{frame.cpu.percent:.0f}%")
-        self.cpu_freq.set_value("--" if frame.cpu.freq_mhz is None else f"{frame.cpu.freq_mhz} MHZ")
-        self.core_strip.set_values(frame.cpu.per_core)
-        self.cpu_processes.set_value(str(frame.cpu.processes))
-        for i, row in enumerate(self.cpu_top_rows):
-            if i < len(frame.cpu.top):
-                name, cpu = frame.cpu.top[i]
-                row.set_label(name[:18])
-                row.set_value(f"{cpu:.0f}%")
-            else:
-                row.set_label("--")
-                row.set_value("--")
-
-        self.ram_bar.set_value(frame.mem.percent / 100, f"{frame.mem.percent:.0f}%")
-        self.ram_spark.push(frame.mem.percent)
-        self.swap_bar.set_value(frame.mem.swap_percent / 100, f"{frame.mem.swap_percent:.0f}%")
-
-        self.gauge_cpu.set_percent(frame.cpu.percent)
-        self.gauge_ram.set_percent(frame.mem.percent)
-        self.gauge_disk.set_percent(frame.disks[0].percent if frame.disks else None)
-        self.gauge_gpu.set_percent(frame.thermals.gpu_load)
-
-        self._update_disks(frame.disks)
-        self.disk_io_read.set_value(f"{frame.disk_io.read_mbs:.1f} MB/S")
-        self.disk_io_write.set_value(f"{frame.disk_io.write_mbs:.1f} MB/S")
-
-        self.net_ip.set_value(frame.net.ip or "--")
-        self.net_up_spark.push(frame.net.up_kbs)
-        self.net_down_spark.push(frame.net.down_kbs)
-
-        self.temp_cpu.set_value("--" if frame.thermals.cpu_c is None else f"{frame.thermals.cpu_c:.0f}°C")
-        self.temp_gpu.set_value("--" if frame.thermals.gpu_c is None else f"{frame.thermals.gpu_c:.0f}°C")
-        self.temp_gpu_load.set_value(
-            "--" if frame.thermals.gpu_load is None else f"{frame.thermals.gpu_load:.0f}%"
-        )
-        self.temp_vram.set_value(
-            "--" if frame.thermals.gpu_vram_percent is None else f"{frame.thermals.gpu_vram_percent:.0f}%"
-        )
-        self.temp_fan.set_value("--" if frame.thermals.fan_rpm is None else f"{frame.thermals.fan_rpm:.0f} RPM")
-
-        d = int(frame.uptime_sec // 86400)
-        h = int((frame.uptime_sec % 86400) // 3600)
-        m = int((frame.uptime_sec % 3600) // 60)
-        self.uptime_label.setText(f"UP {d}D {h}H {m}M")
-        self.link_pip.setStyleSheet(f"color: {tokens.OK.name()}; font-size: 10px;")
-
-        if self.orb.state not in ("thinking", "learning"):
-            load = 0.5 * frame.cpu.percent / 100 + 0.3 * frame.mem.percent / 100 + 0.2 * min(
-                (frame.disk_io.read_mbs + frame.disk_io.write_mbs) / 50, 1.0
-            )
-            self.orb.set_system_load(load)
-
-    def _update_disks(self, disks) -> None:
-        seen = set()
-        for disk in disks:
-            seen.add(disk.mount)
-            bar = self._disk_bars.get(disk.mount)
-            if bar is None:
-                bar = BarMeter(disk.mount)
-                self._disk_bars[disk.mount] = bar
-                self._storage_panel.body_layout.insertWidget(len(self._disk_bars) - 1, bar)
-            bar.set_value(disk.percent / 100, f"{disk.used_gb:.0f}/{disk.total_gb:.0f} GB")
-        for mount in list(self._disk_bars):
-            if mount not in seen:
-                widget = self._disk_bars.pop(mount)
-                widget.setParent(None)
-                widget.deleteLater()
+        self.telemetry_view.render_frame(frame)
 
     def _on_clock_tick(self) -> None:
-        now = datetime.now()
-        self.clock_label.setText(now.strftime("%H:%M:%S"))
-        self.date_label.setText(now.strftime("%A · %d %b %Y").upper())
+        self.telemetry_view.render_clock()
 
     # -- weather ---------------------------------------------------------
 
     def _on_weather(self, sample: WeatherSample | None) -> None:
-        if sample is None:
-            self.weather_temp.setText("--°")
-            self.weather_condition.setText("NO SIGNAL")
-            self.weather_humidity_feels.set_value("--")
-            self.weather_wind_pressure.set_value("--")
-            self.weather_sun.set_value("--")
-            return
-
-        self.weather_temp.setText("--°" if sample.temp_c is None else f"{sample.temp_c:.0f}°C")
-        self.weather_condition.setText((sample.condition or "--").strip().upper())
-
-        humidity = "--" if sample.humidity is None else f"{sample.humidity:.0f}%"
-        feels = "--" if sample.feels_like_c is None else f"{sample.feels_like_c:.0f}°C"
-        self.weather_humidity_feels.set_value(f"{humidity} / {feels}")
-
-        wind = "--" if sample.wind_kph is None else f"{sample.wind_kph:.0f}KM/H"
-        pressure = "--" if sample.pressure_mb is None else f"{sample.pressure_mb:.0f}MB"
-        self.weather_wind_pressure.set_value(f"{wind} / {pressure}")
-
-        sun = f"{sample.sunrise} / {sample.sunset}" if sample.sunrise and sample.sunset else "--"
-        self.weather_sun.set_value(sun)
+        self.telemetry_view.render_weather(sample)
 
     # -- notes / reminders -------------------------------------------------
 
     def _refresh_notes_panel(self) -> None:
-        panel = self._notes_panel
-        for row in self._notes_rows:
-            row.setParent(None)
-            row.deleteLater()
-        self._notes_rows = []
-
-        store = get_store()
-        notes = store.list_notes()
-        reminders = store.pending_reminders()
-        now = time.time()
-
-        if not notes and not reminders:
-            empty = QLabel("NOTHING SAVED.", panel.body)
-            empty.setFont(tokens.font_label(tokens.T_MICRO))
-            empty.setStyleSheet(f"color: {tokens.CY_600.name()};")
-            panel.body_layout.addWidget(empty)
-            self._notes_rows.append(empty)
-            return
-
-        # This panel gets one grid row's worth of pixels (§4's spec table
-        # gave it two; see ui/hud/layout.py's rebalancing note) — reminders
-        # win the limited space since they're time-sensitive, notes fill
-        # whatever's left.
-        max_items = 2
-        shown_reminders = reminders[:max_items]
-        remaining_slots = max_items - len(shown_reminders)
-        shown_notes = notes[-remaining_slots:] if remaining_slots > 0 else []
-
-        for reminder in shown_reminders:
-            remaining = reminder["fire_at"] - now
-            overdue = remaining < 0
-            text = f"{reminder['message']} — {_relative_time(remaining)}"
-            label = QLabel(text, panel.body)
-            label.setWordWrap(True)
-            label.setFont(tokens.font_data(tokens.T_MICRO))
-            label.setStyleSheet(f"color: {tokens.WARN.name() if overdue else tokens.CY_200.name()};")
-            panel.body_layout.addWidget(label)
-            self._notes_rows.append(label)
-
-        for note in shown_notes:
-            label = QLabel(note["text"], panel.body)
-            label.setWordWrap(True)
-            label.setFont(tokens.font_data(tokens.T_MICRO))
-            label.setStyleSheet(f"color: {tokens.CY_500.name()};")
-            panel.body_layout.addWidget(label)
-            self._notes_rows.append(label)
+        self.telemetry_view.refresh_notes_panel()
 
     # -- orb / bridge event handling ----------------------------------------
 
@@ -1010,9 +416,9 @@ class OdinHudWindow(QMainWindow):
         elif command in ("/reset", "/forget"):
             self.trigger_reset()
         elif command == "/mode voice":
-            self._switch_to_voice()
+            self.voice.switch_to_voice()
         elif command == "/mode text":
-            self._switch_to_text()
+            self.voice.switch_to_text()
         elif command in ("/quit", "/exit"):
             QApplication.instance().quit()
         else:
@@ -1090,72 +496,17 @@ class OdinHudWindow(QMainWindow):
     def _finish_turn(self) -> None:
         self.current_worker = None
         self.set_status("idle")
-        if self._voice_loop_worker is not None:
-            threading.Thread(target=self._resume_voice_after_speech, daemon=True).start()
-
-    def _resume_voice_after_speech(self) -> None:
-        self.session.speaker.wait(timeout=60)
-        if self._voice_loop_worker is not None:
-            self._voice_loop_worker.resume()
+        self.voice.notify_turn_finished()
 
     # -- voice mode ------------------------------------------------------
-
-    def _toggle_mode(self) -> None:
-        if self.session.mode == "voice":
-            self._switch_to_text()
-        else:
-            self._switch_to_voice()
-
-    def _switch_to_text(self) -> None:
-        self._stop_voice_loop()
-        self.console.echo(self.session.set_mode("text"))
-
-    def _switch_to_voice(self) -> None:
-        if self._voice_setup_worker is not None or self._voice_loop_worker is not None:
-            # Reachable via /mode voice typed twice, not just the dock
-            # toggle (which already checks session.mode) — without this, a
-            # second call here would overwrite _voice_loop_worker with a
-            # new VoiceListenWorker while the first is still running,
-            # leaking its thread and duplicating every transcription.
-            return
-        self.console.echo("Starting microphone and loading speech models…")
-        worker = VoiceSetupWorker(self.session, self)
-        self._voice_setup_worker = worker
-        worker.finished_ok.connect(self._on_voice_ready)
-        worker.failed.connect(self._on_voice_setup_failed)
-        worker.start()
-
-    def _on_voice_ready(self, message: str) -> None:
-        self._voice_setup_worker = None
-        self.console.echo(message)
-        self._start_voice_loop()
-        self._start_mic_meter()
-
-    def _on_voice_setup_failed(self, message: str) -> None:
-        self._voice_setup_worker = None
-        self.console.echo(message)
-
-    def _start_voice_loop(self) -> None:
-        worker = VoiceListenWorker(self.session, self)
-        self._voice_loop_worker = worker
-        worker.heard.connect(self._on_voice_heard)
-        worker.state_changed.connect(self._on_voice_state)
-        worker.start()
-
-    def _stop_voice_loop(self) -> None:
-        if self._voice_loop_worker is not None:
-            self._voice_loop_worker.stop()
-            self._voice_loop_worker.wait(2000)
-            self._voice_loop_worker = None
-        self._stop_mic_meter()
 
     def _on_voice_state(self, state: str) -> None:
         if self.session.mode == "voice" and self.current_worker is None:
             self.set_status(state)
             if state == "listening":
-                self._start_mic_meter()
+                self.voice.start_mic_meter()
             else:
-                self._stop_mic_meter()
+                self.voice.stop_mic_meter()
 
     def _on_voice_heard(self, text: str) -> None:
         if self.session.mode != "voice" or self.current_worker is not None:
@@ -1164,47 +515,6 @@ class OdinHudWindow(QMainWindow):
             # could both start a BrainWorker, racing on self.brain's shared
             # history and the UiBridge's single confirm() Event.
             return
-        self._stop_mic_meter()
+        self.voice.stop_mic_meter()
         self.transcript_user.setText(text)
         self._process_user_turn(text)
-
-    # -- mic amplitude, ~20Hz while listening (§5.3) -------------------------
-
-    def _start_mic_meter(self) -> None:
-        if self._mic_timer is not None or self.session.mic is None:
-            return
-        try:
-            import numpy  # noqa: F401 - only imported to confirm it's actually available
-        except ImportError:
-            return
-        self._mic_queue = self.session.mic.subscribe()
-        self._mic_smoothed = 0.0
-        self._mic_timer = QTimer(self)
-        self._mic_timer.timeout.connect(self._on_mic_tick)
-        self._mic_timer.start(50)
-
-    def _stop_mic_meter(self) -> None:
-        if self._mic_timer is not None:
-            self._mic_timer.stop()
-            self._mic_timer = None
-        if self._mic_queue is not None and self.session.mic is not None:
-            self.session.mic.unsubscribe(self._mic_queue)
-        self._mic_queue = None
-
-    def _on_mic_tick(self) -> None:
-        if self._mic_queue is None:
-            return
-        import numpy as np
-
-        from core.audio import rms
-
-        level = None
-        while True:
-            try:
-                block = self._mic_queue.get_nowait()
-            except queue.Empty:
-                break
-            level = rms(block, np)
-        if level is not None:
-            self._mic_smoothed += (level - self._mic_smoothed) * 0.5  # ~60ms smoothing at 20Hz
-            self.bridge.mic_rms.emit(min(1.0, self._mic_smoothed * 4))

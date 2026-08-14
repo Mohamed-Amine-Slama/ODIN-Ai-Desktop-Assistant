@@ -7,6 +7,18 @@ third party. Recording stops on silence rather than after a fixed timeout.
 import config
 from core.audio import Microphone, MicrophoneUnavailable, rms
 
+# Blocks at the start of every _record() call spent bootstrapping the noise
+# floor rather than being judged as possible speech — see _record's comment.
+# The first couple of blocks off a *freshly subscribed* queue reliably read
+# near-zero regardless of the room (confirmed live: 0.0000/0.0004 for two
+# blocks before jumping to the room's real ~0.01-0.03 level) — some initial
+# buffering/latency in the callback delivering into a brand new queue, not
+# real silence — so those are skipped rather than calibrated from. The
+# blocks after that are sampled and the *median* (not a blend) is used, so
+# one atypical block can't skew the seed the way a single early reading did.
+_FLOOR_CALIBRATION_SKIP_BLOCKS = 2   # ~160ms: discarded, not representative
+_FLOOR_CALIBRATION_SAMPLE_BLOCKS = 6  # ~480ms: sampled for the median seed
+
 
 class SpeechInput:
     def __init__(self, mic: Microphone | None = None):
@@ -59,15 +71,38 @@ class SpeechInput:
         collected = []
         silent_run = 0
         heard_speech = False
+        calibration_samples: list[float] = []
+        calibration_end = _FLOOR_CALIBRATION_SKIP_BLOCKS + _FLOOR_CALIBRATION_SAMPLE_BLOCKS
 
         try:
-            for _ in range(max_blocks):
+            for i in range(max_blocks):
                 try:
                     block = q.get(timeout=1.0)
                 except Exception:
                     break
 
                 level = rms(block, np)
+
+                if i < calibration_end:
+                    # Bootstrap the floor from a few fresh blocks instead of
+                    # letting it drift up slowly (see _threshold's docstring)
+                    # from wherever it was left. A room's ordinary ambient
+                    # level can already sit above the 0.012 floor below, and
+                    # an unconverged estimate lets that plain noise read as
+                    # "speech" almost immediately — confirmed live, a quiet
+                    # room's own background noise crossed the threshold
+                    # within half a second on a fresh floor. These blocks
+                    # are still kept below (not discarded) in case the user
+                    # started talking with no leading silence at all.
+                    collected.append(block)
+                    if i >= _FLOOR_CALIBRATION_SKIP_BLOCKS:
+                        calibration_samples.append(level)
+                        if i == calibration_end - 1:
+                            calibration_samples.sort()
+                            mid = len(calibration_samples) // 2
+                            self._noise_floor = calibration_samples[mid]
+                    continue
+
                 threshold = self._threshold(level, heard_speech)
 
                 if level >= threshold:
@@ -106,11 +141,26 @@ class SpeechInput:
             # level, and steady-volume continuous speech barely nudges the
             # floor away from that self-referential trap on the blocks right
             # after — so heard_speech can stay false for the whole recording
-            # instead of just missing one block.
+            # instead of just missing one block. In practice _record()'s own
+            # calibration burst seeds this before speech-detection ever
+            # starts, so this branch is now just a safety net.
             self._noise_floor = 0.0
+        updated = 0.9 * self._noise_floor + 0.1 * level
         if not heard_speech:
             # Slow decay toward the current ambient level.
-            self._noise_floor = 0.9 * self._noise_floor + 0.1 * level
+            self._noise_floor = updated
+        else:
+            # While heard_speech is True the floor otherwise stays frozen at
+            # whatever it was the instant speech started — if that value
+            # ends up below the room's real ambient level (a bad
+            # calibration, or the room got quieter), ordinary background
+            # noise then permanently reads as "still speaking" for the rest
+            # of the recording, since it never again reads as "returned to
+            # silence." Letting the floor keep decaying *toward* quieter
+            # blocks (never up, so loud speech itself still can't corrupt
+            # it) gives a bad seed a chance to self-correct instead of
+            # staying wrong for the rest of the call.
+            self._noise_floor = min(self._noise_floor, updated)
         return max(self._noise_floor * 3.0, 0.012)
 
 

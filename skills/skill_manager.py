@@ -141,7 +141,15 @@ class SkillManager:
             skill = cls()
             self.skills[skill.name] = skill
 
-    def tool_definitions(self) -> list[dict]:
+        # self.skills is only ever populated above, never mutated afterward,
+        # so both tool-definition shapes are fixed for the manager's whole
+        # lifetime — built once here instead of reallocated on every model
+        # call (once per tool-iteration round trip, up to
+        # config.MAX_TOOL_ITERATIONS times per turn).
+        self._tool_definitions = self._build_tool_definitions()
+        self._openai_tool_definitions = self._build_openai_tool_definitions()
+
+    def _build_tool_definitions(self) -> list[dict]:
         """Anthropic shape: local skills first, then server tools. Order is
         deterministic so the rendered tool block stays byte-identical across
         requests, which is what keeps the prompt cache warm.
@@ -154,8 +162,7 @@ class SkillManager:
         local = [s.to_tool_definition() for s in self.skills.values() if s.name not in reserved]
         return local + list(SERVER_TOOLS)
 
-    def openai_tool_definitions(self) -> list[dict]:
-        """Expose local skills formatted as OpenAI tools."""
+    def _build_openai_tool_definitions(self) -> list[dict]:
         tools = []
         for s in self.skills.values():
             tools.append({
@@ -167,6 +174,13 @@ class SkillManager:
                 },
             })
         return tools
+
+    def tool_definitions(self) -> list[dict]:
+        return self._tool_definitions
+
+    def openai_tool_definitions(self) -> list[dict]:
+        """Expose local skills formatted as OpenAI tools."""
+        return self._openai_tool_definitions
 
     def is_local(self, tool_name: str) -> bool:
         return tool_name in self.skills

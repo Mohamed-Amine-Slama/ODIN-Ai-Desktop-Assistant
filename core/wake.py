@@ -1,78 +1,63 @@
-"""Wake-word detection — "Hey Jarvis".
+"""Wake trigger — say the assistant's name and "wake up".
 
-openWakeWord ships a pretrained `hey_jarvis` model, so this needs no API key,
-no Picovoice account, and no training. Models download once on first run.
+openWakeWord's only usable pretrained model recognises a fixed phrase
+("hey jarvis"), which doesn't track a configurable ASSISTANT_NAME. Instead
+this reuses the same VAD+Whisper pipeline SpeechInput already loads for
+normal commands: while "asleep", short utterances are transcribed and
+checked for the assistant's name plus "wake up". That trades the low-CPU,
+always-on efficiency of a dedicated wake-word model for a phrase that
+follows whatever name Jarvis is branded as, at the cost of a full
+transcription per utterance and a slightly slower, less certain trigger.
 """
+import re
+
 import config
-from core.audio import Microphone, MicrophoneUnavailable
+from core.audio import Microphone
+from core.speech_input import SpeechInput
+
+# Short: a wake phrase is a couple of words, and keeping this well under
+# SpeechInput's normal command window (config.VAD_MAX_SECONDS) keeps the
+# detector checking stop_event often instead of blocking for a full 20s
+# whenever the room is silent.
+WAKE_LISTEN_SECONDS = 6.0
 
 
-class WakeWordUnavailable(RuntimeError):
-    """Raised when the wake-word engine or its model can't be loaded."""
+class PhraseWakeDetector:
+    """Blocks until an utterance containing the assistant's name and "wake
+    up" is heard, in either order ("ODIN, wake up" / "wake up, ODIN")."""
 
-
-class WakeWordDetector:
-    def __init__(self, mic: Microphone, wake_word: str | None = None, threshold: float | None = None):
-        self.mic = mic
-        self.wake_word = wake_word or config.WAKE_WORD
-        self.threshold = threshold if threshold is not None else config.WAKE_THRESHOLD
-        self._model = _load_model(self.wake_word)
+    def __init__(self, listener: SpeechInput, name: str | None = None):
+        self.listener = listener
+        name = re.escape((name or config.ASSISTANT_NAME).strip().lower())
+        self._pattern = re.compile(
+            rf"\b{name}\b.{{0,25}}\bwake\s*up\b|\bwake\s*up\b.{{0,25}}\b{name}\b"
+        )
 
     def wait(self, stop_event=None) -> bool:
-        """Block until the wake word is heard. Returns False if stopped first."""
-        q = self.mic.subscribe()
-        try:
-            self._model.reset()
-            while True:
-                if stop_event is not None and stop_event.is_set():
-                    return False
-                try:
-                    block = q.get(timeout=0.5)
-                except Exception:
-                    continue
-
-                scores = self._model.predict(block)
-                if any(score >= self.threshold for score in scores.values()):
-                    self._model.reset()
-                    return True
-        finally:
-            self.mic.unsubscribe(q)
+        """Block until the wake phrase is heard. Returns False if stopped first."""
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return False
+            text = self.listener.listen(max_seconds=WAKE_LISTEN_SECONDS)
+            if stop_event is not None and stop_event.is_set():
+                return False
+            if text and self._pattern.search(text.lower()):
+                return True
 
 
-def _load_model(wake_word: str):
-    try:
-        from openwakeword.model import Model
-        import openwakeword
-    except ImportError as e:
-        raise WakeWordUnavailable(
-            "openwakeword isn't installed. Run: pip install -r requirements.txt"
-        ) from e
+def make_detector(mic: Microphone, listener: "SpeechInput | None" = None) -> "PhraseWakeDetector | None":
+    """Build the wake trigger, or return None if wake mode is off/unavailable.
 
-    # Pretrained weights are fetched once and cached by the package.
-    try:
-        openwakeword.utils.download_models()
-    except Exception:
-        pass  # already present, or offline — Model() will report properly
-
-    try:
-        return Model(wakeword_models=[wake_word], inference_framework="onnx")
-    except Exception as e:
-        raise WakeWordUnavailable(
-            f"couldn't load the '{wake_word}' wake-word model ({e}). "
-            "Set WAKE_WORD=off in .env to use push-to-talk instead."
-        ) from e
-
-
-def make_detector(mic: Microphone) -> "WakeWordDetector | None":
-    """Build a detector, or return None if wake-word mode is off/unavailable.
-
-    Never raises: a missing wake word should degrade to push-to-talk, not stop
-    Jarvis from starting.
+    `listener` lets a caller that already built a SpeechInput (and so
+    already paid for loading the Whisper model) share it instead of this
+    loading a second copy. Never raises: a wake trigger that fails to come
+    up should degrade to push-to-talk, not stop Jarvis from starting.
     """
     if config.WAKE_WORD.lower() in ("off", "none", ""):
         return None
     try:
-        return WakeWordDetector(mic)
-    except (WakeWordUnavailable, MicrophoneUnavailable) as e:
-        print(f"[wake] {e}")
+        speech = listener or SpeechInput(mic=mic)
+        return PhraseWakeDetector(speech)
+    except Exception as e:
+        print(f"[wake] couldn't start the wake-phrase listener ({e}).")
         return None
