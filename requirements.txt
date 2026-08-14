@@ -32,6 +32,13 @@ pyttsx3>=2.90
 # those skills degrade to a "not installed" message rather than crashing.
 pyautogui>=0.9.54
 
+# Hand-gesture cursor control (core/gesture.py, ENABLE_GESTURE_CONTROL):
+# optional. Without these, hand_control degrades to a "not installed"
+# message rather than crashing. Reuses pyautogui above for the actual
+# cursor moves/clicks.
+opencv-python>=4.9.0
+mediapipe>=0.10.14
+
 # Desktop HUD. `keyboard` is only for the global summon hotkey — everything
 # else works without it.
 PyQt6>=6.6.0

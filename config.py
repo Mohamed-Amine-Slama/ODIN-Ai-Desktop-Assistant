@@ -84,6 +84,15 @@ ENABLE_SHELL = os.getenv("ENABLE_SHELL", "1") not in ("0", "false", "False")
 ENABLE_INPUT_CONTROL = os.getenv("ENABLE_INPUT_CONTROL", "1") not in ("0", "false", "False")
 UNDO_WINDOW_SECONDS = float(os.getenv("UNDO_WINDOW_SECONDS", "900"))
 
+# Hand-gesture cursor control (core/gesture.py). Off by default, unlike the
+# other ENABLE_* flags above — this is new and activates a webcam, so it's
+# opt-in rather than opt-out.
+ENABLE_GESTURE_CONTROL = os.getenv("ENABLE_GESTURE_CONTROL", "0") not in ("0", "false", "False")
+GESTURE_CAMERA_INDEX = int(os.getenv("GESTURE_CAMERA_INDEX", "0"))
+GESTURE_FPS_LIMIT = int(os.getenv("GESTURE_FPS_LIMIT", "30"))
+GESTURE_SMOOTHING = float(os.getenv("GESTURE_SMOOTHING", "0.5"))
+GESTURE_CLICK_HOLD_MS = float(os.getenv("GESTURE_CLICK_HOLD_MS", "250"))
+
 # HUD only: how long a confirmation banner waits before it defaults to "no".
 # Text mode blocks on input() and cannot honour a timeout, so this has no
 # effect there.

@@ -12,6 +12,7 @@ from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import config
+from core import gesture
 from core.brain import Brain
 from core.scheduler import ReminderScheduler
 from core.speech_output import SpeechOutput
@@ -93,6 +94,12 @@ def main() -> None:
     )
     restored = brain.load_history()
 
+    # Built once, off (or a no-op) unless ENABLE_GESTURE_CONTROL is set — see
+    # core/gesture.py. The skill (hand_control) and the HUD/tray toggle both
+    # reach this same instance via get_gesture_controller().
+    gesture_controller = gesture.make_controller(bridge.on_gesture_state)
+    gesture.set_gesture_controller(gesture_controller)
+
     scheduler = ReminderScheduler(store)
     missed = scheduler.fire_due()
     scheduler.start()
@@ -127,6 +134,8 @@ def main() -> None:
         # could still be alive when the interpreter starts tearing down.
         hud.weather.stop()
         hud.weather.wait(2000)
+        if gesture_controller is not None:
+            gesture_controller.stop()
         bridge.release()  # let a worker parked on a confirmation fall through
         scheduler.stop()
         session.shutdown()

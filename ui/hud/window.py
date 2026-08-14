@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 
 import config
 from core import learning_status
+from core.gesture import get_gesture_controller
 from core.store import get_store
 from core.undo import get_journal
 from ui.hud import tokens
@@ -122,11 +123,17 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
         self.tray_icon.setToolTip(f"{config.ASSISTANT_NAME} — AI desktop assistant")
 
         menu = QMenu(self)
-        for text, slot in (
+        tray_items = [
             (f"Show {config.ASSISTANT_NAME}", self.show_and_activate),
             ("Toggle voice / text mode", self.voice.toggle_mode),
             ("Clear conversation", self.trigger_reset),
-        ):
+        ]
+        if config.ENABLE_GESTURE_CONTROL:
+            # No confirmation here, unlike the voice/text "hand_control" skill
+            # (skills/gesture_skills.py) — a deliberate tray click already is
+            # the user's explicit, in-the-moment consent to turn the camera on.
+            tray_items.insert(2, ("Toggle hand control", self._toggle_gesture_control))
+        for text, slot in tray_items:
             action = QAction(text, self)
             action.triggered.connect(slot)
             menu.addAction(action)
@@ -149,6 +156,7 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
         self.bridge.mic_rms.connect(self.orb.set_mic_level)
         self.bridge.learning_progress.connect(self._on_learning_progress)
         self.bridge.kb_changed.connect(self._on_kb_changed)
+        self.bridge.gesture_state_changed.connect(self._on_gesture_state)
 
     def _wire_voice(self) -> None:
         self.voice.heard.connect(self._on_voice_heard)
@@ -239,6 +247,22 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.dismiss() if self.isVisible() else self.show_and_activate()
+
+    def _toggle_gesture_control(self) -> None:
+        controller = get_gesture_controller()
+        if controller.is_running():
+            controller.stop()
+        else:
+            controller.start()
+
+    def _on_gesture_state(self, state: str, message: str) -> None:
+        """Surfaces GestureController's state so hand control is never
+        silently running: reflected in the tray tooltip and echoed to the
+        console, the same way voice-mode status messages already are
+        (self.voice.status_message -> self.console.echo)."""
+        if self.tray_icon is not None:
+            self.tray_icon.setToolTip(f"{config.ASSISTANT_NAME} — hand control: {state}")
+        self.console.echo(message)
 
     def closeEvent(self, event) -> None:
         if self.tray_icon is not None and self.tray_icon.isVisible():
@@ -396,6 +420,9 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
             return
         if glyph == "CON":
             self.console.toggle()
+            return
+        if glyph == "HAND":
+            self._toggle_gesture_control()
             return
         self._launch_preset(preset)
 
