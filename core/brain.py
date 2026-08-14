@@ -337,6 +337,19 @@ class Brain:
             + "\n".join(lines)
         )
 
+    def _turn_openai_context(self, working: list[dict]) -> tuple[int | None, str]:
+        """The index of this turn's latest plain user message, plus the
+        memory/knowledge context to append to it — resolved once per turn
+        (see the comment in _run_turn) rather than once per API call."""
+        plain_user_indexes = [i for i, m in enumerate(working) if _is_plain_user_turn(m)]
+        if not plain_user_indexes:
+            return None, ""
+        latest = plain_user_indexes[-1]
+        context = self._memory_context() + self._knowledge_context(
+            self._plain_text(working[latest]["content"])
+        )
+        return latest, context
+
     @staticmethod
     def _plain_text(content) -> str:
         """Best-effort text extraction from a message's content, for feeding
@@ -356,9 +369,15 @@ class Brain:
 
     def _run_turn(self, working: list[dict]) -> tuple[str, list[dict]]:
         pause_turns = 0
+        # Computed once per turn, not once per tool-iteration API call: the
+        # underlying query (the turn's own user text) never changes across
+        # a multi-tool-call turn, so re-deriving it on every round trip was
+        # re-embedding the same text and re-hitting the vector store and
+        # memory DB up to MAX_TOOL_ITERATIONS times for an identical result.
+        openai_context = self._turn_openai_context(working) if self.is_openai else (None, "")
 
         for _ in range(config.MAX_TOOL_ITERATIONS):
-            response = self._call_model(working)
+            response = self._call_model(working, openai_context)
 
             if response.stop_reason == "refusal":
                 # content may be empty on a pre-output refusal, and an empty
@@ -399,9 +418,9 @@ class Brain:
         working.append({"role": "assistant", "content": [{"type": "text", "text": fallback}]})
         return fallback, working
 
-    def _call_model(self, working: list[dict]):
+    def _call_model(self, working: list[dict], openai_context: tuple[int | None, str] = (None, "")):
         if self.is_openai:
-            return self._call_openai_model(working)
+            return self._call_openai_model(working, openai_context)
         return self._call_anthropic_model(working)
 
     def _call_anthropic_model(self, working: list[dict]):
@@ -528,27 +547,16 @@ class Brain:
                 print("[model] this model has no reasoning control; dropped the parameter")
             return self.client.chat.completions.create(**kwargs)
 
-    def _call_openai_model(self, working: list[dict]):
+    def _call_openai_model(self, working: list[dict], context: tuple[int | None, str] = (None, "")):
         messages = [{"role": "system", "content": self.system_prompt}]
-        plain_user_indexes = [
-            index
-            for index, message in enumerate(working)
-            if _is_plain_user_turn(message)
-        ]
-        memory_context = self._memory_context()
-        latest_plain_user = plain_user_indexes[-1] if plain_user_indexes else None
-        knowledge_context = (
-            self._knowledge_context(self._plain_text(working[latest_plain_user]["content"]))
-            if latest_plain_user is not None
-            else ""
-        )
+        latest_plain_user, context_suffix = context
 
         for index, msg in enumerate(working):
             role = msg["role"]
             content = msg["content"]
             if isinstance(content, str):
                 if index == latest_plain_user:
-                    content += memory_context + knowledge_context
+                    content += context_suffix
                 messages.append({"role": role, "content": content})
             elif isinstance(content, list):
                 text_parts = []

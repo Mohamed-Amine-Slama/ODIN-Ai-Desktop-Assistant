@@ -37,8 +37,7 @@ That one file covers everything, including the heavier optional stacks below
 — Jarvis still runs fine at runtime if any of them are missing, it just
 degrades that one feature instead of failing to start. Notably:
 
-- Hands-free voice pulls ~1GB of ML wheels (`faster-whisper`, `onnxruntime`,
-  `openwakeword`, ...).
+- Hands-free voice pulls ~1GB of ML wheels (`faster-whisper`, ...).
 - The `deep_learn` skill (research a topic in depth and remember it
   permanently) and semantic recall for the `memory` skill both need a local
   vector store and embedding model — `sentence-transformers` pulls in torch.
@@ -87,9 +86,15 @@ The HUD opens full-screen and leaves an orb on your desktop when you press
 bring it back. The orb shows what Jarvis is doing: its particle swarm holds a
 tight ring when idle and scatters while it's working or speaking.
 
+Voice is the main way to talk to the HUD: on launch, Jarvis speaks a greeting
+and listens right away for your first request — no wake phrase needed yet,
+since it just finished talking. After each request it goes back to sleep;
+say your assistant's name and **"wake up"** to bring it back for the next one.
+
 - **Text mode**: type and hit Enter.
-- **Voice mode**: `/mode voice`, then just say **"Hey Jarvis"** — no key press.
-  Falls back to press-Enter-to-talk if the wake-word model isn't available.
+- **Voice mode**: `/mode voice`, then just say your assistant's name and
+  **"wake up"** (e.g. **"ODIN, wake up"**) — no key press. Falls back to
+  press-Enter-to-talk if the speech models aren't available.
 
 Commands: `/undo`, `/mode voice`, `/mode text`, `/reset`, `/connect google`,
 `/connect microsoft`, `/help`, `/quit`
@@ -134,7 +139,7 @@ Jarvis/
     env_file.py            .env read/update helper for the settings panel
     scheduler.py          durable reminders (survive restarts)
     audio.py              shared 16 kHz microphone stream
-    wake.py               "Hey Jarvis" wake word (openWakeWord)
+    wake.py               "<name>, wake up" wake trigger (faster-whisper phrase match)
     barge_in.py            interrupt Jarvis mid-sentence by talking over it
     speech_input.py       microphone -> text (faster-whisper, local)
     speech_output.py      text -> speech (edge-tts, SAPI fallback)
@@ -223,8 +228,7 @@ platform, so they need no display either.
 | `UNDO_WINDOW_SECONDS` | `900` | How long an action stays undoable |
 | `TRASH_MAX_ENTRIES` | `200` | Deleted-file backups kept, by count |
 | `TRASH_MAX_AGE_DAYS` | `7` | Deleted-file backups kept, by age |
-| `WAKE_WORD` | `hey_jarvis` | Set `off` for push-to-talk |
-| `WAKE_THRESHOLD` | `0.5` | Lower = more sensitive, more false wakes |
+| `WAKE_WORD` | `on` | Say `ASSISTANT_NAME` + "wake up" to wake Jarvis. Set `off` for push-to-talk |
 | `STT_MODEL` | `base.en` | Whisper size. `small.en` is better if your CPU allows |
 | `TTS_ENGINE` | `auto` | `edge` (natural, needs net), `sapi` (offline), `off` |
 | `TTS_VOICE` | `en-GB-RyanNeural` | Any edge-tts voice |

@@ -188,11 +188,16 @@ class VoiceListenWorker(QThread):
     state_changed = pyqtSignal(str)  # "idle" (waiting) or "listening" (recording)
     error = pyqtSignal(str)
 
-    def __init__(self, session, parent=None):
+    def __init__(self, session, skip_wake_first: bool = False, parent=None):
         super().__init__(parent)
         self.session = session
         self._stop_event = threading.Event()
         self._pause = threading.Event()
+        # Consumed on the loop's first live iteration only — lets a caller
+        # (the HUD's post-greeting boot flow) skip straight to listening
+        # once, without disabling the sleep/wake-phrase gate for every turn
+        # after it.
+        self._skip_wake_first = skip_wake_first
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -208,8 +213,9 @@ class VoiceListenWorker(QThread):
             if self._pause.is_set():
                 self._stop_event.wait(0.2)
                 continue
+            skip_wake, self._skip_wake_first = self._skip_wake_first, False
             try:
-                if self.session.wake is not None:
+                if self.session.wake is not None and not skip_wake:
                     self.state_changed.emit("idle")
                     if not self.session.wake.wait(stop_event=self._stop_event):
                         continue

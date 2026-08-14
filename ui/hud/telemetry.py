@@ -25,6 +25,16 @@ IS_WINDOWS = sys.platform == "win32"
 MAX_CORE_GROUPS = 16
 TOP_PROCESS_COUNT = 3
 
+# nvmlInit() hands back a process-wide handle, not a per-worker one.
+# Calling it again from a second TelemetryWorker (e.g. a second
+# OdinHudWindow built in the same process — every HUD test does this)
+# without a matching nvmlShutdown() was reliably crashing the whole
+# interpreter with a native access violation rather than raising a
+# catchable Python exception. Guarding init at module scope keeps it to
+# at most one real call per process, no matter how many workers get built.
+_nvml_ready = False
+_nvml_missing = False
+
 
 @dataclass
 class CpuSample:
@@ -151,9 +161,9 @@ class TelemetryWorker(QThread):
         self._disk_cache_ts: float = 0.0
 
         # Lazily-imported optional sensor backends; None until first probed.
+        # (NVML's ready/missing flags are process-wide module state, not
+        # per-instance — see the comment by _nvml_ready above.)
         self._wmi_lhm = None
-        self._nvml_ready = False
-        self._nvml_missing = False
         self._wmi_missing = False
 
     def stop(self) -> None:
@@ -297,6 +307,7 @@ class TelemetryWorker(QThread):
         """§10: never fabricate. Every field stays None — rendering `--` —
         unless the matching optional backend (requirements.txt) is both
         installed and actually reachable."""
+        global _nvml_ready, _nvml_missing
         cpu_c = fan_rpm = None
         gpu_c = gpu_load = gpu_vram_percent = None
 
@@ -314,19 +325,19 @@ class TelemetryWorker(QThread):
             except Exception:  # noqa: BLE001 - not installed, or LHM not running; both are "--"
                 self._wmi_missing = True
 
-        if not self._nvml_missing:
+        if not _nvml_missing:
             try:
                 import pynvml  # optional: requirements.txt (nvidia-ml-py)
 
-                if not self._nvml_ready:
+                if not _nvml_ready:
                     pynvml.nvmlInit()
-                    self._nvml_ready = True
+                    _nvml_ready = True
                 handle = pynvml.nvmlDeviceGetHandleByIndex(0)
                 gpu_c = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
                 gpu_load = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 gpu_vram_percent = round(mem.used / mem.total * 100, 1)
             except Exception:  # noqa: BLE001 - not installed, or no NVIDIA GPU; both are "--"
-                self._nvml_missing = True
+                _nvml_missing = True
 
         return ThermalSample(cpu_c, gpu_c, gpu_load, gpu_vram_percent, fan_rpm)

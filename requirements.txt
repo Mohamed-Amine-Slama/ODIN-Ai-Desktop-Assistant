@@ -91,10 +91,8 @@ chromadb>=0.5.0
 sounddevice>=0.4.6
 numpy>=1.24.0
 
-# Wake word: openWakeWord ships a pretrained "hey_jarvis" model.
-# No API key, no Picovoice account, no training.
-openwakeword>=0.6.0
-onnxruntime>=1.16.0
+# Wake trigger: reuses faster-whisper below to listen for the assistant's
+# name + "wake up" (core/wake.py) — no separate model or API key needed.
 
 # Speech-to-text: local Whisper. Offline, accurate, and your audio never
 # leaves the machine (the old SpeechRecognition backend posted it to Google).

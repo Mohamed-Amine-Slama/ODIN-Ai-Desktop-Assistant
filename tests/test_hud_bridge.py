@@ -1,7 +1,10 @@
-"""ui/workers.py's UiBridge — the HUD-only signal additions: skill_logged
-duration, kb_changed on a successful deep_learn, and the
-core.learning_status -> learning_progress relay.
+"""ui/workers.py's UiBridge — the HUD-only signal additions (skill_logged
+duration, kb_changed on a successful deep_learn, the core.learning_status ->
+learning_progress relay) plus the core on_text/confirm/on_action behavior
+shared by every UI that wires a UiBridge (moved here from the now-deleted
+tests/test_gui.py, which tested it against the legacy JarvisMainWindow).
 """
+import threading
 from unittest.mock import MagicMock
 
 from core import learning_status
@@ -102,3 +105,71 @@ def test_learning_status_report_reaches_the_bridge_when_wired(qapp):
 def test_learning_status_report_is_a_no_op_without_a_callback():
     learning_status.set_callback(None)
     learning_status.report("react", "Hooks", 0.75)  # must not raise
+
+
+# -- core on_text/confirm/on_action behavior --------------------------------
+
+
+def test_bridge_speaks_and_displays_every_sentence(qapp):
+    """Regression: the GUI replaced the brain's on_text callback with one that
+    only drew to the screen, which left the desktop app completely mute."""
+    speaker = MagicMock()
+    bridge = UiBridge(speaker=speaker)
+    seen = []
+    bridge.text_chunk.connect(seen.append)
+
+    bridge.on_text("All done.")
+
+    speaker.say.assert_called_once_with("All done.")
+    assert seen == ["All done."]
+
+
+def test_bridge_confirmation_blocks_until_answered(qapp):
+    bridge = UiBridge()
+    skill = MagicMock()
+    skill.consequence.return_value = "Delete it?"
+
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(ok=bridge.confirm(skill, {})))
+    worker.start()
+    # The worker is parked on the Event until the GUI thread answers.
+    assert not bridge._answered.wait(timeout=0.1)
+    bridge.answer(True)
+    worker.join(timeout=5)
+
+    assert result == {"ok": True}
+
+
+def test_bridge_confirmation_defaults_to_no_on_timeout(qapp, monkeypatch):
+    """Nothing is refused outright, but an unanswered question is not consent."""
+    import config
+
+    monkeypatch.setattr(config, "CONFIRM_TIMEOUT_SECONDS", 0.05)
+    bridge = UiBridge()
+    skill = MagicMock()
+    skill.consequence.return_value = "Format the drive?"
+
+    assert bridge.confirm(skill, {}) is False
+
+
+def test_bridge_reports_undo_token_only_when_one_exists(qapp):
+    from core.undo import UndoJournal, set_journal
+
+    journal = UndoJournal()
+    set_journal(journal)
+    try:
+        bridge = UiBridge()
+        seen = []
+        bridge.action_reported.connect(lambda *args: seen.append(args))
+
+        skill = MagicMock()
+        skill.name = "type_text"
+        bridge.on_action(skill, {}, MagicMock(undo_token=None))
+        assert seen[-1] == ("type_text", "", "")
+
+        token = journal.record("Restore notes.txt", lambda: "back")
+        skill.name = "write_file"
+        bridge.on_action(skill, {}, MagicMock(undo_token=token))
+        assert seen[-1] == ("write_file", token, "Restore notes.txt")
+    finally:
+        set_journal(None)

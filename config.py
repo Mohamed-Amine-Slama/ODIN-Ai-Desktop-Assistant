@@ -103,10 +103,10 @@ HUD_SPECTRUM_SOURCE = os.getenv("HUD_SPECTRUM_SOURCE", "loopback")
 HUD_REDUCED_MOTION = os.getenv("HUD_REDUCED_MOTION", "0") not in ("0", "false", "False")
 
 # --- Voice ----------------------------------------------------------------
-# Wake word. openWakeWord ships a pretrained "hey_jarvis" model, so this works
-# with no API key and no training. Set WAKE_WORD=off for push-to-talk.
-WAKE_WORD = os.getenv("WAKE_WORD", "hey_jarvis")
-WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.5"))
+# Wake trigger: say ASSISTANT_NAME and "wake up" to bring Jarvis back from
+# sleep. Works with any name, no API key, no training (see core/wake.py).
+# Set WAKE_WORD=off for push-to-talk instead.
+WAKE_WORD = os.getenv("WAKE_WORD", "on")
 
 # Speech-to-text: faster-whisper model size. base.en is a good CPU default;
 # small.en is more accurate if your machine can take it.

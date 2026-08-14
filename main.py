@@ -82,7 +82,7 @@ class Session:
                 self.mic = Microphone()
                 self.mic.start()
                 self.listener = SpeechInput(mic=self.mic)
-                self.wake = make_detector(self.mic)
+                self.wake = make_detector(self.mic, self.listener)
                 self.barge_in = make_watcher(self.mic, on_interrupt=self._on_barge_in)
             except Exception as e:
                 self._teardown_audio()
@@ -90,7 +90,7 @@ class Session:
 
         self.mode = "voice"
         if self.wake is not None:
-            return f"Voice mode on. Say '{config.WAKE_WORD.replace('_', ' ')}' to wake me."
+            return f"Voice mode on. Say '{config.ASSISTANT_NAME}, wake up' to wake me."
         return "Voice mode on (push-to-talk — press Enter, then speak)."
 
     def _teardown_audio(self) -> None:
@@ -160,7 +160,7 @@ class Session:
                 return "/quit"
 
         if self.wake is not None:
-            print(f"[idle] waiting for '{config.WAKE_WORD.replace('_', ' ')}'...  (Ctrl-C to quit)")
+            print(f"[idle] waiting for '{config.ASSISTANT_NAME}, wake up'...  (Ctrl-C to quit)")
             if not self.wake.wait():
                 return None
             # Short cue so the user knows it heard them before they start.

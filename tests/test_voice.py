@@ -382,11 +382,71 @@ def test_text_mode_needs_no_audio_stack():
     assert session.mode == "text"
 
 
+class _FakeSpeechInput:
+    """Stands in for core.speech_input.SpeechInput in wake-phrase tests: no
+    mic, no Whisper model, just canned transcripts returned in order."""
+
+    def __init__(self, transcripts):
+        self._transcripts = list(transcripts)
+
+    def listen(self, max_seconds=None):  # noqa: ARG002
+        return self._transcripts.pop(0) if self._transcripts else ""
+
+
 def test_wake_word_off_returns_no_detector(monkeypatch):
     monkeypatch.setattr(config, "WAKE_WORD", "off", raising=False)
     from core.wake import make_detector
 
     assert make_detector(mic=None) is None
+
+
+def test_phrase_wake_detector_matches_name_then_wake_up():
+    from core.wake import PhraseWakeDetector
+
+    detector = PhraseWakeDetector(_FakeSpeechInput(["hey ODIN wake up please"]), name="ODIN")
+    assert detector.wait() is True
+
+
+def test_phrase_wake_detector_matches_wake_up_then_name():
+    from core.wake import PhraseWakeDetector
+
+    detector = PhraseWakeDetector(_FakeSpeechInput(["wake up ODIN"]), name="ODIN")
+    assert detector.wait() is True
+
+
+def test_phrase_wake_detector_keeps_listening_past_unrelated_speech():
+    from core.wake import PhraseWakeDetector
+
+    detector = PhraseWakeDetector(
+        _FakeSpeechInput(["what's the weather", "", "ODIN, wake up"]), name="ODIN"
+    )
+    assert detector.wait() is True
+
+
+def test_phrase_wake_detector_stops_when_asked():
+    from core.wake import PhraseWakeDetector
+
+    stop_event = threading.Event()
+    stop_event.set()
+    detector = PhraseWakeDetector(_FakeSpeechInput(["ODIN wake up"]), name="ODIN")
+    assert detector.wait(stop_event=stop_event) is False
+
+
+def test_make_detector_reuses_the_provided_listener(monkeypatch):
+    """set_mode() already built a SpeechInput (and paid for loading Whisper)
+    for normal commands — the wake detector must reuse it, not load a
+    second model."""
+    from core.wake import make_detector
+
+    monkeypatch.setattr(config, "WAKE_WORD", "on", raising=False)
+    monkeypatch.setattr(
+        "core.wake.SpeechInput",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not build a second SpeechInput")),
+    )
+
+    listener = _FakeSpeechInput([])
+    detector = make_detector(mic=None, listener=listener)
+    assert detector.listener is listener
 
 
 # -- barge-in ---------------------------------------------------------------
@@ -453,15 +513,16 @@ def test_read_input_drains_a_pending_utterance_first():
 
 
 def test_missing_wake_model_degrades_to_push_to_talk(monkeypatch, capsys):
-    """A broken wake word should mean push-to-talk, not a refusal to start."""
-    from core.wake import WakeWordUnavailable, make_detector
+    """A broken wake-phrase listener should mean push-to-talk, not a refusal
+    to start."""
+    from core.wake import make_detector
 
-    monkeypatch.setattr(config, "WAKE_WORD", "hey_jarvis", raising=False)
+    monkeypatch.setattr(config, "WAKE_WORD", "on", raising=False)
 
-    def unavailable(mic, *a, **k):
-        raise WakeWordUnavailable("openwakeword isn't installed")
+    def unavailable(*a, **k):
+        raise RuntimeError("faster-whisper isn't installed")
 
-    monkeypatch.setattr("core.wake.WakeWordDetector", unavailable)
+    monkeypatch.setattr("core.wake.SpeechInput", unavailable)
 
     assert make_detector(mic=None) is None
-    assert "openwakeword isn't installed" in capsys.readouterr().out
+    assert "faster-whisper isn't installed" in capsys.readouterr().out

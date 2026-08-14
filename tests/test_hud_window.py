@@ -36,6 +36,13 @@ def window(qapp, mock_brain, mock_session):
     bridge = UiBridge()
     win = OdinHudWindow(mock_brain, mock_session, bridge)
     yield win
+    # show_and_activate() now kicks off a real VoiceSetupWorker/
+    # VoiceListenWorker QThread on first show (voice-first boot).
+    # VoiceLoopController.shutdown() joins both, drains any signal already
+    # queued for the GUI event loop (so it can't fire later against a
+    # window this fixture already tore down), and blocks any new worker
+    # from spawning mid-drain.
+    win.voice.shutdown()
     win.dismiss()
     win.tray_icon.hide()
     win.deleteLater()
@@ -95,8 +102,13 @@ def test_voice_heard_is_a_no_op_while_a_turn_is_in_flight(window, mock_brain, mo
     """Mirrors _launch_preset's guard: without it, a voice-heard turn and a
     dock/console-triggered turn could both start a BrainWorker, racing on
     Brain's shared history and the confirmation bridge's single Event."""
-    mock_session.mode = "voice"
+    # A sentinel here (mirrors test_switch_to_voice_is_a_no_op_...) makes
+    # show_and_activate()'s own boot-time voice.switch_to_voice() a no-op,
+    # so it can't race this test's manual mode/heard setup with a real
+    # VoiceSetupWorker/VoiceListenWorker thread reading a MagicMock session.
+    window.voice._loop_worker = MagicMock()
     window.show_and_activate()
+    mock_session.mode = "voice"
     window._launch_preset("typed command")  # sets current_worker
     calls_after_first = mock_brain.ask.call_count
 
@@ -107,8 +119,9 @@ def test_voice_heard_is_a_no_op_while_a_turn_is_in_flight(window, mock_brain, mo
 
 
 def test_voice_heard_starts_a_turn_when_idle(window, mock_brain, mock_session):
-    mock_session.mode = "voice"
+    window.voice._loop_worker = MagicMock()  # see the note in the test above
     window.show_and_activate()
+    mock_session.mode = "voice"
     window._on_voice_heard("hello")
     QTest.qWait(300)
     mock_brain.ask.assert_called_with("hello")
@@ -137,18 +150,16 @@ def test_reset_runs_when_idle(window, mock_brain):
 def test_switch_to_voice_is_a_no_op_while_the_voice_loop_is_already_running(window):
     """Reachable via '/mode voice' typed twice, not just the dock toggle
     (which already checks session.mode) — without this guard, a second call
-    would overwrite _voice_loop_worker with a new VoiceListenWorker while
-    the first is still running, leaking its thread and duplicating every
+    would overwrite _loop_worker with a new VoiceListenWorker while the
+    first is still running, leaking its thread and duplicating every
     transcription."""
-    from unittest.mock import MagicMock
-
     sentinel = MagicMock()
-    window._voice_loop_worker = sentinel
+    window.voice._loop_worker = sentinel
 
-    window._switch_to_voice()
+    window.voice.switch_to_voice()
 
-    assert window._voice_setup_worker is None
-    assert window._voice_loop_worker is sentinel
+    assert window.voice.setup_worker is None
+    assert window.voice._loop_worker is sentinel
 
 
 def test_confirm_requested_shows_a_banner_and_answering_clears_it(window):
