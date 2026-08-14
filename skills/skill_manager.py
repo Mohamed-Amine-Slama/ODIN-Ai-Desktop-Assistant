@@ -101,6 +101,11 @@ if getattr(config, "ENABLE_INPUT_CONTROL", True):
 
     SKILL_CLASSES.extend([TypeTextSkill, PressKeysSkill, ClickSkill, ScrollSkill])
 
+if getattr(config, "ENABLE_GESTURE_CONTROL", False):
+    from .gesture_skills import HandControlSkill
+
+    SKILL_CLASSES.append(HandControlSkill)
+
 # Email/calendar skills need one interactive /connect (main.py) per account
 # before they're any use, so they're gated on either account already being
 # connected, or a client-secrets file / client ID being in place so /connect

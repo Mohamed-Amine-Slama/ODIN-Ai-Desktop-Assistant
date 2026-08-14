@@ -68,6 +68,7 @@ class UiBridge(QObject):
     learning_progress = pyqtSignal(str, str, float)    # topic, subtopic, 0..1
     skill_logged = pyqtSignal(object)                  # SkillLogEntry
     kb_changed = pyqtSignal()                          # a deep_learn run just completed
+    gesture_state_changed = pyqtSignal(str, str)       # "idle" | "active" | "error", message
 
     def __init__(self, speaker=None, parent=None):
         super().__init__(parent)
@@ -119,6 +120,12 @@ class UiBridge(QObject):
         """Wired to core.learning_status.set_callback() once at startup — a
         thin re-emit so core/ stays Qt-free (see core/learning_status.py)."""
         self.learning_progress.emit(topic, subtopic, progress)
+
+    def on_gesture_state(self, state: str, message: str) -> None:
+        """Wired to GestureController's on_state_change at startup (app.py) —
+        fires from the camera capture thread, same re-emit pattern as
+        report_learning_progress above, so core/gesture.py stays Qt-free."""
+        self.gesture_state_changed.emit(state, message)
 
     def confirm(self, skill, tool_input) -> bool:
         """Block the worker until the HUD answers. Defaults to no."""

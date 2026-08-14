@@ -46,7 +46,7 @@ degrades that one feature instead of failing to start. Notably:
   affected.
 - Email and calendar (`read_email`, `send_email`, `list_events`,
   `create_event`, `delete_event`) still need one Google or Microsoft account
-  connected before they do anything — see section 9 below.
+  connected before they do anything — see section 10 below.
 
 `web_search` needs no setup at all — it runs on DuckDuckGo via the `ddgs`
 package (already in `requirements.txt`), with no API key, signup, or billing.
@@ -143,6 +143,7 @@ Jarvis/
     barge_in.py            interrupt Jarvis mid-sentence by talking over it
     speech_input.py       microphone -> text (faster-whisper, local)
     speech_output.py      text -> speech (edge-tts, SAPI fallback)
+    gesture.py             hand-gesture cursor control: camera, tracking, GestureController
   skills/
     base_skill.py         base class every skill implements
     skill_manager.py      registers skills, exposes them as tools
@@ -151,6 +152,7 @@ Jarvis/
     shell_skills.py       run_command (arbitrary shell)
     window_skills.py      list, focus, minimise/maximise, close windows
     input_skills.py       type text, press keys, click, scroll
+    gesture_skills.py      hand_control: voice/text on/off for hand-gesture cursor control
     web_skills.py         open website (optionally in a specific browser), browser search, fetch a page, weather, web_search
     vision_skills.py      screenshot -> the model can see your screen
     knowledge_skills.py    deep_learn, list_learned_topics
@@ -171,7 +173,31 @@ Deleted and overwritten files are backed up to Jarvis's local trash first, makin
 `close_app` matches process names exactly and refuses to touch critical
 Windows processes (`lsass`, `csrss`, `winlogon`, …).
 
-## 6. Adding a new skill
+## 6. Hand-gesture cursor control
+
+Point a webcam at your hand and drive the literal OS cursor with it — point to
+move, pinch to click or drag, pinch thumb-and-middle to right-click, hold up
+two fingers and move up/down to scroll. An open palm or a fist pauses
+tracking without letting go of anything mid-gesture.
+
+Off by default (`ENABLE_GESTURE_CONTROL=0` in `.env`) — turning it on
+activates your webcam. Once enabled, there are two ways to start it:
+
+- **HUD/tray**: right-click the tray icon → **Toggle hand control**. Instant,
+  no confirmation — a deliberate click already is your consent.
+- **Voice/text**: say or type "turn on hand control". This goes through the
+  same confirmation flow as any other `DANGEROUS` action, since this path can
+  be reached by a mishearing. Turning it back **off** is always instant on
+  either path — never gated behind a prompt.
+
+Needs `opencv-python` and `mediapipe` (see `requirements.txt`); without them
+it reports what's missing instead of failing to start. No frame is ever
+written to disk or sent anywhere, including to the model — this subsystem
+never touches the LLM. `pyautogui`'s corner failsafe stays on, so slamming the
+cursor into a screen corner still aborts everything, exactly as it does for
+the ordinary `click`/`type_text` skills in section 5.
+
+## 7. Adding a new skill
 
 1. Subclass `BaseSkill` in a file under `skills/`:
 
@@ -198,17 +224,17 @@ class MyNewSkill(BaseSkill):
 That's it. A skill can also return image content blocks instead of a string —
 see `vision_skills.py` — and they're converted correctly for both providers.
 
-## 7. Tests
+## 8. Tests
 
 ```bat
 python -m pytest tests/ -v
 ```
 
-343 tests, no API key and no microphone needed. They also run on Linux/WSL,
+501 tests, no API key and no microphone needed. They also run on Linux/WSL,
 which is useful because the voice stack won't. The HUD tests use Qt's offscreen
 platform, so they need no display either.
 
-## 8. Configuration reference
+## 9. Configuration reference
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -218,12 +244,17 @@ platform, so they need no display either.
 | `MAX_TOOL_ITERATIONS` | `25` | Tool round-trips before giving up on a turn — a compound, multi-step request can easily need a dozen-plus |
 | `ENABLE_SHELL` | `1` | Master switch for `run_command` |
 | `ENABLE_INPUT_CONTROL` | `1` | Master switch for typing/clicking |
+| `ENABLE_GESTURE_CONTROL` | `0` | Master switch for hand-gesture cursor control (section 6). Off by default — activates a webcam |
+| `GESTURE_CAMERA_INDEX` | `0` | Which capture device to open |
+| `GESTURE_FPS_LIMIT` | `30` | Caps how often frames are processed |
+| `GESTURE_SMOOTHING` | `0.5` | Cursor-position smoothing factor |
+| `GESTURE_CLICK_HOLD_MS` | `250` | Pinch-tap (click) vs. pinch-and-hold (drag) threshold |
 | `MAX_HISTORY_MESSAGES` | `80` | Live request context cap. Full history stays in SQLite |
 | `MEMORY_CONTEXT_LIMIT` | `5` | Durable facts injected alongside the newest turn |
 | `KNOWLEDGE_CONTEXT_RESULTS` | `4` | deep_learn notes chunks injected per turn when relevant. `0` disables retrieval |
 | `HUD_HOTKEY` | `ctrl+alt+j` | Global summon key (needs the `keyboard` package). `off` to disable |
 | `CONFIRM_TIMEOUT_SECONDS` | `120` | HUD only: an unanswered confirmation counts as no |
-| `MS_OAUTH_CLIENT_ID` | — | Enables the Microsoft-backed email/calendar skills once connected. See section 9 |
+| `MS_OAUTH_CLIENT_ID` | — | Enables the Microsoft-backed email/calendar skills once connected. See section 10 |
 | `MS_OAUTH_TENANT_ID` | `common` | Azure tenant for the Microsoft OAuth app; `common` covers both personal and work/school accounts |
 | `UNDO_WINDOW_SECONDS` | `900` | How long an action stays undoable |
 | `TRASH_MAX_ENTRIES` | `200` | Deleted-file backups kept, by count |
@@ -236,7 +267,7 @@ platform, so they need no display either.
 | `BARGE_IN_THRESHOLD` | `0.05` | RMS level that counts as "the user is talking over Jarvis." No echo cancellation — raise this if playback through open speakers triggers it |
 | `DEBUG` | `0` | Print token usage and cache hit rates |
 
-## 9. Email and calendar setup
+## 10. Email and calendar setup
 
 `read_email`, `send_email`, `list_events`, `create_event`, and `delete_event`
 need one connected account (the packages are already in `requirements.txt`).
@@ -264,7 +295,7 @@ Both accounts can be connected at once — Jarvis asks which one to use for a
 given request only when it's genuinely ambiguous. Tokens live under
 `data/oauth/`, which is already covered by `.gitignore`.
 
-## 10. Roadmap ideas
+## 11. Roadmap ideas
 
 - **Smart home**: skills hitting Home Assistant / Hue / Govee APIs.
 - **Scheduled re-learning**: periodically re-run `deep_learn` on stored

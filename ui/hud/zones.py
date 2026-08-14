@@ -38,6 +38,12 @@ DOCK_ITEMS = [
     ("CON", "ODIN Console", None),
 ]
 
+if config.ENABLE_GESTURE_CONTROL:
+    # Handled locally (glyph == "HAND" in _on_dock_clicked), same as SET/CON
+    # above — an instant toggle, no LLM confirmation, mirroring the tray
+    # menu's "Toggle hand control" entry. Only shown when the feature is on.
+    DOCK_ITEMS.append(("HAND", "Hand Control", None))
+
 STATUS_FOR_STATE = {
     "idle": "STANDING BY",
     "listening": "LISTENING",
