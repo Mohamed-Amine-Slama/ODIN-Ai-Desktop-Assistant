@@ -13,7 +13,15 @@ without a camera, mediapipe, or pyautogui anywhere nearby:
 Frames are processed in memory and discarded. Nothing here writes a frame to
 disk or sends one anywhere — unlike skills/vision_skills.py's see_screen, this
 never reaches the model.
+
+Hand detection uses mediapipe's Tasks API (HandLandmarker), not the older
+`mp.solutions.hands` — that legacy surface has been dropped from the
+mediapipe package this project pins. The Tasks API needs a small (~8MB)
+model file that isn't bundled with the package; it's downloaded once to
+data/models/ on first use, the same one-time-download shape faster-whisper
+and sentence-transformers already use elsewhere in this project.
 """
+import os
 import sys
 import threading
 import time
@@ -302,6 +310,72 @@ def _mediapipe():
     return mp, None
 
 
+# Google's official hosted hand-landmark model bundle for the Tasks API — see
+# https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker. Not
+# bundled with the mediapipe package itself, so it's fetched once and cached.
+HAND_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+
+def _model_path() -> str:
+    return os.path.join(config.DATA_DIR, "models", "hand_landmarker.task")
+
+
+def _ensure_model():
+    """Return (path, error_message) for the cached hand-landmark model,
+    downloading it on first use. Never raises — a network hiccup here
+    degrades to a friendly message, same as a missing package."""
+    path = _model_path()
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path, None
+    try:
+        import requests
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        response = requests.get(HAND_LANDMARKER_MODEL_URL, timeout=30)
+        response.raise_for_status()
+        # Download to a temp file and rename atomically, so a connection
+        # dropped mid-download can never leave a corrupt file that
+        # os.path.getsize(path) > 0 would wrongly treat as cached.
+        tmp_path = path + ".part"
+        with open(tmp_path, "wb") as f:
+            f.write(response.content)
+        os.replace(tmp_path, path)
+        return path, None
+    except Exception as e:
+        return None, f"Couldn't download the hand-tracking model: {e}"
+
+
+def _hand_landmarker():
+    """Build a Tasks-API hand landmark detector. Returns (landmarker,
+    error_message); the caller still needs _mediapipe() separately for
+    mp.Image/mp.ImageFormat, which don't depend on this model."""
+    try:
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+    except ImportError:
+        return None, "Hand control needs the 'mediapipe' package. Run: pip install mediapipe"
+    except Exception as e:
+        return None, f"Hand tracking is unavailable: {e}"
+
+    model_path, err = _ensure_model()
+    if err:
+        return None, err
+
+    try:
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            num_hands=1,
+            min_hand_detection_confidence=0.6,
+            min_tracking_confidence=0.5,
+        )
+        return HandLandmarker.create_from_options(options), None
+    except Exception as e:
+        return None, f"Hand tracking is unavailable: {e}"
+
+
 def _pyautogui():
     try:
         import pyautogui
@@ -361,6 +435,10 @@ class GestureController:
         if err:
             self.on_state_change("error", err)
             return
+        landmarker, err = _hand_landmarker()
+        if err:
+            self.on_state_change("error", err)
+            return
         gui, err = _pyautogui()
         if err:
             self.on_state_change("error", err)
@@ -372,9 +450,6 @@ class GestureController:
             self.on_state_change("error", f"Couldn't open camera {self.camera_index}.")
             return
 
-        hands = mp.solutions.hands.Hands(
-            max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.5,
-        )
         machine = GestureStateMachine()
         bounds = _virtual_screen_bounds()
         min_frame_seconds = 1.0 / max(1, config.GESTURE_FPS_LIMIT)
@@ -389,12 +464,11 @@ class GestureController:
                     continue
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = hands.process(rgb)
+                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect(image)
                 landmarks = None
-                if result.multi_hand_landmarks:
-                    landmarks = [
-                        Landmark(p.x, p.y, p.z) for p in result.multi_hand_landmarks[0].landmark
-                    ]
+                if result.hand_landmarks:
+                    landmarks = [Landmark(p.x, p.y, p.z) for p in result.hand_landmarks[0]]
 
                 pose = classify_pose(landmarks)
                 x_norm = landmarks[INDEX_TIP].x if landmarks else 0.0
@@ -418,7 +492,7 @@ class GestureController:
                     gui.mouseUp()
                 except Exception:
                     pass
-            hands.close()
+            landmarker.close()
             cap.release()
 
     def _apply(self, gui, event: GestureEvent, bounds) -> None:

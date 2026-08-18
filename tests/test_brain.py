@@ -4,6 +4,8 @@ The headline test is test_history_survives_midturn_failure — that's the
 regression guard for the bug where an exception between a tool_use block and
 its tool_result left history permanently invalid, 400ing every later request.
 """
+import threading
+
 import openai
 import pytest
 
@@ -266,6 +268,84 @@ def test_dangerous_action_still_confirms(make_brain, monkeypatch):
     assert "declined" in brain.history[2]["content"][0]["content"]
 
 
+# -- per-call overrides (scheduled tasks / remote channels) ----------------
+# ask() accepts confirm/on_text overrides so a turn run unattended (a
+# scheduled task, a Telegram message) can auto-decline confirmations and
+# keep its reply off the desktop's speech, without touching the instance
+# defaults every other caller relies on.
+
+
+def test_ask_confirm_override_does_not_replace_the_instance_default(make_brain):
+    default_confirm = lambda skill, tool_input: True  # noqa: E731
+    override_confirm = lambda skill, tool_input: False  # noqa: E731
+
+    brain = make_brain(
+        [
+            response([tool_use_block("power_control", {"action": "shutdown"})], stop_reason="tool_use"),
+            response([text_block("Cancelled.")]),
+        ],
+        confirm=default_confirm,
+    )
+
+    brain.ask("shut down", confirm=override_confirm)
+
+    assert "declined" in brain.history[2]["content"][0]["content"]
+    assert brain.confirm is default_confirm, "a per-call override must not mutate the instance default"
+
+
+def test_ask_on_text_override_replaces_on_text_for_that_call_only(make_brain):
+    default_spoken = []
+    override_spoken = []
+
+    brain = make_brain(
+        [response([text_block("Hello there.")]), response([text_block("Second one.")])],
+        on_text=default_spoken.append,
+    )
+
+    brain.ask("hi", on_text=override_spoken.append)
+    assert override_spoken == ["Hello there."]
+    assert default_spoken == [], "the override replaces on_text for this call, not both firing"
+
+    brain.ask("hi again")  # no override this time -> falls back to the instance default
+    assert default_spoken == ["Second one."]
+
+
+def test_auto_decline_always_declines():
+    from core.brain import auto_decline
+
+    assert auto_decline(object(), {"action": "shutdown"}) is False
+
+
+def test_ask_holds_the_turn_lock_for_the_whole_turn(make_brain, monkeypatch):
+    """Regression guard for concurrent callers: a scheduled task and a
+    Telegram message can now reach ask() on their own threads, at the same
+    time as the main loop. The lock must be held for the whole turn, or two
+    turns could interleave their mutation of self.history."""
+    brain = make_brain([response([text_block("ok.")])])
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_run_turn = brain._run_turn
+
+    def blocking_run_turn(working, confirm, on_text):
+        entered.set()
+        release.wait(timeout=5)
+        return original_run_turn(working, confirm, on_text)
+
+    monkeypatch.setattr(brain, "_run_turn", blocking_run_turn)
+
+    thread = threading.Thread(target=brain.ask, args=("hi",))
+    thread.start()
+    try:
+        assert entered.wait(timeout=2), "the turn should have started"
+        assert brain._turn_lock.locked(), "the lock must be held while a turn is in flight"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not brain._turn_lock.locked()
+
+
 def test_on_action_receives_the_undo_token(make_brain):
     """A skill that records an undo entry must surface its token so the UI can
     offer a working undo button."""
@@ -397,7 +477,96 @@ def test_openai_client_is_built_with_a_request_timeout(monkeypatch):
 
     Brain()
 
-    assert captured.get("timeout") == 42.0
+
+def test_bedrock_prefixed_model_selects_anthropic_bedrock(monkeypatch):
+    """MODEL='bedrock/<id>' must route to AnthropicBedrock rather than the
+    native Anthropic client or an OpenAI-compatible one — see
+    core.brain._BEDROCK_PREFIX. The prefix itself must never reach the
+    actual API call: self.model_id is what _call_anthropic_model sends."""
+    import anthropic
+    import config
+    from core.brain import Brain
+
+    captured = {}
+
+    class FakeAnthropicBedrock:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(anthropic, "AnthropicBedrock", FakeAnthropicBedrock, raising=False)
+    monkeypatch.setattr(
+        config, "MODEL", "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0", raising=False
+    )
+    monkeypatch.setattr(config, "AWS_REGION", "us-west-2", raising=False)
+    monkeypatch.setattr(config, "REQUEST_TIMEOUT_SECONDS", 42.0, raising=False)
+
+    brain = Brain()
+
+    assert isinstance(brain.client, FakeAnthropicBedrock)
+    assert brain.is_openai is False
+    assert brain.model_id == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert captured["aws_region"] == "us-west-2"
+    assert captured["timeout"] == 42.0
+
+
+def test_non_bedrock_claude_model_still_uses_the_native_anthropic_client(monkeypatch):
+    """A plain 'claude-...' MODEL (no bedrock/ prefix) must keep using
+    anthropic.Anthropic, not be accidentally caught by the Bedrock branch."""
+    import anthropic
+    import config
+    from core.brain import Brain
+
+    captured = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic, raising=False)
+    monkeypatch.setattr(config, "MODEL", "claude-opus-5", raising=False)
+    monkeypatch.setattr(config, "BASE_URL", "", raising=False)
+    monkeypatch.setattr(config, "API_KEY", "key", raising=False)
+
+    brain = Brain()
+
+    assert isinstance(brain.client, FakeAnthropic)
+    assert brain.is_openai is False
+    assert brain.model_id == "claude-opus-5"
+
+
+# -- missing_key_message() (Bedrock auths differently from every other path) -
+
+def test_missing_key_message_ignores_api_key_for_bedrock_when_bearer_token_is_set(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "MODEL", "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0", raising=False)
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "some-token")
+
+    assert config.missing_key_message() is None
+
+
+def test_missing_key_message_flags_bedrock_without_a_bearer_token(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "MODEL", "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0", raising=False)
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+
+    message = config.missing_key_message()
+    assert message is not None
+    assert "AWS_BEARER_TOKEN_BEDROCK" in message
+
+
+def test_missing_key_message_still_requires_api_key_for_non_bedrock_models(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "MODEL", "gemini-3.6-flash", raising=False)
+
+    message = config.missing_key_message()
+    assert message is not None
+    assert "API_KEY" in message
 
 
 def test_friendly_error_distinguishes_timeout_from_connection_failure():

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import config
 from core.risk import Risk, is_sensitive_path
+from core.security import guard
 from core.undo import get_journal, move_to_trash
 
 from .base_skill import BaseSkill
@@ -74,7 +75,92 @@ class ReadFileSkill(BaseSkill):
         text = data[:limit].decode("utf-8", errors="replace")
         if len(data) > limit:
             text += f"\n\n[truncated — showing {limit} of {len(data)} bytes]"
-        return text
+        return guard(text, source=f"read_file:{path}")
+
+
+def _parse_pdf_pages(spec: str, total_pages: int) -> list[int]:
+    """Parse a 1-indexed page spec like '1-5' or '1,3,5' into a sorted list of
+    unique 0-indexed page numbers. Raises ValueError with a user-facing
+    message on anything unparsable, rather than the raw exception a bad
+    int(...) would produce."""
+    result: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, _, end_str = part.partition("-")
+            try:
+                start, end = int(start_str.strip()), int(end_str.strip())
+            except ValueError:
+                raise ValueError(f"'{part}' isn't a valid page range.")
+            for n in range(max(1, start), min(total_pages, end) + 1):
+                result.add(n - 1)
+        else:
+            try:
+                n = int(part)
+            except ValueError:
+                raise ValueError(f"'{part}' isn't a valid page number.")
+            if 1 <= n <= total_pages:
+                result.add(n - 1)
+    return sorted(result)
+
+
+class ReadPdfSkill(BaseSkill):
+    name = "read_pdf"
+    description = (
+        "Extract text from a PDF file on the user's PC. Use for 'what does "
+        "this PDF say', 'summarise this report', 'read this document' — "
+        "read_file only handles plain text and can't decode a PDF's binary "
+        "format."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Absolute path to the PDF file."},
+            "pages": {
+                "type": "string",
+                "description": (
+                    "Optional 1-indexed page range, e.g. '1-5' or '1,3,5'. "
+                    "Omit to extract every page."
+                ),
+            },
+        },
+        "required": ["path"],
+    }
+    risk = Risk.SAFE
+
+    def run(self, path: str, pages: str = "") -> str:
+        if _blank(path):
+            return "I need a path to work with."
+        target = Path(path).expanduser()
+        if not target.exists():
+            return f"There is no file at {path}."
+        if target.suffix.lower() != ".pdf":
+            return f"{path} isn't a .pdf file — use read_file for plain text."
+
+        try:
+            import pdfplumber
+        except ImportError:
+            return "Reading PDFs needs the 'pdfplumber' package. Run: pip install pdfplumber"
+
+        try:
+            with pdfplumber.open(str(target)) as pdf:
+                total = len(pdf.pages)
+                try:
+                    indices = _parse_pdf_pages(pages, total) if pages.strip() else range(total)
+                except ValueError as e:
+                    return str(e)
+                parts = [pdf.pages[i].extract_text() or "" for i in indices if 0 <= i < total]
+        except Exception as e:
+            return f"I couldn't read {path}: {e}"
+
+        text = "\n\n".join(p for p in parts if p.strip())
+        if not text:
+            return f"{path} has no extractable text ({total} page(s)) — it may be scanned images."
+        if len(text) > READ_LIMIT:
+            text = text[:READ_LIMIT] + f"\n\n[truncated — {total} page(s) total]"
+        return guard(text, source=f"read_pdf:{path}")
 
 
 class ListDirSkill(BaseSkill):

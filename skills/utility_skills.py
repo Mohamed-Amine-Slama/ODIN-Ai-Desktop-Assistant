@@ -6,6 +6,7 @@ import operator
 import time
 
 import config
+from core.scheduler import parse_schedule
 from core.store import get_store
 
 from .base_skill import BaseSkill
@@ -140,6 +141,80 @@ class ListRemindersSkill(BaseSkill):
             for r in rows
         ]
         return "Pending reminders:\n" + "\n".join(lines)
+
+
+class ScheduleTaskSkill(BaseSkill):
+    name = "schedule_task"
+    description = (
+        "Create, list, or remove a recurring task that runs automatically on "
+        "a schedule — e.g. 'every weekday at 8am, check my email and "
+        "calendar and give me a morning briefing'. Each run starts a full "
+        "turn using the prompt given here, exactly as if the user had typed "
+        "it, with every tool available. Nobody is present when a scheduled "
+        "run fires, so anything that would normally ask for confirmation is "
+        "automatically declined instead — don't schedule a task that depends "
+        "on one going through."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["create", "list", "delete"]},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "What to do when this task runs, written as if the user typed it. "
+                    "Required for 'create'."
+                ),
+            },
+            "schedule": {
+                "type": "string",
+                "description": (
+                    "When to run it: 'daily HH:MM', 'weekdays HH:MM', 'weekends HH:MM', "
+                    "or a comma list of day abbreviations plus HH:MM, e.g. 'mon,wed,fri "
+                    "18:30'. 24-hour local time. Required for 'create'."
+                ),
+            },
+            "task_id": {
+                "type": "integer",
+                "description": "Task id to remove, from 'list'. Required for 'delete'.",
+            },
+        },
+        "required": ["action"],
+    }
+
+    def run(
+        self, action: str, prompt: str = "", schedule: str = "", task_id: int | None = None
+    ) -> str:
+        store = get_store()
+
+        if action == "create":
+            if not prompt.strip():
+                return "What should this task do when it runs?"
+            try:
+                parse_schedule(schedule)
+            except ValueError as e:
+                return str(e)
+            new_id = store.add_scheduled_task(prompt.strip(), schedule.strip())
+            return f'Scheduled task #{new_id}: "{prompt.strip()}" — {schedule.strip()}.'
+
+        if action == "list":
+            rows = store.list_scheduled_tasks()
+            if not rows:
+                return "You have no scheduled tasks."
+            lines = [
+                f"#{r['id']} [{'on' if r['enabled'] else 'off'}] {r['schedule']} — {r['prompt']}"
+                for r in rows
+            ]
+            return "Scheduled tasks:\n" + "\n".join(lines)
+
+        if action == "delete":
+            if task_id is None:
+                return "Which task id should I remove? Use 'list' to see them."
+            if store.delete_scheduled_task(int(task_id)):
+                return f"Removed scheduled task #{task_id}."
+            return f"I don't have a scheduled task #{task_id}."
+
+        return "Unknown schedule_task action."
 
 
 class MemorySkill(BaseSkill):

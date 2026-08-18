@@ -174,8 +174,22 @@ def _load_model():
 
     try:
         # First call downloads the weights (~75MB for base.en) and caches them.
-        return WhisperModel(config.STT_MODEL, device="auto", compute_type=config.STT_COMPUTE)
+        # device/compute_type default to "auto" (config.py), which is what
+        # lets this land on an NVIDIA GPU automatically instead of CPU.
+        model = WhisperModel(
+            config.STT_MODEL, device=config.STT_DEVICE, compute_type=config.STT_COMPUTE
+        )
     except Exception as e:
         raise MicrophoneUnavailable(
             f"couldn't load the '{config.STT_MODEL}' speech model ({e})"
         ) from e
+
+    # "auto" is opaque from the outside — print what it actually resolved to,
+    # so GPU use is something you can verify instead of just hoping for.
+    # Defensive getattr: these are CTranslate2 model attributes, not part of
+    # faster-whisper's own documented API, so a version that renames or drops
+    # them degrades to showing the requested value instead of raising.
+    device = getattr(model.model, "device", config.STT_DEVICE)
+    compute_type = getattr(model.model, "compute_type", config.STT_COMPUTE)
+    print(f"[stt] '{config.STT_MODEL}' loaded on {device} (compute_type={compute_type})")
+    return model

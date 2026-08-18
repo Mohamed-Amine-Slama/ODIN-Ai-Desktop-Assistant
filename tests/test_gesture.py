@@ -8,6 +8,7 @@ without any of those packages actually installed.
 """
 import sys
 import time
+from types import ModuleType
 
 import pytest
 
@@ -239,23 +240,32 @@ class _FakeCapture:
         self.released = True
 
 
-class _FakeHands:
-    def __init__(self, **_kwargs):
+class _FakeLandmarker:
+    """Stands in for a mediapipe Tasks-API HandLandmarker. No hand is ever
+    detected, so the loop just idles."""
+
+    def __init__(self):
         self.closed = False
 
-    def process(self, _rgb):
+    def detect(self, _image):
         from types import SimpleNamespace
-        return SimpleNamespace(multi_hand_landmarks=None)
+        return SimpleNamespace(hand_landmarks=[])
 
     def close(self):
         self.closed = True
 
 
-def _install_fake_camera_stack(monkeypatch, opens=True):
-    """Fakes cv2, mediapipe, and pyautogui at the sys.modules boundary so
-    GestureController._run() can execute for real without any of those
-    packages installed, mirroring test_window_input_skills.py's pyautogui
-    fixture. No hand is ever detected, so the loop just idles."""
+def _install_fake_camera_stack(monkeypatch, opens=True, landmarker_error=None):
+    """Fakes cv2, mediapipe, and pyautogui so GestureController._run() can
+    execute for real without any of those packages installed, mirroring
+    test_window_input_skills.py's pyautogui fixture.
+
+    mediapipe's Tasks API (mediapipe.tasks.python...) is a deep submodule
+    chain that isn't worth faking at the sys.modules boundary; instead
+    core.gesture._hand_landmarker (its one call site) is patched directly.
+    mp.Image/mp.ImageFormat are still real top-level attributes _run() reads
+    directly, so those are faked on the mediapipe module itself.
+    """
     from types import SimpleNamespace, ModuleType
 
     fake_cv2 = ModuleType("cv2")
@@ -265,8 +275,14 @@ def _install_fake_camera_stack(monkeypatch, opens=True):
     monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
 
     fake_mediapipe = ModuleType("mediapipe")
-    fake_mediapipe.solutions = SimpleNamespace(hands=SimpleNamespace(Hands=_FakeHands))
+    fake_mediapipe.Image = lambda image_format, data: data
+    fake_mediapipe.ImageFormat = SimpleNamespace(SRGB=1)
     monkeypatch.setitem(sys.modules, "mediapipe", fake_mediapipe)
+
+    if landmarker_error is None:
+        monkeypatch.setattr("core.gesture._hand_landmarker", lambda: (_FakeLandmarker(), None))
+    else:
+        monkeypatch.setattr("core.gesture._hand_landmarker", lambda: (None, landmarker_error))
 
     class _FailSafeException(Exception):
         pass
@@ -336,6 +352,78 @@ class TestGestureController:
         _wait_until(lambda: states)
         assert states[0][0] == "error"
         assert "opencv-python" in states[0][1]
+
+    def test_landmarker_build_failure_reports_an_error(self, monkeypatch):
+        """E.g. the one-time model download failed (core.gesture._ensure_model)
+        — must degrade to a message, not crash the capture thread."""
+        _install_fake_camera_stack(monkeypatch, landmarker_error="Couldn't download the hand-tracking model: timed out")
+        states = []
+        controller = GestureController(on_state_change=lambda s, m: states.append((s, m)))
+        controller.start()
+        _wait_until(lambda: states)
+        assert states[0] == ("error", "Couldn't download the hand-tracking model: timed out")
+        assert not controller.is_running()
+
+
+# -- model download -------------------------------------------------------------
+
+class TestEnsureModel:
+    def test_uses_a_cached_file_without_downloading(self, monkeypatch, tmp_path):
+        from core.gesture import _ensure_model
+
+        cached = tmp_path / "hand_landmarker.task"
+        cached.write_bytes(b"already here")
+        monkeypatch.setattr("core.gesture._model_path", lambda: str(cached))
+
+        def boom(*a, **k):
+            raise AssertionError("should not re-download a cached model")
+
+        monkeypatch.setitem(sys.modules, "requests", _fake_requests_module(boom))
+
+        path, err = _ensure_model()
+        assert path == str(cached)
+        assert err is None
+
+    def test_downloads_and_caches_when_missing(self, monkeypatch, tmp_path):
+        from core.gesture import _ensure_model
+
+        target = tmp_path / "models" / "hand_landmarker.task"
+        monkeypatch.setattr("core.gesture._model_path", lambda: str(target))
+
+        class _FakeResponse:
+            content = b"model bytes"
+
+            def raise_for_status(self):
+                pass
+
+        fake_requests = _fake_requests_module(lambda url, timeout: _FakeResponse())
+        monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+        path, err = _ensure_model()
+        assert err is None
+        assert path == str(target)
+        assert target.read_bytes() == b"model bytes"
+        assert not target.with_suffix(".task.part").exists()
+
+    def test_download_failure_is_a_message_not_a_crash(self, monkeypatch, tmp_path):
+        from core.gesture import _ensure_model
+
+        monkeypatch.setattr("core.gesture._model_path", lambda: str(tmp_path / "hand_landmarker.task"))
+
+        def boom(url, timeout):
+            raise OSError("network down")
+
+        monkeypatch.setitem(sys.modules, "requests", _fake_requests_module(boom))
+
+        path, err = _ensure_model()
+        assert path is None
+        assert "network down" in err
+
+
+def _fake_requests_module(get_fn):
+    module = ModuleType("requests")
+    module.get = get_fn
+    return module
 
 
 # -- make_controller / singleton -----------------------------------------------

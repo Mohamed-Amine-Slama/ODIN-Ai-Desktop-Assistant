@@ -18,12 +18,17 @@ import subprocess
 import sys
 import urllib.parse
 import webbrowser
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from ipaddress import ip_address
 
 import requests
 
 import config
+from core import rate_limit
+from core.risk import Risk
+from core.security import guard
+
 from .base_skill import BaseSkill
 from .system_skills import _resolve_windows_app_executable
 
@@ -321,6 +326,8 @@ class WebFetchSkill(BaseSkill):
             return "I can only fetch a valid public http(s) URL."
         if not _is_public_url(normalized):
             return "I won't fetch local, private-network, or unresolved addresses."
+        if not rate_limit.allow("web_fetch"):
+            return "I'm making too many web requests right now — try again in a moment."
 
         try:
             response = requests.get(
@@ -361,7 +368,7 @@ class WebFetchSkill(BaseSkill):
             return "That page had no readable text."
         if len(text) > _FETCH_MAX_CHARS:
             text = text[:_FETCH_MAX_CHARS].rstrip() + "\n\n[Page text truncated.]"
-        return text
+        return guard(text, source=f"web_fetch:{normalized}", untrusted=True)
 
 
 def _decode_response(raw: bytes, content_type: str, declared_encoding: str | None) -> str:
@@ -409,6 +416,243 @@ class WeatherSkill(BaseSkill):
         if resp.status_code == 200:
             return resp.text.strip()
         return f"I couldn't fetch the weather for {city} (status {resp.status_code})."
+
+
+_HTTP_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
+_HTTP_MAX_RESPONSE_CHARS = 20_000
+
+
+class HttpRequestSkill(BaseSkill):
+    """Call an arbitrary HTTP API. Unlike web_fetch (GET-only, read-only),
+    this can send a body and use any HTTP method — for webhooks, REST APIs,
+    and anything else a plain page read doesn't cover. Like run_command, a
+    request that changes something on the far end can never be undone by
+    Jarvis, so this never records an undo entry."""
+
+    name = "http_request"
+    description = (
+        "Make an HTTP request to a URL — GET, POST, PUT, PATCH, DELETE, or "
+        "HEAD, with optional headers and a body. Use for calling REST APIs "
+        "and webhooks. For just reading a normal web page, use web_fetch "
+        "instead — it's simpler and always read-only."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Public http(s) URL."},
+            "method": {
+                "type": "string",
+                "description": "HTTP method. Defaults to GET.",
+                "enum": sorted(_HTTP_ALLOWED_METHODS),
+            },
+            "headers": {
+                "type": "object",
+                "description": "Optional request headers as key-value pairs.",
+            },
+            "body": {"type": "string", "description": "Optional request body."},
+            "timeout": {
+                "type": "integer",
+                "description": "Seconds before giving up (default 30).",
+            },
+        },
+        "required": ["url"],
+    }
+
+    def risk_for(self, method: str = "GET", **_) -> Risk:
+        # Mirrors run_command's calibration: a mutation runs immediately
+        # (MODERATE), it just isn't gated behind a confirmation prompt —
+        # only genuinely destructive actions are.
+        return Risk.SAFE if (method or "GET").upper() in ("GET", "HEAD") else Risk.MODERATE
+
+    def consequence(self, url: str = "", method: str = "GET", **_) -> str:
+        return f"Send a {(method or 'GET').upper()} request to {url}?"
+
+    def run(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: dict | None = None,
+        body: str = "",
+        timeout: int = 30,
+    ) -> str:
+        normalized = _to_web_url(url)
+        if normalized is None:
+            return "I can only call a valid public http(s) URL."
+        if not _is_public_url(normalized):
+            return "I won't call local, private-network, or unresolved addresses."
+        if not rate_limit.allow("http_request"):
+            return "I'm making too many web requests right now — try again in a moment."
+
+        method = (method or "GET").upper()
+        if method not in _HTTP_ALLOWED_METHODS:
+            return (
+                f"Unsupported method '{method}'. Use one of: "
+                f"{', '.join(sorted(_HTTP_ALLOWED_METHODS))}."
+            )
+
+        try:
+            response = requests.request(
+                method,
+                normalized,
+                headers=headers or None,
+                data=body or None,
+                timeout=max(1, int(timeout)),
+                # Not followed automatically — same choice web_fetch makes,
+                # so a redirect target always gets its own SSRF check rather
+                # than trusting whatever the far end points us at next.
+                allow_redirects=False,
+            )
+        except requests.Timeout:
+            return "That request did not respond in time."
+        except requests.RequestException as e:
+            return f"That request failed: {e}"
+
+        if 300 <= response.status_code < 400:
+            return (
+                f"That URL redirects (status {response.status_code}) — "
+                "I don't follow redirects automatically. Call the final URL directly."
+            )
+
+        text = response.text
+        if len(text) > _HTTP_MAX_RESPONSE_CHARS:
+            text = text[:_HTTP_MAX_RESPONSE_CHARS] + "\n\n[response truncated]"
+        body_text = (
+            guard(text, source=f"http_request:{normalized}", untrusted=True)
+            if text.strip()
+            else "(empty response)"
+        )
+        return f"HTTP {response.status_code}\n{body_text}"
+
+
+_NEWS_MAX_ITEMS_PER_FEED = 8
+_NEWS_MAX_TOTAL_ITEMS = 15
+_NEWS_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+
+
+class NewsSkill(BaseSkill):
+    """Recent headlines from an RSS/Atom feed. Stdlib XML parsing only (no
+    feedparser dependency), the same 'reuse what's already imported' choice
+    web_fetch's own HTML text extraction makes."""
+
+    name = "get_news"
+    description = (
+        "Get recent headlines from a news/RSS feed. Pass a well-known name "
+        "('hacker news', 'bbc', 'the verge', 'techcrunch') or any RSS/Atom "
+        "feed URL directly. With no feed named, uses the feeds configured in "
+        "RSS_FEEDS. Use for 'what's in the news', a morning briefing, or "
+        "checking a specific feed."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "feed": {
+                "type": "string",
+                "description": "Feed name or URL. Omit to use the configured default feeds.",
+            },
+            "max_items": {
+                "type": "integer",
+                "description": "Max headlines to return across all feeds fetched (default 8).",
+            },
+        },
+        "required": [],
+    }
+
+    KNOWN = {
+        "hacker news": "https://news.ycombinator.com/rss",
+        "hn": "https://news.ycombinator.com/rss",
+        "bbc": "https://feeds.bbci.co.uk/news/rss.xml",
+        "bbc world": "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "nyt": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+        "the verge": "https://www.theverge.com/rss/index.xml",
+        "verge": "https://www.theverge.com/rss/index.xml",
+        "techcrunch": "https://techcrunch.com/feed/",
+        "reuters": "https://feeds.reuters.com/reuters/topNews",
+    }
+
+    def run(self, feed: str = "", max_items: int = 8) -> str:
+        urls = self._resolve_feeds(feed)
+        if not urls:
+            return (
+                "No feed to read — pass a feed name or URL, or set "
+                "RSS_FEEDS in .env for a default."
+            )
+        if not rate_limit.allow("get_news"):
+            return "I'm making too many web requests right now — try again in a moment."
+
+        cap = max(1, int(max_items)) if max_items else 8
+        lines: list[str] = []
+        errors: list[str] = []
+        for name, url in urls:
+            try:
+                items = _fetch_feed_items(url)
+            except (requests.RequestException, ET.ParseError) as e:
+                errors.append(f"{name}: {e}")
+                continue
+            for item in items[:_NEWS_MAX_ITEMS_PER_FEED]:
+                if len(lines) >= min(cap, _NEWS_MAX_TOTAL_ITEMS):
+                    break
+                lines.append(f"- [{name}] {item['title']} ({item['link']})")
+            if len(lines) >= cap:
+                break
+
+        if not lines:
+            detail = f" ({'; '.join(errors)})" if errors else ""
+            return f"I couldn't get any headlines{detail}."
+        text = "\n".join(lines)
+        return guard(text, source="get_news", untrusted=True)
+
+    def _resolve_feeds(self, feed: str) -> list[tuple[str, str]]:
+        """Return [(display_name, url), ...] to fetch, resolving a known
+        name or a raw URL, or falling back to RSS_FEEDS from config."""
+        feed = (feed or "").strip()
+        if not feed:
+            return [(_feed_display_name(url), url) for url in config.RSS_FEEDS]
+
+        known_url = self.KNOWN.get(feed.lower())
+        if known_url:
+            return [(feed, known_url)]
+
+        url = _to_web_url(feed)
+        if url is None or not _is_public_url(url):
+            return []
+        return [(_feed_display_name(url), url)]
+
+
+def _feed_display_name(url: str) -> str:
+    return urllib.parse.urlparse(url).netloc or url
+
+
+def _fetch_feed_items(url: str) -> list[dict]:
+    """Download and parse an RSS or Atom feed into
+    [{title, link, published}, ...], newest first as the feed provides them."""
+    response = requests.get(
+        url,
+        timeout=15,
+        headers={"User-Agent": "ODIN/1.0 (personal assistant)"},
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+
+    items = []
+    for item_el in root.iter("item"):  # RSS 2.0
+        items.append(
+            {
+                "title": (item_el.findtext("title") or "Untitled").strip(),
+                "link": (item_el.findtext("link") or "").strip(),
+            }
+        )
+    if items:
+        return items
+
+    for entry_el in root.iter(f"{_NEWS_ATOM_NS}entry"):  # Atom
+        link_el = entry_el.find(f"{_NEWS_ATOM_NS}link")
+        items.append(
+            {
+                "title": (entry_el.findtext(f"{_NEWS_ATOM_NS}title") or "Untitled").strip(),
+                "link": (link_el.get("href", "") if link_el is not None else "").strip(),
+            }
+        )
+    return items
 
 
 _DNS_TIMEOUT_SECONDS = 5

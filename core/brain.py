@@ -10,6 +10,7 @@ conversation. Every turn is built in a local working copy and committed only
 on success. If anything throws mid-turn, the working copy is discarded.
 """
 import json
+import threading
 from types import SimpleNamespace
 import openai
 
@@ -17,6 +18,12 @@ import config
 from core import knowledge
 from core.risk import Risk
 from skills.skill_manager import SkillManager
+
+# MODEL="bedrock/<bedrock model id>" selects Amazon Bedrock (AnthropicBedrock)
+# instead of the native Anthropic API or an OpenAI-compatible endpoint — see
+# Brain.__init__. The prefix is ODIN's own convention, stripped before the
+# model id is ever sent anywhere.
+_BEDROCK_PREFIX = "bedrock/"
 
 _BASE_PROMPT = f"""You are {config.ASSISTANT_NAME}, a direct AI assistant that operates this
 Windows PC through tools — think Iron Man's J.A.R.V.I.S., not a chatbot that talks
@@ -44,9 +51,11 @@ Rules, in priority order:
 _CAPABILITY_LINES = {
     "open_app": "- launch applications and open websites",
     "read_file": "- read, write, search, move, and delete files and folders",
+    "read_pdf": "- extract text from PDF files",
     "list_windows": "- list, focus, resize, and close windows",
     "type_text": "- type, press key combinations, click, and scroll, to drive apps that have no other way in",
     "run_command": "- run shell commands",
+    "http_request": "- call REST APIs and webhooks directly (not just read web pages)",
     "see_screen": "- look at the screen",
     "system_info": "- read system stats and control volume and power",
     "read_email": "- read and send email, and manage calendar events",
@@ -150,6 +159,16 @@ def _confirm_always(skill, tool_input) -> bool:  # noqa: ARG001
     return True
 
 
+def auto_decline(skill, tool_input) -> bool:  # noqa: ARG001
+    """A confirm callback for turns that run with nobody there to answer —
+    a scheduled task firing at 3am, a message from Telegram. Same "default
+    to no" rule the interactive prompts already use for silence or an
+    unparsable answer, just unconditional: there is no one to ask, so
+    every DANGEROUS action (shutdown, close_app, overwriting a sensitive
+    path, ...) is declined rather than run unattended."""
+    return False
+
+
 def _ignore_action(skill, tool_input, outcome) -> None:  # noqa: ARG001
     """Default action notifier: do nothing. main.py prints; the desktop UI
     raises a toast."""
@@ -184,6 +203,21 @@ class Brain:
         if client is not None:
             self.client = client
             self.is_openai = hasattr(client, "chat")
+            self.model_id = config.MODEL
+        elif config.MODEL.startswith(_BEDROCK_PREFIX):
+            # Amazon Bedrock. AnthropicBedrock is a drop-in for anthropic.
+            # Anthropic below — same messages.stream()/get_final_message()
+            # shape, just a different transport/auth — so _call_anthropic_model
+            # needs no branching of its own. Auth is an AWS Bedrock API key
+            # (bearer token): set AWS_BEARER_TOKEN_BEDROCK in .env and boto3
+            # picks it up on its own; nothing here reads or forwards it.
+            from anthropic import AnthropicBedrock
+            self.client = AnthropicBedrock(
+                aws_region=config.AWS_REGION,
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
+            )
+            self.is_openai = False
+            self.model_id = config.MODEL[len(_BEDROCK_PREFIX):]
         elif config.MODEL.startswith("claude") or not config.BASE_URL:
             import anthropic
             self.client = anthropic.Anthropic(
@@ -192,6 +226,7 @@ class Brain:
                 timeout=config.REQUEST_TIMEOUT_SECONDS,
             )
             self.is_openai = False
+            self.model_id = config.MODEL
         else:
             self.client = openai.OpenAI(
                 api_key=config.API_KEY,
@@ -199,6 +234,7 @@ class Brain:
                 timeout=config.REQUEST_TIMEOUT_SECONDS,
             )
             self.is_openai = True
+            self.model_id = config.MODEL
 
         # Cleared for the session the first time a model rejects the parameter.
         self._send_effort = True
@@ -219,6 +255,14 @@ class Brain:
         self.last_usage = None
         self.spoke_during_last_turn = False
 
+        # Serializes ask() calls. Originally only ever called from one worker
+        # thread at a time (the text loop, or one BrainWorker); scheduled
+        # tasks and the Telegram channel are now additional callers that can
+        # land concurrently with that and with each other, and self.history
+        # is mutated at the end of every turn — two turns racing on it would
+        # corrupt or lose one of them.
+        self._turn_lock = threading.Lock()
+
     def _available_tool_names(self) -> set[str]:
         """Tool names given to the model."""
         if self.is_openai:
@@ -227,24 +271,38 @@ class Brain:
 
     # -- public API --------------------------------------------------------
 
-    def ask(self, user_text: str) -> str:
-        """Run one full turn. self.history is left untouched if this raises."""
-        self.spoke_during_last_turn = False
+    def ask(self, user_text: str, *, confirm=None, on_text=None) -> str:
+        """Run one full turn. self.history is left untouched if this raises.
 
-        # Keep the live request bounded before making an API call, but retain
-        # the complete conversation on disk. Trimming only begins at a normal
-        # user turn, never at a tool_result whose tool_use may be before it.
-        working = self._trim_history(self.history)
-        working.append({"role": "user", "content": user_text})
-        turn_start = len(working) - 1
+        confirm/on_text default to the callbacks given at construction;
+        pass either to override just this call — a scheduled task or a
+        remote channel message runs unattended, so it typically overrides
+        confirm to auto-decline (nobody is there to answer "shut down the
+        PC?") and may override on_text to keep the reply off the desktop's
+        speech/GUI output. Held under _turn_lock for the whole turn: with
+        more than one caller now able to reach ask() concurrently, history
+        must only ever be read and written by one turn at a time.
+        """
+        with self._turn_lock:
+            self.spoke_during_last_turn = False
+            effective_confirm = confirm if confirm is not None else self.confirm
+            effective_on_text = on_text if on_text is not None else self.on_text
 
-        # If _run_turn raises, `working` is discarded and self.history keeps its
-        # last known-good value. That is the whole point of this indirection.
-        reply, working = self._run_turn(working)
+            # Keep the live request bounded before making an API call, but retain
+            # the complete conversation on disk. Trimming only begins at a normal
+            # user turn, never at a tool_result whose tool_use may be before it.
+            working = self._trim_history(self.history)
+            working.append({"role": "user", "content": user_text})
+            turn_start = len(working) - 1
 
-        self.history = self._trim_history(working)
-        self._persist(working[turn_start:])
-        return reply
+            # If _run_turn raises, `working` is discarded and self.history keeps
+            # its last known-good value. That is the whole point of this
+            # indirection.
+            reply, working = self._run_turn(working, effective_confirm, effective_on_text)
+
+            self.history = self._trim_history(working)
+            self._persist(working[turn_start:])
+            return reply
 
     def load_history(self, limit: int = 20) -> int:
         """Restore the tail of the previous session. Returns messages loaded."""
@@ -367,7 +425,7 @@ class Brain:
 
     # -- internals ---------------------------------------------------------
 
-    def _run_turn(self, working: list[dict]) -> tuple[str, list[dict]]:
+    def _run_turn(self, working: list[dict], confirm, on_text) -> tuple[str, list[dict]]:
         pause_turns = 0
         # Computed once per turn, not once per tool-iteration API call: the
         # underlying query (the turn's own user text) never changes across
@@ -377,7 +435,7 @@ class Brain:
         openai_context = self._turn_openai_context(working) if self.is_openai else (None, "")
 
         for _ in range(config.MAX_TOOL_ITERATIONS):
-            response = self._call_model(working, openai_context)
+            response = self._call_model(working, openai_context, on_text)
 
             if response.stop_reason == "refusal":
                 # content may be empty on a pre-output refusal, and an empty
@@ -404,7 +462,7 @@ class Brain:
             if response.stop_reason != "tool_use":
                 return self._final_text(response), working
 
-            tool_results = self._run_tools(response)
+            tool_results = self._run_tools(response, confirm)
             if not tool_results:
                 # stop_reason said tool_use but no tool_use blocks came back.
                 # Appending an empty content list would make the next request
@@ -418,35 +476,37 @@ class Brain:
         working.append({"role": "assistant", "content": [{"type": "text", "text": fallback}]})
         return fallback, working
 
-    def _call_model(self, working: list[dict], openai_context: tuple[int | None, str] = (None, "")):
+    def _call_model(
+        self, working: list[dict], openai_context: tuple[int | None, str] = (None, ""), on_text=None
+    ):
         if self.is_openai:
-            return self._call_openai_model(working, openai_context)
-        return self._call_anthropic_model(working)
+            return self._call_openai_model(working, openai_context, on_text)
+        return self._call_anthropic_model(working, on_text)
 
-    def _call_anthropic_model(self, working: list[dict]):
+    def _call_anthropic_model(self, working: list[dict], on_text=None):
         kwargs = dict(
-            model=config.MODEL,
+            model=self.model_id,
             max_tokens=config.MAX_TOKENS,
             system=self._system_blocks(),
             tools=self.skills.tool_definitions(),
             messages=self._cached(working),
         )
-        if "claude" in config.MODEL.lower():
+        if "claude" in self.model_id.lower():
             kwargs["thinking"] = {"type": "adaptive"}
             kwargs["output_config"] = {"effort": config.EFFORT}
 
         with self.client.messages.stream(**kwargs) as stream:
-            if self.on_text is not None:
+            if on_text is not None:
                 buffer = ""
                 for chunk in stream.text_stream:
                     buffer += chunk
                     buffer, done = _drain_sentences(buffer)
                     for sentence in done:
                         self.spoke_during_last_turn = True
-                        self.on_text(sentence)
+                        on_text(sentence)
                 if buffer.strip():
                     self.spoke_during_last_turn = True
-                    self.on_text(buffer.strip())
+                    on_text(buffer.strip())
             response = stream.get_final_message()
 
         self.last_usage = response.usage
@@ -547,7 +607,9 @@ class Brain:
                 print("[model] this model has no reasoning control; dropped the parameter")
             return self.client.chat.completions.create(**kwargs)
 
-    def _call_openai_model(self, working: list[dict], context: tuple[int | None, str] = (None, "")):
+    def _call_openai_model(
+        self, working: list[dict], context: tuple[int | None, str] = (None, ""), on_text=None
+    ):
         messages = [{"role": "system", "content": self.system_prompt}]
         latest_plain_user, context_suffix = context
 
@@ -651,8 +713,8 @@ class Brain:
                 buffer, done = _drain_sentences(buffer)
                 for sentence in done:
                     self.spoke_during_last_turn = True
-                    if self.on_text:
-                        self.on_text(sentence)
+                    if on_text:
+                        on_text(sentence)
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -669,8 +731,8 @@ class Brain:
 
         if buffer.strip():
             self.spoke_during_last_turn = True
-            if self.on_text:
-                self.on_text(buffer.strip())
+            if on_text:
+                on_text(buffer.strip())
 
         content_blocks = []
         if full_content:
@@ -734,7 +796,7 @@ class Brain:
             usage=self.last_usage,
         )
 
-    def _run_tools(self, response) -> list[dict]:
+    def _run_tools(self, response, confirm) -> list[dict]:
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -760,7 +822,7 @@ class Brain:
                 continue
 
             if config.CONFIRM_DESTRUCTIVE and risk >= Risk.DANGEROUS:
-                if not self.confirm(skill, tool_input):
+                if not confirm(skill, tool_input):
                     results.append(
                         _tool_result(
                             block.id,

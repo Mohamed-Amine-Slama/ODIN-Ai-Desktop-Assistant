@@ -120,7 +120,16 @@ WAKE_WORD = os.getenv("WAKE_WORD", "on")
 # Speech-to-text: faster-whisper model size. base.en is a good CPU default;
 # small.en is more accurate if your machine can take it.
 STT_MODEL = os.getenv("STT_MODEL", "base.en")
-STT_COMPUTE = os.getenv("STT_COMPUTE", "int8")
+
+# Which device runs the speech model, and at what numeric precision. "auto"
+# for both (the default for each) lets CTranslate2 pick the fastest
+# combination this machine actually supports — an NVIDIA GPU with float16 (or
+# better) when one's usable, CPU int8 otherwise. This is what makes STT fast
+# rather than a source of lag. Force STT_DEVICE=cuda only to troubleshoot: a
+# request for a GPU that isn't actually usable then raises a clear error at
+# startup instead of silently and slowly falling back to CPU.
+STT_DEVICE = os.getenv("STT_DEVICE", "auto")
+STT_COMPUTE = os.getenv("STT_COMPUTE", "auto")
 
 # Text-to-speech: "auto" prefers edge-tts (natural, free, no key) and falls
 # back to the offline Windows SAPI voices. Use "sapi" to force offline, "off"
@@ -141,6 +150,50 @@ VAD_MAX_SECONDS = float(os.getenv("VAD_MAX_SECONDS", "20"))
 # speakers can trigger a false interruption.
 BARGE_IN_THRESHOLD = float(os.getenv("BARGE_IN_THRESHOLD", "0.05"))
 
+# --- Security ---------------------------------------------------------------
+# Scans file reads, shell command output, and web fetches for things that look
+# like API keys/passwords/tokens before they reach the model, get spoken, or
+# get persisted to the conversation log. off | warn (log only, pass through) |
+# redact (mask matches, default) | block (withhold the result entirely).
+SECURITY_SCAN_MODE = os.getenv("SECURITY_SCAN_MODE", "redact").strip().lower()
+
+# Token-bucket throttle on web_fetch/http_request/get_news (core/rate_limit.py)
+# — same limit no matter who triggered the call, so a runaway or
+# prompt-injected loop can't hammer a target unattended. 0 disables it.
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "10"))
+
+# --- Remote channels ---------------------------------------------------------
+# Telegram bridge (core/telegram_channel.py): text the assistant from your
+# phone and get replies back. Off unless a bot token is set. TELEGRAM_CHAT_ID
+# locks the bot to one chat — see that module's docstring for why this matters.
+# Actions requiring confirmation are always auto-declined over this channel;
+# there's nobody there to answer.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Discord bridge (core/discord_channel.py): same shape as Telegram above, just
+# on Discord's Gateway instead of a long-poll REST API. Off unless a bot token
+# is set; DISCORD_CHANNEL_ID locks it to one channel the same way
+# TELEGRAM_CHAT_ID does. Needs the optional 'discord.py' package.
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "")
+
+# --- News / RSS -------------------------------------------------------------
+# get_news skill: comma-separated feed URLs used when the request doesn't name
+# a specific feed. Optional — well-known names (see skills/web_skills.py's
+# NewsSkill.KNOWN) and explicit feed URLs work without this being set.
+RSS_FEEDS = [u.strip() for u in os.getenv("RSS_FEEDS", "").split(",") if u.strip()]
+
+# --- Amazon Bedrock -----------------------------------------------------
+# Selected when MODEL starts with "bedrock/" — see core/brain.py's
+# _BEDROCK_PREFIX. Auth is an AWS Bedrock API key (bearer token, no IAM
+# access-key/secret pair): set AWS_BEARER_TOKEN_BEDROCK in .env and boto3
+# reads it automatically, so nothing here stores or forwards it — this is
+# only the region. Needs the optional `anthropic[bedrock]` extra (pulls in
+# boto3).
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
 # --- Paths ----------------------------------------------------------------
 NOTES_FILE = os.path.join(DATA_DIR, "notes.txt")
 
@@ -151,9 +204,22 @@ def ensure_dirs() -> None:
 
 
 def missing_key_message() -> str | None:
-    """Return a user-facing message if the API key is absent, else None."""
+    """Return a user-facing message if the API key is absent, else None.
+
+    Amazon Bedrock (MODEL=bedrock/...) authenticates via
+    AWS_BEARER_TOKEN_BEDROCK, which boto3 reads directly from the
+    environment — API_KEY is never set for that path, so it must not be
+    treated as missing.
+    """
     if API_KEY:
         return None
+    if MODEL.startswith("bedrock/"):
+        if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
+            return None
+        return (
+            "AWS_BEARER_TOKEN_BEDROCK is not set. Add your AWS Bedrock API "
+            "key to .env."
+        )
     return (
         "API_KEY is not set. Copy .env.example to .env and add your "
         "API key."

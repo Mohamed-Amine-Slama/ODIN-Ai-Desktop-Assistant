@@ -10,6 +10,7 @@ A shell command can never be undone, so this skill never records an undo entry.
 import subprocess
 
 from core.risk import Risk, classify_command
+from core.security import guard
 
 from .base_skill import BaseSkill
 
@@ -74,6 +75,7 @@ class RunCommandSkill(BaseSkill):
         output = "\n".join(parts) if parts else "(no output)"
         if len(output) > OUTPUT_LIMIT:
             output = output[:OUTPUT_LIMIT] + f"\n[truncated at {OUTPUT_LIMIT} characters]"
+        output = guard(output, source="run_command")
 
         if completed.returncode != 0:
             return f"Command finished with exit code {completed.returncode}.\n{output}"

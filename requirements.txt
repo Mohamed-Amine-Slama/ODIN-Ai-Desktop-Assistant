@@ -11,10 +11,25 @@ psutil>=5.9.0
 requests>=2.31.0
 plyer>=2.1.0
 
+# Native Anthropic path (MODEL names a Claude, or BASE_URL is empty) and
+# Amazon Bedrock (MODEL=bedrock/..., core/brain.py's _BEDROCK_PREFIX): both
+# optional in the sense that Jarvis runs fine on any OpenAI-compatible
+# endpoint without this, but importing anthropic raises a clear error at
+# startup instead of a vague one if a Claude/Bedrock MODEL is configured
+# without it installed. The `bedrock` extra additionally pulls in boto3,
+# which AnthropicBedrock needs to talk to Bedrock's runtime API — auth is
+# an AWS Bedrock API key (AWS_BEARER_TOKEN_BEDROCK in .env), which boto3
+# picks up from the environment on its own.
+anthropic[bedrock]>=0.68.0
+
 # Screen awareness (see_screen) and clipboard
 mss>=9.0.1
 pillow>=10.0.0
 pyperclip>=1.8.2
+
+# read_pdf: optional. Without it, the skill reports what's missing instead
+# of failing to start.
+pdfplumber>=0.11.0
 
 # web_search / deep_learn's search step. No API key, no signup, no billing —
 # unlike every LLM-provider-hosted search option, this needs nothing beyond
@@ -35,7 +50,8 @@ pyautogui>=0.9.54
 # Hand-gesture cursor control (core/gesture.py, ENABLE_GESTURE_CONTROL):
 # optional. Without these, hand_control degrades to a "not installed"
 # message rather than crashing. Reuses pyautogui above for the actual
-# cursor moves/clicks.
+# cursor moves/clicks. mediapipe's hand-landmark model (~8MB) isn't bundled
+# with the package — it's downloaded once to data/models/ on first use.
 opencv-python>=4.9.0
 mediapipe>=0.10.14
 
@@ -43,6 +59,13 @@ mediapipe>=0.10.14
 # else works without it.
 PyQt6>=6.6.0
 keyboard>=0.13.5; sys_platform == "win32"
+
+# Discord bridge (core/discord_channel.py, DISCORD_BOT_TOKEN): optional.
+# Discord's bot Gateway is a persistent websocket protocol (handshake,
+# heartbeats, reconnect/resume), unlike Telegram's plain long-poll REST API —
+# genuinely complex enough to be worth this library instead of hand-rolling
+# it. Without it, the bridge just stays off and logs why.
+discord.py>=2.3.0
 
 # Tests
 pytest>=8.0.0
@@ -84,7 +107,11 @@ msal>=1.28.0
 # what's missing, and memory recall quietly falls back to plain-text search.
 
 # Local embeddings — no API key, no per-chunk cost, works offline after the
-# first run (which downloads the ~90MB all-MiniLM-L6-v2 model).
+# first run (which downloads the ~90MB all-MiniLM-L6-v2 model). Uses an
+# NVIDIA GPU automatically if the installed torch build supports CUDA — pip's
+# default torch wheel is CPU-only on Windows, so for GPU acceleration here
+# install torch from https://pytorch.org/get-started/locally/ *before*
+# installing this file (pip won't downgrade an already-satisfied dependency).
 sentence-transformers>=3.0.0
 
 # Local vector store, persisted under data/knowledge_db and data/memory_db.
@@ -103,6 +130,9 @@ numpy>=1.24.0
 
 # Speech-to-text: local Whisper. Offline, accurate, and your audio never
 # leaves the machine (the old SpeechRecognition backend posted it to Google).
+# Uses an NVIDIA GPU automatically (STT_DEVICE=auto in .env) — on Windows
+# that additionally needs the CUDA 12 runtime + cuDNN 9 on PATH, or just
+# `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` alongside this file.
 faster-whisper>=1.0.0
 
 # Text-to-speech: Edge neural voices (free, no key) + playback.

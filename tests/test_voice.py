@@ -17,6 +17,91 @@ from core.speech_output import EdgeEngine, SapiEngine, SpeechOutput, _make_engin
 from main import NO_WORDS, YES_WORDS, Session
 
 
+# -- STT model loading / device selection -----------------------------------
+# STT_DEVICE/STT_COMPUTE default to "auto" so CTranslate2 can pick an NVIDIA
+# GPU over CPU when one's usable — the actual fix for voice lag on a GPU
+# machine. Regression guard: compute_type used to be hardcoded to the
+# CPU-tuned "int8" regardless of device, so "auto" device selection alone
+# never actually sped anything up.
+
+def test_load_model_passes_the_configured_device_and_compute_type(monkeypatch, capsys):
+    from core.speech_input import _load_model
+
+    captured = {}
+
+    class FakeWhisperModel:
+        def __init__(self, model_size, **kwargs):
+            captured["model_size"] = model_size
+            captured["kwargs"] = kwargs
+            self.model = SimpleNamespace(device="cuda", compute_type="float16")
+
+    monkeypatch.setitem(
+        sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel)
+    )
+    monkeypatch.setattr(config, "STT_MODEL", "base.en", raising=False)
+    monkeypatch.setattr(config, "STT_DEVICE", "auto", raising=False)
+    monkeypatch.setattr(config, "STT_COMPUTE", "auto", raising=False)
+
+    _load_model()
+
+    assert captured["model_size"] == "base.en"
+    assert captured["kwargs"]["device"] == "auto"
+    assert captured["kwargs"]["compute_type"] == "auto"
+
+
+def test_load_model_reports_what_auto_actually_resolved_to(monkeypatch, capsys):
+    """'auto' is opaque from the outside — GPU use has to be something you
+    can verify, not just hope for."""
+    from core.speech_input import _load_model
+
+    class FakeWhisperModel:
+        def __init__(self, *a, **k):  # noqa: ARG002
+            self.model = SimpleNamespace(device="cuda", compute_type="float16")
+
+    monkeypatch.setitem(
+        sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel)
+    )
+
+    _load_model()
+
+    out = capsys.readouterr().out
+    assert "loaded on cuda" in out
+    assert "compute_type=float16" in out
+
+
+def test_load_model_reporting_degrades_when_attributes_are_missing(monkeypatch, capsys):
+    """The .device/.compute_type read back off the model are CTranslate2
+    internals, not documented faster-whisper API — a version that renames or
+    drops them must fall back to the requested config values, not raise."""
+    from core.speech_input import _load_model
+
+    class FakeWhisperModel:
+        def __init__(self, *a, **k):  # noqa: ARG002
+            self.model = object()  # no .device / .compute_type
+
+    monkeypatch.setitem(
+        sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel)
+    )
+    monkeypatch.setattr(config, "STT_DEVICE", "cpu", raising=False)
+    monkeypatch.setattr(config, "STT_COMPUTE", "int8", raising=False)
+
+    _load_model()
+
+    out = capsys.readouterr().out
+    assert "loaded on cpu" in out
+    assert "compute_type=int8" in out
+
+
+def test_load_model_reports_the_package_being_missing(monkeypatch):
+    from core.audio import MicrophoneUnavailable
+    from core.speech_input import _load_model
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)
+
+    with pytest.raises(MicrophoneUnavailable, match="faster-whisper isn't installed"):
+        _load_model()
+
+
 # -- speech output ---------------------------------------------------------
 
 def test_missing_engines_run_silent_not_crash(monkeypatch):

@@ -48,6 +48,24 @@ CREATE TABLE IF NOT EXISTS knowledge_topics (
     chunk_count INTEGER NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    created  REAL NOT NULL,
+    prompt   TEXT NOT NULL,
+    schedule TEXT NOT NULL,       -- e.g. "daily 08:00", "mon,wed,fri 18:30"
+    last_run REAL,                -- NULL until it has fired at least once
+    enabled  INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS security_events (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       REAL NOT NULL,
+    source   TEXT NOT NULL,   -- e.g. "read_file:C:\\notes.txt", "run_command"
+    mode     TEXT NOT NULL,   -- warn | redact | block
+    pattern  TEXT NOT NULL,   -- comma-joined names of the patterns that matched
+    preview  TEXT NOT NULL    -- short REDACTED preview only, never the raw secret
+);
 """
 
 
@@ -250,6 +268,64 @@ class Store:
                 "SELECT topic, subtopics, chunk_count, updated_at FROM knowledge_topics WHERE topic = ?",
                 (topic,),
             ).fetchone()
+
+    # -- scheduled tasks -----------------------------------------------------
+
+    def add_scheduled_task(self, prompt: str, schedule: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO scheduled_tasks (created, prompt, schedule) VALUES (?, ?, ?)",
+                (time.time(), prompt, schedule),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def list_scheduled_tasks(self, enabled_only: bool = False) -> list[sqlite3.Row]:
+        query = "SELECT id, created, prompt, schedule, last_run, enabled FROM scheduled_tasks"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY id"
+        with self._lock:
+            return self._conn.execute(query).fetchall()
+
+    def get_scheduled_task(self, task_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, created, prompt, schedule, last_run, enabled FROM scheduled_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+
+    def delete_scheduled_task(self, task_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def mark_task_run(self, task_id: int, ts: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE scheduled_tasks SET last_run = ? WHERE id = ?", (ts, task_id)
+            )
+            self._conn.commit()
+
+    # -- security audit log -------------------------------------------------
+
+    def log_security_event(self, source: str, mode: str, pattern: str, preview: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO security_events (ts, source, mode, pattern, preview) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (time.time(), source, mode, pattern, preview),
+            )
+            self._conn.commit()
+
+    def recent_security_events(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT ts, source, mode, pattern, preview FROM security_events "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
     # -- migration ---------------------------------------------------------
 

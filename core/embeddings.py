@@ -15,7 +15,14 @@ _MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 def get_embedder():
-    """The shared SentenceTransformer instance, loaded on first use."""
+    """The shared SentenceTransformer instance, loaded on first use.
+
+    device is left unset so sentence-transformers auto-detects it — it
+    already prefers a CUDA GPU over CPU when the installed torch build
+    supports one. That auto-detection is opaque from the outside, though, so
+    this reports what it actually picked, the same way core.speech_input
+    does for the STT model — GPU use should be something you can verify.
+    """
     global _embedder
     if _embedder is None:
         try:
@@ -26,6 +33,7 @@ def get_embedder():
                 "Run: pip install -r requirements.txt"
             ) from e
         _embedder = SentenceTransformer(_MODEL_NAME)
+        print(f"[embeddings] '{_MODEL_NAME}' loaded on {_embedder.device}")
     return _embedder
 
 
