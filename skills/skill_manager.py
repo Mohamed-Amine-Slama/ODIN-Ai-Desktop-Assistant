@@ -16,6 +16,8 @@ from .system_skills import (
     PowerControlSkill,
 )
 from .web_skills import (
+    HttpRequestSkill,
+    NewsSkill,
     OpenWebsiteSkill,
     SearchInBrowserSkill,
     WeatherSkill,
@@ -26,7 +28,7 @@ from .web_skills import (
 from .vision_skills import ScreenshotSkill
 from .file_skills import (
     DeleteFileSkill, ListDirSkill, MakeDirSkill, MoveFileSkill,
-    ReadFileSkill, SearchFilesSkill, WriteFileSkill,
+    ReadFileSkill, ReadPdfSkill, SearchFilesSkill, WriteFileSkill,
 )
 from .window_skills import (
     CloseWindowSkill, FocusWindowSkill, ListWindowsSkill, SetWindowStateSkill,
@@ -36,6 +38,7 @@ from .utility_skills import (
     NoteSkill,
     ReminderSkill,
     ListRemindersSkill,
+    ScheduleTaskSkill,
     MemorySkill,
     CalculatorSkill,
     ClipboardSkill,
@@ -51,8 +54,11 @@ SKILL_CLASSES = [
     OpenWebsiteSkill,
     SearchInBrowserSkill,
     WeatherSkill,
+    HttpRequestSkill,
+    NewsSkill,
     ScreenshotSkill,
     ReadFileSkill,
+    ReadPdfSkill,
     ListDirSkill,
     SearchFilesSkill,
     WriteFileSkill,
@@ -67,6 +73,7 @@ SKILL_CLASSES = [
     NoteSkill,
     ReminderSkill,
     ListRemindersSkill,
+    ScheduleTaskSkill,
     MemorySkill,
     CalculatorSkill,
     ClipboardSkill,

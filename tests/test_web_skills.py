@@ -1,11 +1,13 @@
-"""Tests for skills/web_skills.py's WebFetchSkill and web_search(): connection
-handling, the bounded DNS timeout in _is_public_url, and DuckDuckGo result
-parsing. No real network calls are made."""
+"""Tests for skills/web_skills.py's WebFetchSkill, HttpRequestSkill, and
+web_search(): connection handling, the bounded DNS timeout in
+_is_public_url, and DuckDuckGo result parsing. No real network calls are
+made."""
 import socket
 
 import pytest
 
-from skills.web_skills import WebFetchSkill, _is_public_url, web_search
+from core.risk import Risk
+from skills.web_skills import HttpRequestSkill, NewsSkill, WebFetchSkill, _is_public_url, web_search
 
 
 class _FakeResponse:
@@ -88,6 +90,31 @@ def test_web_fetch_decodes_unlabeled_utf8_correctly(monkeypatch, public_url):
     _patch_get(monkeypatch, resp)
     out = WebFetchSkill().run(url="http://example.com")
     assert "Café 😀" in out
+
+
+def test_web_fetch_respects_rate_limit(monkeypatch, public_url):
+    monkeypatch.setattr("skills.web_skills.rate_limit.allow", lambda key: False)  # noqa: ARG005
+    calls = []
+    monkeypatch.setattr("skills.web_skills.requests.get", lambda *a, **k: calls.append(1))  # noqa: ARG005
+    out = WebFetchSkill().run(url="http://example.com")
+    assert "too many" in out.lower()
+    assert calls == []
+
+
+def test_web_fetch_marks_its_result_untrusted_for_the_security_scan(monkeypatch, public_url):
+    resp = _FakeResponse(
+        status_code=200, headers={"content-type": "text/plain"}, chunks=[b"hello"]
+    )
+    _patch_get(monkeypatch, resp)
+    captured = {}
+
+    def fake_guard(text, *, source, untrusted=False):  # noqa: ARG001
+        captured["untrusted"] = untrusted
+        return text
+
+    monkeypatch.setattr("skills.web_skills.guard", fake_guard)
+    WebFetchSkill().run(url="http://example.com")
+    assert captured["untrusted"] is True
 
 
 def test_web_fetch_respects_an_explicitly_declared_charset(monkeypatch, public_url):
@@ -200,3 +227,220 @@ def test_is_public_url_bounds_dns_timeout(monkeypatch):
     assert _is_public_url("http://example.com") is False
     assert seen[0] is not None, "a bounded timeout must be set before resolving"
     assert socket.getdefaulttimeout() is None, "must restore the previous global timeout"
+
+
+# -- http_request -------------------------------------------------------------
+
+class _FakeHttpResponse:
+    def __init__(self, status_code=200, text="", headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+
+def _patch_request(monkeypatch, response):
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return response
+
+    monkeypatch.setattr("skills.web_skills.requests.request", fake_request)
+    return calls
+
+
+def test_http_request_get_and_head_are_safe_tier():
+    assert HttpRequestSkill().risk_for() == Risk.SAFE  # default method is GET
+    assert HttpRequestSkill().risk_for(method="get") == Risk.SAFE
+    assert HttpRequestSkill().risk_for(method="HEAD") == Risk.SAFE
+
+
+def test_http_request_mutating_methods_are_moderate_tier():
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        assert HttpRequestSkill().risk_for(method=method) == Risk.MODERATE
+
+
+def test_http_request_rejects_private_addresses(monkeypatch):
+    monkeypatch.setattr("skills.web_skills._is_public_url", lambda url: False)  # noqa: ARG005
+    out = HttpRequestSkill().run(url="http://localhost/admin")
+    assert "won't call" in out
+
+
+def test_http_request_rejects_an_invalid_url(public_url):
+    out = HttpRequestSkill().run(url="javascript:alert(1)")
+    assert "valid public" in out
+
+
+def test_http_request_rejects_an_unsupported_method(public_url):
+    out = HttpRequestSkill().run(url="http://example.com", method="TRACE")
+    assert "Unsupported method" in out
+
+
+def test_http_request_sends_method_body_and_headers(monkeypatch, public_url):
+    calls = _patch_request(monkeypatch, _FakeHttpResponse(status_code=200, text="ok"))
+
+    out = HttpRequestSkill().run(
+        url="http://example.com/hook",
+        method="post",
+        body="payload",
+        headers={"X-Test": "1"},
+    )
+
+    assert "HTTP 200" in out and "ok" in out
+    method, url, kwargs = calls[0]
+    assert method == "POST"
+    assert url == "http://example.com/hook"
+    assert kwargs["data"] == "payload"
+    assert kwargs["headers"] == {"X-Test": "1"}
+    assert kwargs["allow_redirects"] is False
+
+
+def test_http_request_does_not_follow_redirects(monkeypatch, public_url):
+    _patch_request(monkeypatch, _FakeHttpResponse(status_code=302))
+    out = HttpRequestSkill().run(url="http://example.com")
+    assert "redirect" in out.lower()
+
+
+def test_http_request_reports_timeout(monkeypatch, public_url):
+    import requests
+
+    def boom(method, url, **kwargs):  # noqa: ARG001
+        raise requests.Timeout()
+
+    monkeypatch.setattr("skills.web_skills.requests.request", boom)
+    assert "did not respond in time" in HttpRequestSkill().run(url="http://example.com")
+
+
+def test_http_request_reports_connection_failures(monkeypatch, public_url):
+    import requests
+
+    def boom(method, url, **kwargs):  # noqa: ARG001
+        raise requests.ConnectionError("no route to host")
+
+    monkeypatch.setattr("skills.web_skills.requests.request", boom)
+    assert "failed" in HttpRequestSkill().run(url="http://example.com").lower()
+
+
+def test_http_request_truncates_a_long_response(monkeypatch, public_url):
+    _patch_request(monkeypatch, _FakeHttpResponse(status_code=200, text="x" * 30_000))
+    out = HttpRequestSkill().run(url="http://example.com")
+    assert "truncated" in out
+    assert len(out) < 25_000
+
+
+def test_http_request_reports_an_empty_body(monkeypatch, public_url):
+    _patch_request(monkeypatch, _FakeHttpResponse(status_code=204, text=""))
+    assert "empty response" in HttpRequestSkill().run(url="http://example.com")
+
+
+def test_http_request_respects_rate_limit(monkeypatch, public_url):
+    monkeypatch.setattr("skills.web_skills.rate_limit.allow", lambda key: False)  # noqa: ARG005
+    calls = []
+    monkeypatch.setattr("skills.web_skills.requests.request", lambda *a, **k: calls.append(1))  # noqa: ARG005
+    out = HttpRequestSkill().run(url="http://example.com")
+    assert "too many" in out.lower()
+    assert calls == []
+
+
+def test_http_request_marks_its_result_untrusted_for_the_security_scan(monkeypatch, public_url):
+    _patch_request(monkeypatch, _FakeHttpResponse(status_code=200, text="ok"))
+    captured = {}
+
+    def fake_guard(text, *, source, untrusted=False):  # noqa: ARG001
+        captured["untrusted"] = untrusted
+        return text
+
+    monkeypatch.setattr("skills.web_skills.guard", fake_guard)
+    HttpRequestSkill().run(url="http://example.com")
+    assert captured["untrusted"] is True
+
+
+# -- get_news -------------------------------------------------------------------
+
+_RSS_XML = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<title>Example Feed</title>
+<item><title>First Story</title><link>https://example.com/1</link></item>
+<item><title>Second Story</title><link>https://example.com/2</link></item>
+</channel></rss>"""
+
+_ATOM_XML = """<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Atom Feed</title>
+<entry><title>Atom Story</title><link href="https://example.com/atom1"/></entry>
+</feed>"""
+
+
+class _FakeNewsResponse:
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+def test_get_news_resolves_a_known_feed_name_and_parses_rss(monkeypatch):
+    monkeypatch.setattr(
+        "skills.web_skills.requests.get", lambda *a, **k: _FakeNewsResponse(_RSS_XML.encode())  # noqa: ARG005
+    )
+    out = NewsSkill().run(feed="hacker news")
+    assert "First Story" in out and "https://example.com/1" in out
+    assert "Second Story" in out
+
+
+def test_get_news_parses_atom_feeds_too(monkeypatch):
+    monkeypatch.setattr(
+        "skills.web_skills.requests.get", lambda *a, **k: _FakeNewsResponse(_ATOM_XML.encode())  # noqa: ARG005
+    )
+    out = NewsSkill().run(feed="https://example.com/atom.xml")
+    assert "Atom Story" in out and "https://example.com/atom1" in out
+
+
+def test_get_news_uses_configured_default_feeds_when_none_is_named(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "RSS_FEEDS", ["https://example.com/feed.xml"], raising=False)
+    monkeypatch.setattr(
+        "skills.web_skills.requests.get", lambda *a, **k: _FakeNewsResponse(_RSS_XML.encode())  # noqa: ARG005
+    )
+    out = NewsSkill().run()
+    assert "First Story" in out
+
+
+def test_get_news_with_no_feed_named_and_no_default_configured(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "RSS_FEEDS", [], raising=False)
+    out = NewsSkill().run()
+    assert "no feed" in out.lower()
+
+
+def test_get_news_rejects_an_unresolvable_feed(monkeypatch):
+    monkeypatch.setattr("skills.web_skills._is_public_url", lambda url: False)  # noqa: ARG005
+    out = NewsSkill().run(feed="some-made-up-host")
+    assert "no feed" in out.lower()
+
+
+def test_get_news_respects_rate_limit(monkeypatch):
+    monkeypatch.setattr("skills.web_skills.rate_limit.allow", lambda key: False)  # noqa: ARG005
+    out = NewsSkill().run(feed="hacker news")
+    assert "too many" in out.lower()
+
+
+def test_get_news_reports_fetch_errors_without_failing_the_whole_call(monkeypatch):
+    import requests
+
+    def boom(*a, **k):  # noqa: ARG001
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr("skills.web_skills.requests.get", boom)
+    out = NewsSkill().run(feed="hacker news")
+    assert "couldn't get" in out.lower()
+
+
+def test_get_news_respects_max_items(monkeypatch):
+    monkeypatch.setattr(
+        "skills.web_skills.requests.get", lambda *a, **k: _FakeNewsResponse(_RSS_XML.encode())  # noqa: ARG005
+    )
+    out = NewsSkill().run(feed="hacker news", max_items=1)
+    assert len(out.strip().splitlines()) == 1

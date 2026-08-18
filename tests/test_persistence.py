@@ -12,6 +12,7 @@ from skills.utility_skills import (
     MemorySkill,
     NoteSkill,
     ReminderSkill,
+    ScheduleTaskSkill,
 )
 
 
@@ -155,6 +156,65 @@ def test_reminder_rejects_non_finite_minutes(store):
     assert "real number" in ReminderSkill().run(message="x", minutes=float("nan"))
     assert "real number" in ReminderSkill().run(message="x", minutes=float("inf"))
     assert store.pending_reminders() == []
+
+
+# -- scheduled tasks --------------------------------------------------------
+
+def test_schedule_task_create_and_list(store):
+    skill = ScheduleTaskSkill()
+    out = skill.run(action="create", prompt="give me a briefing", schedule="daily 08:00")
+    assert "Scheduled task #" in out
+    assert "give me a briefing" in out
+
+    listing = skill.run(action="list")
+    assert "give me a briefing" in listing
+    assert "daily 08:00" in listing
+
+
+def test_schedule_task_list_when_empty(store):
+    assert "no scheduled tasks" in ScheduleTaskSkill().run(action="list")
+
+
+def test_schedule_task_rejects_an_unparsable_schedule(store):
+    out = ScheduleTaskSkill().run(action="create", prompt="do a thing", schedule="whenever")
+    assert "day part" in out or "recognise" in out
+    assert store.list_scheduled_tasks() == []
+
+
+def test_schedule_task_create_requires_a_prompt(store):
+    out = ScheduleTaskSkill().run(action="create", prompt="  ", schedule="daily 08:00")
+    assert "should this task do" in out
+    assert store.list_scheduled_tasks() == []
+
+
+def test_schedule_task_delete(store):
+    skill = ScheduleTaskSkill()
+    skill.run(action="create", prompt="x", schedule="daily 08:00")
+    task_id = store.list_scheduled_tasks()[0]["id"]
+
+    out = skill.run(action="delete", task_id=task_id)
+
+    assert "Removed" in out
+    assert store.list_scheduled_tasks() == []
+
+
+def test_schedule_task_delete_unknown_id(store):
+    out = ScheduleTaskSkill().run(action="delete", task_id=999)
+    assert "don't have" in out
+
+
+def test_schedule_task_delete_requires_an_id(store):
+    out = ScheduleTaskSkill().run(action="delete")
+    assert "Which task id" in out
+
+
+def test_schedule_task_survives_a_new_store(store, tmp_path):
+    ScheduleTaskSkill().run(action="create", prompt="persisted", schedule="daily 08:00")
+    reopened = Store(str(tmp_path / "test.db"))
+    try:
+        assert any(r["prompt"] == "persisted" for r in reopened.list_scheduled_tasks())
+    finally:
+        reopened.close()
 
 
 # -- memory ----------------------------------------------------------------

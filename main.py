@@ -17,10 +17,12 @@ Commands (work in either mode):
 import sys
 
 import config
-from core.brain import Brain, friendly_error
-from core.scheduler import ReminderScheduler
+from core.brain import Brain, auto_decline, friendly_error
+from core.discord_channel import DiscordChannel
+from core.scheduler import ReminderScheduler, TaskScheduler
 from core.speech_output import SpeechOutput
 from core.store import get_store
+from core.telegram_channel import TelegramChannel
 from core.undo import get_journal, prune_trash
 
 COMMANDS = """Commands:
@@ -219,10 +221,18 @@ class Session:
             print(f"  [done] {skill.name} (cannot be undone)")
 
 
-def handle_command(cmd: str, brain: Brain, session: Session) -> None:
+def handle_command(
+    cmd: str, brain: Brain, session: Session, *, task_scheduler=None, telegram=None, discord=None
+) -> None:
     cmd = cmd.strip().lower()
     if cmd in ("/quit", "/exit"):
         print("Goodbye.")
+        if task_scheduler is not None:
+            task_scheduler.stop()
+        if telegram is not None:
+            telegram.stop()
+        if discord is not None:
+            discord.stop()
         session.shutdown()
         sys.exit(0)
     if cmd == "/undo":
@@ -300,6 +310,52 @@ def main() -> None:
     missed = scheduler.fire_due()
     scheduler.start()
 
+    # Recurring scheduled tasks (schedule_task skill) — a full brain turn run
+    # unattended, so confirmations are auto-declined and the reply is spoken
+    # the same way a normal turn's would be. Whether anything was already
+    # spoken is tracked in a local flag, not read from brain.spoke_during_
+    # last_turn after the call returns: that instance attribute is only
+    # guaranteed accurate while _turn_lock is held, and the main loop or the
+    # Telegram bridge could acquire it and overwrite it the moment this
+    # thread's ask() releases it, before this function gets to check it.
+    # speaker.say() (not session.speak()) is deliberate too — SpeechOutput's
+    # queue is thread-safe, but Session's barge-in watcher is not designed
+    # to be started/stopped from more than one thread.
+    def run_scheduled_task(prompt: str) -> None:
+        spoken = False
+
+        def capture_and_speak(sentence: str) -> None:
+            nonlocal spoken
+            spoken = True
+            speaker.say(sentence)
+
+        try:
+            reply = brain.ask(prompt, confirm=auto_decline, on_text=capture_and_speak)
+        except Exception as e:  # noqa: BLE001 - one bad scheduled run must not kill the poller
+            print(f"[scheduled task] {friendly_error(e)}")
+            return
+        if not spoken:
+            speaker.say(reply)
+
+    task_scheduler = TaskScheduler(store, run_scheduled_task)
+    task_scheduler.start()
+
+    # Telegram/Discord bridges — off unless their bot token is set. Replies
+    # go back as text on that channel only, never spoken on the desktop, and
+    # confirmations are auto-declined for the same reason as scheduled tasks:
+    # nobody is there to answer them.
+    def handle_remote_message(text: str) -> str:
+        try:
+            return brain.ask(text, confirm=auto_decline, on_text=lambda _s: None)
+        except Exception as e:  # noqa: BLE001 - a bad turn must not kill the poll loop
+            return friendly_error(e)
+
+    telegram = TelegramChannel(handle_remote_message)
+    telegram_live = telegram.start()
+
+    discord = DiscordChannel(handle_remote_message)
+    discord_live = discord.start()
+
     if config.DEFAULT_MODE == "voice":
         print(session.set_mode("voice"))
 
@@ -309,6 +365,10 @@ def main() -> None:
         print(f"Restored {restored} messages from your last session.")
     if missed:
         print(f"Fired {missed} reminder(s) that came due while I was closed.")
+    if telegram_live:
+        print("Telegram bridge is live.")
+    if discord_live:
+        print("Discord bridge is live.")
     speaker.say(f"{config.ASSISTANT_NAME} online. How can I help?")
 
     while True:
@@ -317,6 +377,9 @@ def main() -> None:
         except KeyboardInterrupt:
             print("\nGoodbye.")
             scheduler.stop()
+            task_scheduler.stop()
+            telegram.stop()
+            discord.stop()
             session.shutdown()
             return
         except Exception as e:  # noqa: BLE001 - a transcription/mic hiccup must not kill the loop
@@ -332,11 +395,26 @@ def main() -> None:
             continue
 
         if text.startswith("/"):
-            handle_command(text, brain, session)
+            handle_command(
+                text, brain, session, task_scheduler=task_scheduler, telegram=telegram, discord=discord
+            )
             continue
 
+        # Tracked locally, not read from brain.spoke_during_last_turn after
+        # ask() returns: now that a scheduled task or a Telegram message can
+        # call ask() concurrently, that instance attribute is only reliable
+        # while _turn_lock is held — another thread's turn could start and
+        # overwrite it the instant this one releases the lock, before this
+        # loop gets to check it.
+        spoken = False
+
+        def _capture_and_speak(sentence: str) -> None:
+            nonlocal spoken
+            spoken = True
+            session.speak(sentence)
+
         try:
-            reply = brain.ask(text)
+            reply = brain.ask(text, on_text=_capture_and_speak)
         except KeyboardInterrupt:
             print("\n[interrupted]")
             continue
@@ -346,7 +424,7 @@ def main() -> None:
 
         # The streaming callback already spoke the reply. Only speak here if
         # nothing was streamed (e.g. a tool-only turn with no text).
-        if not brain.spoke_during_last_turn:
+        if not spoken:
             speaker.say(reply)
         speaker.wait(timeout=60)
         session.stop_barge_in()

@@ -1,10 +1,18 @@
 """Tests for filesystem skills."""
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from core.risk import Risk
-from skills.file_skills import ListDirSkill, ReadFileSkill, SearchFilesSkill
+from skills.file_skills import (
+    ListDirSkill,
+    ReadFileSkill,
+    ReadPdfSkill,
+    SearchFilesSkill,
+    _parse_pdf_pages,
+)
 
 
 @pytest.fixture
@@ -46,6 +54,135 @@ def test_read_file_truncates(tree):
     out = ReadFileSkill().run(path=str(big), max_bytes=100)
     assert "truncated" in out.lower()
     assert len(out) < 1000
+
+
+# -- read_pdf ----------------------------------------------------------------
+
+def _fake_pdfplumber(monkeypatch, page_texts):
+    """page_texts: list[str | None] - one entry per page; None simulates a
+    page with no extractable text (e.g. a scanned image)."""
+
+    class _Page:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _PDF:
+        def __init__(self, pages):
+            self.pages = pages
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    module = SimpleNamespace(open=lambda path: _PDF([_Page(t) for t in page_texts]))  # noqa: ARG005
+    monkeypatch.setitem(sys.modules, "pdfplumber", module)
+
+
+@pytest.fixture
+def pdf_file(tmp_path):
+    path = tmp_path / "report.pdf"
+    path.write_bytes(b"%PDF-1.4 fake")  # content is irrelevant; pdfplumber is faked
+    return path
+
+
+def test_parse_pdf_pages_range():
+    assert _parse_pdf_pages("1-3", total_pages=10) == [0, 1, 2]
+
+
+def test_parse_pdf_pages_list():
+    assert _parse_pdf_pages("1,3,5", total_pages=10) == [0, 2, 4]
+
+
+def test_parse_pdf_pages_clamps_out_of_range():
+    assert _parse_pdf_pages("1-100", total_pages=3) == [0, 1, 2]
+
+
+def test_parse_pdf_pages_deduplicates_and_sorts():
+    assert _parse_pdf_pages("3,1,1-2", total_pages=10) == [0, 1, 2]
+
+
+def test_parse_pdf_pages_rejects_garbage():
+    with pytest.raises(ValueError, match="valid page"):
+        _parse_pdf_pages("abc", total_pages=10)
+
+
+def test_read_pdf_is_safe_tier():
+    assert ReadPdfSkill().risk_for(path="x") == Risk.SAFE
+
+
+def test_read_pdf_reports_missing_package(monkeypatch, pdf_file):
+    monkeypatch.setitem(sys.modules, "pdfplumber", None)
+    out = ReadPdfSkill().run(path=str(pdf_file))
+    assert "pdfplumber" in out
+
+
+def test_read_pdf_returns_all_pages_by_default(monkeypatch, pdf_file):
+    _fake_pdfplumber(monkeypatch, ["page one text", "page two text"])
+    out = ReadPdfSkill().run(path=str(pdf_file))
+    assert "page one text" in out
+    assert "page two text" in out
+
+
+def test_read_pdf_honours_a_page_range(monkeypatch, pdf_file):
+    _fake_pdfplumber(monkeypatch, ["first", "second", "third"])
+    out = ReadPdfSkill().run(path=str(pdf_file), pages="2")
+    assert "second" in out
+    assert "first" not in out
+    assert "third" not in out
+
+
+def test_read_pdf_rejects_an_invalid_page_spec(monkeypatch, pdf_file):
+    _fake_pdfplumber(monkeypatch, ["only page"])
+    out = ReadPdfSkill().run(path=str(pdf_file), pages="not-a-page")
+    assert "valid page" in out
+
+
+def test_read_pdf_reports_no_extractable_text(monkeypatch, pdf_file):
+    _fake_pdfplumber(monkeypatch, [None, None])
+    out = ReadPdfSkill().run(path=str(pdf_file))
+    assert "no extractable text" in out
+
+
+def test_read_pdf_rejects_non_pdf_extension(tree):
+    out = ReadPdfSkill().run(path=str(tree / "notes.txt"))
+    assert ".pdf" in out
+
+
+def test_read_pdf_missing_file(tmp_path):
+    out = ReadPdfSkill().run(path=str(tmp_path / "nope.pdf"))
+    assert "no file" in out.lower()
+
+
+def test_read_pdf_blank_path():
+    assert "path to work with" in ReadPdfSkill().run(path="")
+
+
+def test_read_pdf_redacts_secrets(monkeypatch, pdf_file, tmp_path):
+    """Consistent with read_file: PDF text goes through the same
+    secret-scanning guard before it reaches the model. A match makes guard()
+    log an audit event, which would otherwise open the *real* project
+    database — point it at a throwaway one instead."""
+    import config
+    from core.store import Store, set_store
+
+    monkeypatch.setattr(config, "SECURITY_SCAN_MODE", "redact", raising=False)
+    store = Store(str(tmp_path / "audit.db"))
+    set_store(store)
+    _fake_pdfplumber(monkeypatch, ["my key is AKIAABCDEFGHIJKLMNOP thanks"])
+
+    try:
+        out = ReadPdfSkill().run(path=str(pdf_file))
+    finally:
+        set_store(None)
+        store.close()
+
+    assert "AKIAABCDEFGHIJKLMNOP" not in out
+    assert "REDACTED" in out
 
 
 def test_list_dir(tree):

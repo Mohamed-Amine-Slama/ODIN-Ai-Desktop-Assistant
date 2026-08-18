@@ -13,10 +13,12 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import config
 from core import gesture
-from core.brain import Brain
-from core.scheduler import ReminderScheduler
+from core.brain import Brain, auto_decline, friendly_error
+from core.discord_channel import DiscordChannel
+from core.scheduler import ReminderScheduler, TaskScheduler
 from core.speech_output import SpeechOutput
 from core.store import get_store
+from core.telegram_channel import TelegramChannel
 from core.undo import prune_trash
 from main import Session
 from ui.app_window import OrbWindow
@@ -104,6 +106,37 @@ def main() -> None:
     missed = scheduler.fire_due()
     scheduler.start()
 
+    # Recurring scheduled tasks (schedule_task skill): a full brain turn run
+    # unattended, on its own thread. Confirmations auto-decline — nobody is
+    # there to answer them — but on_text/on_action/on_tool_activity stay the
+    # bridge's, so a briefing is spoken and its tool calls show up in the
+    # HUD's live trace exactly like a normal turn's would.
+    def run_scheduled_task(prompt: str) -> None:
+        try:
+            brain.ask(prompt, confirm=auto_decline)
+        except Exception as e:  # noqa: BLE001 - one bad scheduled run must not kill the poller
+            print(f"[scheduled task] {friendly_error(e)}")
+
+    task_scheduler = TaskScheduler(store, run_scheduled_task)
+    task_scheduler.start()
+
+    # Telegram/Discord bridges — off unless their bot token is set. Replies go
+    # back over that channel as text only (on_text suppressed, so nothing is
+    # spoken or pushed into the HUD transcript for a message that didn't
+    # originate there), and confirmations auto-decline for the same reason
+    # as scheduled tasks: nobody is there to answer them.
+    def handle_remote_message(text: str) -> str:
+        try:
+            return brain.ask(text, confirm=auto_decline, on_text=lambda _s: None)
+        except Exception as e:  # noqa: BLE001 - a bad turn must not kill the poll loop
+            return friendly_error(e)
+
+    telegram = TelegramChannel(handle_remote_message)
+    telegram_live = telegram.start()
+
+    discord = DiscordChannel(handle_remote_message)
+    discord_live = discord.start()
+
     hud = OdinHudWindow(brain, session, bridge)
     orb = OrbWindow()
     orb.summoned.connect(hud.show_and_activate)
@@ -121,6 +154,10 @@ def main() -> None:
         hud.announce(f"Picked up {restored} messages from your last session.")
     if missed:
         hud.announce(f"Fired {missed} reminder(s) that came due while I was closed.")
+    if telegram_live:
+        hud.announce("Telegram bridge is live.")
+    if discord_live:
+        hud.announce("Discord bridge is live.")
     if bound:
         hud.announce(f"Press {config.HUD_HOTKEY} any time to summon me.")
 
@@ -138,6 +175,9 @@ def main() -> None:
             gesture_controller.stop()
         bridge.release()  # let a worker parked on a confirmation fall through
         scheduler.stop()
+        task_scheduler.stop()
+        telegram.stop()
+        discord.stop()
         session.shutdown()
 
     app.aboutToQuit.connect(shutdown)
