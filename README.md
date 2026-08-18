@@ -1,5 +1,9 @@
 # Jarvis — Personal AI Desktop Assistant (Windows)
 
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
 A modular Jarvis-style assistant: talk or type to it, and it uses an LLM to
 understand you and calls real "skills" to control your PC — opening apps,
 checking system stats, reading your screen, searching the web, volume, power
@@ -23,6 +27,25 @@ Any endpoint speaking the OpenAI chat-completions protocol works (Gemini's
 compatibility endpoint, OpenRouter, DashScope/Qwen, a local server), the
 native Anthropic API when `MODEL` names a Claude, and Amazon Bedrock when
 `MODEL` starts with `bedrock/` (section 2).
+
+![The ODIN HUD: a voice-reactive orb centerpiece surrounded by live CPU, RAM, disk, and network telemetry panels](assets/hud-screenshot.png)
+
+## Contents
+
+1. [Install](#1-install)
+2. [Configure](#2-configure)
+3. [Run](#3-run)
+4. [Project layout](#4-project-layout)
+5. [Safety](#5-safety)
+6. [Hand-gesture cursor control](#6-hand-gesture-cursor-control)
+7. [Adding a new skill](#7-adding-a-new-skill)
+8. [Tests](#8-tests)
+9. [Configuration reference](#9-configuration-reference)
+10. [Email and calendar setup](#10-email-and-calendar-setup)
+11. [Scheduled proactive tasks](#11-scheduled-proactive-tasks)
+12. [Remote control: Telegram and Discord](#12-remote-control-telegram-and-discord)
+13. [Roadmap ideas](#13-roadmap-ideas)
+14. [License](#14-license)
 
 ## 1. Install
 
@@ -157,10 +180,27 @@ Jarvis/
   main.py                 terminal run loop, voice state machine, confirmations
   config.py               loads .env settings
   ui/
-    orb.py                the arc reactor: rings, core, reactive particle swarm
-    app_window.py         the full-screen HUD and the desktop orb window
+    orb.py                the small ambient orb: rings, core, reactive particle swarm
+    app_window.py         OrbWindow, the always-on-top desktop orb that summons the HUD
     panels.py             settings/skills dialog and the knowledge browser
     workers.py            Qt <-> brain threading seam
+    hud/                  the full-screen instrument HUD (native PyQt6, built to ODIN-HUD.md)
+      window.py             OdinHudWindow: assembles the zones, owns the one shared ~30fps animation tick
+      voice_orb.py          VoiceOrb, the HUD's centerpiece: rings + launcher ring + reactive core
+      zones.py              one builder per grid zone (telemetry panels, transcript, dock, launcher)
+      layout.py             the CSS-grid-style zone geometry the HUD is assembled from
+      tokens.py             every color/glow/font/duration used under ui/hud/ — the one design-tokens file
+      widgets.py            Panel, Readout, BarMeter, DockButton, TickRuler
+      radial_gauge.py       the four gauges flanking the orb (CPU/RAM/DISK/GPU)
+      sparkline.py          rolling history line for network/CPU
+      spectrum.py           zone K's live audio-loopback analyser
+      telemetry.py          QThread sampling CPU/RAM/disk/network into one frame per tick
+      telemetry_view.py     renders telemetry/weather onto the HUD's zone widgets
+      voice_loop.py         wake/listen/sleep state machine, mode switching (text <-> voice)
+      weather.py            structured weather (temp, humidity, forecast) for zone G
+      boot.py               the ~4.2s orchestrated startup animation
+      confirm.py            the DANGEROUS-tier confirmation banner
+      console.py            typed-input overlay, a convenience surface over the same bridge
   core/
     brain.py              talks to the LLM, runs the tool-use loop
     risk.py               SAFE / MODERATE / DANGEROUS, shell command classifier
@@ -298,7 +338,7 @@ see `vision_skills.py` — and they're converted correctly for both providers.
 python -m pytest tests/ -v
 ```
 
-501 tests, no API key and no microphone needed. They also run on Linux/WSL,
+650+ tests, no API key and no microphone needed. They also run on Linux/WSL,
 which is useful because the voice stack won't. The HUD tests use Qt's offscreen
 platform, so they need no display either.
 
@@ -438,3 +478,7 @@ desktop. Confirmations are always auto-declined over both bridges (section
   stored topics instead of a freeform prompt.
 - **More remote channels**: Slack and WhatsApp follow the same
   `on_message(text) -> str` shape as Telegram/Discord above.
+
+## 14. License
+
+[MIT](LICENSE) — use it, fork it, ship it.
