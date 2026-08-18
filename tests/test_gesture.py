@@ -26,6 +26,7 @@ from core.gesture import (
     Action,
     FRAME_MARGIN,
     GestureController,
+    GestureEvent,
     GestureStateMachine,
     Landmark,
     Pose,
@@ -100,15 +101,31 @@ class TestClassifyPose:
         hand = _hand({THUMB_TIP: (0.5, 0.61), MIDDLE_TIP: (0.5, 0.6), INDEX_TIP: (0.9, 0.9)})
         assert classify_pose(hand) == Pose.PINCH_MIDDLE
 
-    def test_three_fingers_up_is_none(self):
-        """Not a recognised pose -> NONE (neutral), never misread as a
-        different gesture."""
+    def test_thumb_near_ring_is_pinch_ring(self):
+        # index_tip and middle_tip pushed out of their default curled
+        # position, which would otherwise also land within pinch range.
+        hand = _hand({
+            THUMB_TIP: (0.5, 0.61), RING_TIP: (0.5, 0.6),
+            INDEX_TIP: (0.9, 0.9), MIDDLE_TIP: (0.9, 0.9),
+        })
+        assert classify_pose(hand) == Pose.PINCH_RING
+
+    def test_thumb_near_pinky_is_pinch_pinky(self):
+        hand = _hand({
+            THUMB_TIP: (0.5, 0.61), PINKY_TIP: (0.5, 0.6),
+            INDEX_TIP: (0.9, 0.9), MIDDLE_TIP: (0.9, 0.9), RING_TIP: (0.9, 0.9),
+        })
+        assert classify_pose(hand) == Pose.PINCH_PINKY
+
+    def test_index_middle_ring_up_is_three_finger(self):
+        """Was previously an unrecognised NONE pose; now the pinch-to-zoom
+        gate — index+middle+ring up, pinky curled, thumb free to move."""
         hand = _hand({
             INDEX_TIP: (0.5, EXTENDED_TIP), INDEX_PIP: (0.5, EXTENDED_PIP),
             MIDDLE_TIP: (0.5, EXTENDED_TIP), MIDDLE_PIP: (0.5, EXTENDED_PIP),
             RING_TIP: (0.5, EXTENDED_TIP), RING_PIP: (0.5, EXTENDED_PIP),
         })
-        assert classify_pose(hand) == Pose.NONE
+        assert classify_pose(hand) == Pose.THREE_FINGER
 
 
 # -- state machine ------------------------------------------------------------
@@ -190,6 +207,71 @@ class TestGestureStateMachine:
         assert m.update(Pose.FIST, 0.5, 0.5, now=0.0) == []
         assert m.update(Pose.NONE, 0.5, 0.5, now=0.1) == []
 
+    def test_pinch_ring_double_clicks_once_while_held(self):
+        m = GestureStateMachine(smoothing=1.0)
+        first = m.update(Pose.PINCH_RING, 0.5, 0.5, now=0.0)
+        again = m.update(Pose.PINCH_RING, 0.5, 0.5, now=0.1)
+        released = m.update(Pose.POINT, 0.5, 0.5, now=0.2)
+        assert [e.action for e in first] == [Action.DOUBLE_CLICK]
+        assert again == []
+        assert [e.action for e in released] == [Action.MOVE]
+
+    def test_pinch_pinky_middle_clicks_once_while_held(self):
+        m = GestureStateMachine(smoothing=1.0)
+        first = m.update(Pose.PINCH_PINKY, 0.5, 0.5, now=0.0)
+        again = m.update(Pose.PINCH_PINKY, 0.5, 0.5, now=0.1)
+        assert [e.action for e in first] == [Action.MIDDLE_CLICK]
+        assert again == []
+
+    def test_three_finger_spread_change_zooms(self):
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.THREE_FINGER, 0.5, 0.5, spread=0.1, now=0.0)  # anchors the span
+        events = m.update(Pose.THREE_FINGER, 0.5, 0.5, spread=0.2, now=0.1)  # spread apart
+        assert [e.action for e in events] == [Action.ZOOM]
+        assert events[0].scroll_amount > 0  # spreading apart zooms in (positive)
+
+    def test_tiny_three_finger_jitter_does_not_zoom(self):
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.THREE_FINGER, 0.5, 0.5, spread=0.100, now=0.0)
+        events = m.update(Pose.THREE_FINGER, 0.5, 0.5, spread=0.101, now=0.1)
+        assert events == []
+
+    def test_switching_from_zoom_to_a_new_three_finger_hold_reanchors(self):
+        """Leaving THREE_FINGER and coming back must not reuse the old span
+        as the anchor -- that would fire a bogus zoom on the first frame."""
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.THREE_FINGER, 0.5, 0.5, spread=0.1, now=0.0)
+        m.update(Pose.POINT, 0.5, 0.5, now=0.1)
+        events = m.update(Pose.THREE_FINGER, 0.5, 0.5, spread=0.4, now=0.2)
+        assert events == []  # first frame back just re-anchors, no jump
+
+    def test_palm_swipe_right_fires_alt_tab(self):
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.PALM, 0.8, 0.5, now=0.0)  # anchor
+        events = m.update(Pose.PALM, 0.5, 0.5, now=0.2)  # raw x decreased -> physical right swipe
+        assert [e.action for e in events] == [Action.ALT_TAB]
+
+    def test_palm_swipe_left_fires_alt_shift_tab(self):
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.PALM, 0.2, 0.5, now=0.0)  # anchor
+        events = m.update(Pose.PALM, 0.5, 0.5, now=0.2)  # raw x increased -> physical left swipe
+        assert [e.action for e in events] == [Action.ALT_SHIFT_TAB]
+
+    def test_holding_palm_still_does_not_swipe(self):
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.PALM, 0.5, 0.5, now=0.0)
+        events = m.update(Pose.PALM, 0.51, 0.5, now=0.2)  # well under SWIPE_THRESHOLD
+        assert events == []
+
+    def test_double_click_and_middle_click_flags_reset_on_pose_change(self):
+        """Firing once on pinch_ring must not suppress a later, independent
+        pinch_pinky fire (each single-fire flag is scoped to its own pose)."""
+        m = GestureStateMachine(smoothing=1.0)
+        m.update(Pose.PINCH_RING, 0.5, 0.5, now=0.0)
+        m.update(Pose.POINT, 0.5, 0.5, now=0.1)
+        events = m.update(Pose.PINCH_PINKY, 0.5, 0.5, now=0.2)
+        assert [e.action for e in events] == [Action.MIDDLE_CLICK]
+
 
 # -- coordinate mapping --------------------------------------------------------
 
@@ -221,6 +303,63 @@ class TestMapToScreen:
         -- the mapping must land inside that box too, not just at (0, 0)."""
         bounds = (-1920, 0, 0, 1080)
         assert map_to_screen(0.5, 0.5, bounds, mirror_x=False) == (-960, 540)
+
+
+# -- GestureController._apply dispatch ----------------------------------------
+# Pure dispatch from GestureEvent -> the right pyautogui call; no camera or
+# state machine involved, just a fake `gui` recording what was called.
+
+class _FakeGui:
+    def __init__(self, raise_on_scroll=False):
+        self.calls: list[tuple] = []
+        self._raise_on_scroll = raise_on_scroll
+
+    def __getattr__(self, name):
+        def record(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            if name == "scroll" and self._raise_on_scroll:
+                raise RuntimeError("boom")
+        return record
+
+
+class TestApplyDispatch:
+    BOUNDS = (0, 0, 1920, 1080)
+
+    def test_double_click_calls_double_click(self):
+        gui = _FakeGui()
+        GestureController()._apply(gui, GestureEvent(Action.DOUBLE_CLICK), self.BOUNDS)
+        assert gui.calls == [("doubleClick", (), {})]
+
+    def test_middle_click_calls_click_with_middle_button(self):
+        gui = _FakeGui()
+        GestureController()._apply(gui, GestureEvent(Action.MIDDLE_CLICK), self.BOUNDS)
+        assert gui.calls == [("click", (), {"button": "middle"})]
+
+    def test_alt_tab_sends_the_hotkey(self):
+        gui = _FakeGui()
+        GestureController()._apply(gui, GestureEvent(Action.ALT_TAB), self.BOUNDS)
+        assert gui.calls == [("hotkey", ("alt", "tab"), {})]
+
+    def test_alt_shift_tab_sends_the_hotkey(self):
+        gui = _FakeGui()
+        GestureController()._apply(gui, GestureEvent(Action.ALT_SHIFT_TAB), self.BOUNDS)
+        assert gui.calls == [("hotkey", ("alt", "shift", "tab"), {})]
+
+    def test_zoom_holds_ctrl_around_the_scroll(self):
+        gui = _FakeGui()
+        GestureController()._apply(gui, GestureEvent(Action.ZOOM, scroll_amount=5), self.BOUNDS)
+        names = [c[0] for c in gui.calls]
+        assert names == ["keyDown", "scroll", "keyUp"]
+        assert gui.calls[0] == ("keyDown", ("ctrl",), {})
+        assert gui.calls[2] == ("keyUp", ("ctrl",), {})
+
+    def test_zoom_releases_ctrl_even_if_scroll_raises(self):
+        """A bad frame mid-zoom must never leave Ctrl stuck down."""
+        gui = _FakeGui(raise_on_scroll=True)
+        with pytest.raises(RuntimeError):
+            GestureController()._apply(gui, GestureEvent(Action.ZOOM, scroll_amount=5), self.BOUNDS)
+        names = [c[0] for c in gui.calls]
+        assert names == ["keyDown", "scroll", "keyUp"]
 
 
 # -- GestureController lifecycle ----------------------------------------------
@@ -295,7 +434,11 @@ def _install_fake_camera_stack(monkeypatch, opens=True, landmarker_error=None):
     fake_pyautogui.mouseDown = lambda: None
     fake_pyautogui.mouseUp = lambda: None
     fake_pyautogui.click = lambda button="left": None
+    fake_pyautogui.doubleClick = lambda: None
     fake_pyautogui.scroll = lambda amount: None
+    fake_pyautogui.keyDown = lambda key: None
+    fake_pyautogui.keyUp = lambda key: None
+    fake_pyautogui.hotkey = lambda *keys: None
     monkeypatch.setitem(sys.modules, "pyautogui", fake_pyautogui)
 
     monkeypatch.setattr("core.gesture.IS_WINDOWS", False)

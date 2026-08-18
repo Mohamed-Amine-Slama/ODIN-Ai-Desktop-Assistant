@@ -13,9 +13,12 @@ from .base_skill import BaseSkill
 
 GESTURE_VOCABULARY = (
     "Point with your index finger to move the cursor. Pinch thumb and index "
-    "to click (hold to drag). Pinch thumb and middle to right-click. Hold up "
-    "index and middle together and move up/down to scroll. An open palm or "
-    "fist pauses tracking."
+    "to click (hold to drag). Pinch thumb and middle to right-click, thumb "
+    "and ring to double-click, thumb and pinky to middle-click. Hold up "
+    "index and middle together and move up/down to scroll. Hold up index, "
+    "middle, and ring together and move your thumb to zoom. Swipe an open "
+    "palm sideways to switch windows. An open palm held still, or a fist, "
+    "pauses tracking."
 )
 
 
