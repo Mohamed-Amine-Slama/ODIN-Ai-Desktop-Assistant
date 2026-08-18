@@ -65,6 +65,20 @@ class VoiceOrb(QWidget):
         self._phase = 0.0       # outer-ring rotation, degrees
         self._tick_phase = 0.0  # tick-ring counter-rotation, degrees
         self._breathe_phase = 0.0  # seconds accumulator for sinusoidal motion
+
+        # §5.3 listening: "a second bright arc sweeps the ring once per
+        # second" — a distinct overlay on top of the base outer-ring
+        # rotation, not a replacement for it.
+        self._sweep_phase = 0.0  # degrees
+
+        # §5.3 speaking: "outer segments light up in sequence, radiating
+        # outward" driven by "a 180ms synthetic pulse per word" (no TTS
+        # envelope is wired into the UI, so this is the spec's own
+        # fallback rather than a real audio-driven signal).
+        self._speak_pulse_ms = 180.0
+        self._speak_elapsed = 0.0  # seconds since the last synthetic pulse
+        self._speak_peak = 0.0     # degrees, current ripple origin
+
         self._mic_level = 0.0
         self._data_value = 0.0
         self._learning_subtopic = ""
@@ -116,6 +130,14 @@ class VoiceOrb(QWidget):
         if value == self._state:
             return
         self._state = value
+        # Start each entry into these states from a clean beat/sweep origin
+        # rather than resuming wherever the phase happened to be left last
+        # time, so the first frame of the new state never looks mid-cycle.
+        if value == "speaking":
+            self._speak_elapsed = 0.0
+            self._speak_peak = 0.0
+        elif value == "listening":
+            self._sweep_phase = 0.0
         self.status_changed.emit(self._status_text())
         self.update()
 
@@ -198,6 +220,10 @@ class VoiceOrb(QWidget):
             if not self._flashing:
                 self._phase = (self._phase + dt * self._ring_speed()) % 360.0
                 self._tick_phase = (self._tick_phase - dt * 4.0) % 360.0
+                if self._state == "listening":
+                    self._sweep_phase = (self._sweep_phase + dt * 360.0) % 360.0
+                elif self._state == "speaking":
+                    self._advance_speak_pulse(dt)
         self._breathe_phase += dt
         self.update()
 
@@ -205,6 +231,29 @@ class VoiceOrb(QWidget):
         if self._state == "listening":
             return 360.0 / 24.0  # §5.3: speeds to a 24s revolution
         return 360.0 / 60.0      # §5.3: base 60s revolution
+
+    def _advance_speak_pulse(self, dt: float) -> None:
+        pulse_s = self._speak_pulse_ms / 1000.0
+        self._speak_elapsed += dt
+        if self._speak_elapsed >= pulse_s:
+            self._speak_elapsed %= pulse_s
+            self._speak_peak = (self._speak_peak + 45.0) % 360.0  # one launcher-segment step per word beat
+
+    def _speak_wave(self, seg_angle: float) -> float:
+        """0..1 brightness for one outer-ring segment under the speaking
+        chase: a hot spot ignites at `_speak_peak` and, over the course of
+        the beat, hands off to a ring of brightness expanding away from it
+        — "light up, then radiate outward" rather than a static glow."""
+        pulse_s = self._speak_pulse_ms / 1000.0
+        t = min(1.0, self._speak_elapsed / pulse_s)
+        delta = self._angular_delta(seg_angle, self._speak_peak)
+        ripple = math.exp(-((delta - (10.0 + t * 55.0)) / 16.0) ** 2)
+        core = math.exp(-(delta / 12.0) ** 2) * (1.0 - t)
+        return max(ripple, core)
+
+    @staticmethod
+    def _angular_delta(a: float, b: float) -> float:
+        return abs((a - b + 180.0) % 360.0 - 180.0)
 
     # -- launcher ring hit-testing --------------------------------------
 
@@ -298,6 +347,7 @@ class VoiceOrb(QWidget):
 
         self._paint_halo(painter, accent)
         self._paint_outer_ring(painter, ring_accent)
+        self._paint_listening_sweep(painter)
         self._paint_launcher_ring(painter)
         self._paint_tick_ring(painter)
         self._paint_data_ring(painter, accent)
@@ -340,15 +390,33 @@ class VoiceOrb(QWidget):
         seg_span = 360.0 / n - gap_deg
         rect = QRectF(self.CENTER - self.R_OUTER, self.CENTER - self.R_OUTER, self.R_OUTER * 2, self.R_OUTER * 2)
         pens = self._outer_ring_pens(accent, n)
+        speaking = self._state == "speaking"
         for i in range(n):
             start = self._phase + i * (360.0 / n)
-            wave = 0.5 + 0.5 * math.sin(math.radians(start) + self._breathe_phase)
+            if speaking:
+                wave = self._speak_wave(start + seg_span / 2)
+            else:
+                wave = 0.5 + 0.5 * math.sin(math.radians(start) + self._breathe_phase)
             pen = pens[i]
             color = pen.color()
             color.setAlphaF(0.25 + 0.75 * wave)
             pen.setColor(color)
             painter.setPen(pen)
             painter.drawArc(rect, int(start * 16), int(-seg_span * 16))
+
+    def _paint_listening_sweep(self, painter: QPainter) -> None:
+        """§5.3: "a second bright arc sweeps the ring once per second" — an
+        overlay on top of the base 32-segment ring, only while listening."""
+        if self._state != "listening":
+            return
+        span = 28.0
+        rect = QRectF(self.CENTER - self.R_OUTER, self.CENTER - self.R_OUTER, self.R_OUTER * 2, self.R_OUTER * 2)
+
+        def stroke(pen: QPen) -> None:
+            painter.setPen(pen)
+            painter.drawArc(rect, int(self._sweep_phase * 16), int(-span * 16))
+
+        tokens.draw_glow(painter, stroke, tokens.CY_100, 3.0, passes=2)
 
     def _paint_launcher_ring(self, painter: QPainter) -> None:
         rect = QRectF(self.CENTER - self.R_LAUNCHER, self.CENTER - self.R_LAUNCHER, self.R_LAUNCHER * 2, self.R_LAUNCHER * 2)

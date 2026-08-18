@@ -103,6 +103,58 @@ def test_tick_path_is_built_once_and_reused_across_frames(qapp):
     assert orb._tick_path is path  # never rebuilt — only rotated at paint time
 
 
+# -- §5.3 per-state ring signatures: listening's sweep arc, speaking's
+# radiating chase — previously both states just reused the generic idle
+# shimmer, so nothing distinguished them visually beyond color/speed -------
+
+def test_listening_sweep_advances_once_per_second_and_resets_on_entry(qapp):
+    orb = VoiceOrb()
+    orb.state = "listening"
+    assert orb._sweep_phase == 0.0
+    orb.advance(0.5)
+    assert orb._sweep_phase == 180.0  # §5.3: one full lap per second
+
+    orb.state = "idle"
+    orb.advance(1.0)
+    assert orb._sweep_phase == 180.0  # only advances while listening
+
+    orb.state = "listening"
+    assert orb._sweep_phase == 0.0  # re-entry starts the sweep fresh
+
+
+def test_speaking_pulse_advances_peak_every_180ms_and_resets_on_entry(qapp):
+    orb = VoiceOrb()
+    orb.state = "speaking"
+    assert orb._speak_peak == 0.0
+
+    orb.advance(0.18)  # exactly one synthetic word-pulse interval
+    assert orb._speak_peak == 45.0
+    assert orb._speak_elapsed == 0.0
+
+    orb.state = "idle"
+    orb.state = "speaking"
+    assert orb._speak_peak == 0.0  # re-entry starts the chase fresh
+
+
+def test_speak_wave_peaks_at_the_current_ripple_origin(qapp):
+    orb = VoiceOrb()
+    orb.state = "speaking"
+    # At t=0 (just after a pulse), the hot spot is the peak itself: brightness
+    # falls off monotonically with angular distance away from it.
+    at_peak = orb._speak_wave(0.0)
+    nearby = orb._speak_wave(20.0)
+    far = orb._speak_wave(150.0)
+    assert at_peak > nearby > far
+
+
+def test_outer_ring_uses_chase_wave_only_while_speaking(qapp):
+    orb = VoiceOrb()
+    orb.state = "speaking"
+    for _ in range(3):
+        orb.advance(1 / 30)
+    _render(orb)  # must not raise — exercises the speaking branch in _paint_outer_ring
+
+
 def test_outer_ring_pens_are_cached_per_accent_color(qapp):
     orb = VoiceOrb()
     orb.state = "idle"

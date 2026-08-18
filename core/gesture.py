@@ -5,7 +5,8 @@ without a camera, mediapipe, or pyautogui anywhere nearby:
 
 - `classify_pose` + `GestureStateMachine` are pure. They turn one frame's 21
   hand landmarks into a named pose, and a stream of poses into high-level
-  cursor actions (move, click, drag, scroll). No I/O, no OS calls.
+  cursor/keyboard actions (move, click variants, drag, scroll, zoom, window
+  switch). No I/O, no OS calls.
 - `GestureController` is the impure shell: it owns the camera, the mediapipe
   model, and the actual pyautogui calls, on a background thread — the same
   start()/stop() shape as core/barge_in.py's BargeInWatcher.
@@ -59,6 +60,18 @@ PINCH_THRESHOLD = 0.06
 # camera's physical edge, where landmarks are least reliable.
 FRAME_MARGIN = 0.15
 
+# Minimum thumb-to-index span change (same normalized units as PINCH_THRESHOLD)
+# between frames before a pinch-to-zoom pose registers a step, so sensor
+# jitter alone never fires a zoom event.
+ZOOM_DEADZONE = 0.01
+# Scales a span delta into a Ctrl+scroll amount; matches the scroll gesture's
+# own y-delta * 40 so the two continuous gestures feel equally responsive.
+ZOOM_SENSITIVITY = 40
+
+# Normalized horizontal palm travel (raw camera frame, pre-mirroring) needed
+# to register as a deliberate swipe rather than an idle hand held in frame.
+SWIPE_THRESHOLD = 0.15
+
 
 @dataclass
 class Landmark:
@@ -71,9 +84,12 @@ class Pose(Enum):
     NONE = "none"           # no hand, or not confidently any pose below
     POINT = "point"          # index only — move
     TWO_FINGER = "two_finger"  # index + middle — scroll
+    THREE_FINGER = "three_finger"  # index + middle + ring — pinch-to-zoom
     PINCH_INDEX = "pinch_index"    # thumb+index together — click / drag
     PINCH_MIDDLE = "pinch_middle"  # thumb+middle together — right-click
-    PALM = "palm"            # all five extended — neutral
+    PINCH_RING = "pinch_ring"      # thumb+ring together — double-click
+    PINCH_PINKY = "pinch_pinky"    # thumb+pinky together — middle-click
+    PALM = "palm"            # all five extended — neutral, or a swipe
     FIST = "fist"            # all five curled — neutral
 
 
@@ -81,10 +97,15 @@ class Action(Enum):
     MOVE = "move"
     CLICK = "click"
     RIGHT_CLICK = "right_click"
+    DOUBLE_CLICK = "double_click"
+    MIDDLE_CLICK = "middle_click"
     DRAG_START = "drag_start"
     DRAG_MOVE = "drag_move"
     DRAG_END = "drag_end"
     SCROLL = "scroll"
+    ZOOM = "zoom"
+    ALT_TAB = "alt_tab"
+    ALT_SHIFT_TAB = "alt_shift_tab"
 
 
 @dataclass
@@ -116,21 +137,29 @@ def classify_pose(landmarks: "list[Landmark] | None") -> Pose:
     thumb_tip = landmarks[THUMB_TIP]
     index_tip = landmarks[INDEX_TIP]
     middle_tip = landmarks[MIDDLE_TIP]
+    ring_tip = landmarks[RING_TIP]
+    pinky_tip = landmarks[PINKY_TIP]
 
     if _dist(thumb_tip, index_tip) < PINCH_THRESHOLD:
         return Pose.PINCH_INDEX
     if _dist(thumb_tip, middle_tip) < PINCH_THRESHOLD:
         return Pose.PINCH_MIDDLE
+    if _dist(thumb_tip, ring_tip) < PINCH_THRESHOLD:
+        return Pose.PINCH_RING
+    if _dist(thumb_tip, pinky_tip) < PINCH_THRESHOLD:
+        return Pose.PINCH_PINKY
 
     index_up = _extended(index_tip, landmarks[INDEX_PIP])
     middle_up = _extended(middle_tip, landmarks[MIDDLE_PIP])
-    ring_up = _extended(landmarks[RING_TIP], landmarks[RING_PIP])
-    pinky_up = _extended(landmarks[PINKY_TIP], landmarks[PINKY_PIP])
+    ring_up = _extended(ring_tip, landmarks[RING_PIP])
+    pinky_up = _extended(pinky_tip, landmarks[PINKY_PIP])
 
     if index_up and middle_up and ring_up and pinky_up:
         return Pose.PALM
     if not index_up and not middle_up and not ring_up and not pinky_up:
         return Pose.FIST
+    if index_up and middle_up and ring_up and not pinky_up:
+        return Pose.THREE_FINGER
     if index_up and middle_up and not ring_up and not pinky_up:
         return Pose.TWO_FINGER
     if index_up and not middle_up and not ring_up and not pinky_up:
@@ -143,9 +172,11 @@ class GestureStateMachine:
     high-level cursor actions. Pure logic, no camera/OS calls.
 
     A pinch shorter than click_hold_seconds is a click; held longer, it
-    becomes a drag. Losing the hand (or seeing an open palm / fist, the
-    deliberate "neutral" poses) always ends any in-progress drag rather than
-    leaving a mouse button stuck down.
+    becomes a drag. Losing the hand, or making a fist (the one purely
+    "neutral" pose), always ends any in-progress drag rather than leaving a
+    mouse button stuck down. An open palm also ends a drag, but unlike a fist
+    it isn't purely neutral — holding it still is neutral, sweeping it
+    sideways fires a window-switch (Alt+Tab) instead.
     """
 
     def __init__(self, click_hold_seconds: float | None = None, smoothing: float | None = None):
@@ -159,7 +190,11 @@ class GestureStateMachine:
         self._pinch_started_at: float | None = None
         self._dragging = False
         self._right_clicked = False
+        self._ring_clicked = False
+        self._pinky_clicked = False
         self._last_two_finger_y: float | None = None
+        self._zoom_start_span: float | None = None
+        self._palm_start_x: float | None = None
 
     @property
     def dragging(self) -> bool:
@@ -191,13 +226,44 @@ class GestureStateMachine:
         self._pinch_started_at = None
         self._dragging = False
         self._right_clicked = False
+        self._ring_clicked = False
+        self._pinky_clicked = False
         self._last_two_finger_y = None
+        self._zoom_start_span = None
+        self._palm_start_x = None
 
-    def update(self, pose: Pose, x_norm: float, y_norm: float, now: "float | None" = None) -> "list[GestureEvent]":
+    def _reset_other_trackers(self, events: list, keep: str) -> None:
+        """Every non-neutral pose owns exactly one continuous tracker or
+        single-fire flag below; clear the others each frame so switching
+        gestures never inherits stale state from whichever gesture was
+        active a moment ago (e.g. a leftover scroll anchor making the first
+        frame of a fresh two-finger gesture jump)."""
+        if keep != "pinch_index":
+            self._end_index_pinch(events)
+        if keep != "two_finger":
+            self._last_two_finger_y = None
+        if keep != "three_finger":
+            self._zoom_start_span = None
+        if keep != "palm":
+            self._palm_start_x = None
+        if keep != "pinch_middle":
+            self._right_clicked = False
+        if keep != "pinch_ring":
+            self._ring_clicked = False
+        if keep != "pinch_pinky":
+            self._pinky_clicked = False
+
+    def update(
+        self, pose: Pose, x_norm: float, y_norm: float, spread: float = 0.0, now: "float | None" = None
+    ) -> "list[GestureEvent]":
+        """`spread` is the current normalized thumb-to-index-tip distance —
+        only meaningful for THREE_FINGER (pinch-to-zoom), which needs a
+        continuous analog signal that the discrete `pose` alone can't carry.
+        Every other pose ignores it."""
         now = time.monotonic() if now is None else now
         events: list[GestureEvent] = []
 
-        if pose in (Pose.NONE, Pose.PALM, Pose.FIST):
+        if pose in (Pose.NONE, Pose.FIST):
             self._end_index_pinch(events)
             self.reset()
             return events
@@ -205,23 +271,49 @@ class GestureStateMachine:
         sx, sy = self._smooth(x_norm, y_norm)
 
         if pose == Pose.POINT:
-            self._end_index_pinch(events)
-            self._last_two_finger_y = None
-            self._right_clicked = False
+            self._reset_other_trackers(events, keep="point")
             events.append(GestureEvent(Action.MOVE, x=sx, y=sy))
 
         elif pose == Pose.TWO_FINGER:
-            self._end_index_pinch(events)
-            self._right_clicked = False
+            self._reset_other_trackers(events, keep="two_finger")
             if self._last_two_finger_y is not None:
                 delta = self._last_two_finger_y - sy
                 if abs(delta) > 0.01:
                     events.append(GestureEvent(Action.SCROLL, scroll_amount=int(delta * 40)))
             self._last_two_finger_y = sy
 
+        elif pose == Pose.THREE_FINGER:
+            self._reset_other_trackers(events, keep="three_finger")
+            if self._zoom_start_span is None:
+                self._zoom_start_span = spread
+            else:
+                delta = spread - self._zoom_start_span
+                if abs(delta) > ZOOM_DEADZONE:
+                    events.append(GestureEvent(Action.ZOOM, scroll_amount=int(delta * ZOOM_SENSITIVITY)))
+                    self._zoom_start_span = spread
+
+        elif pose == Pose.PALM:
+            # Neutral when held still (matches FIST/NONE's old behavior via
+            # _reset_other_trackers ending any drag); a deliberate horizontal
+            # swipe fires a window switch instead of just idling.
+            self._reset_other_trackers(events, keep="palm")
+            if self._palm_start_x is None:
+                self._palm_start_x = x_norm
+            else:
+                # Raw camera x, not mirrored: map_to_screen() flips x so a
+                # physical rightward hand move feels like moving the cursor
+                # right; the same physical swipe therefore *decreases*
+                # x_norm here, so the sign below matches that convention.
+                delta = self._palm_start_x - x_norm
+                if delta > SWIPE_THRESHOLD:
+                    events.append(GestureEvent(Action.ALT_TAB))
+                    self._palm_start_x = x_norm
+                elif delta < -SWIPE_THRESHOLD:
+                    events.append(GestureEvent(Action.ALT_SHIFT_TAB))
+                    self._palm_start_x = x_norm
+
         elif pose == Pose.PINCH_INDEX:
-            self._last_two_finger_y = None
-            self._right_clicked = False
+            self._reset_other_trackers(events, keep="pinch_index")
             if self._pinch_started_at is None:
                 self._pinch_started_at = now
             held = now - self._pinch_started_at
@@ -232,11 +324,22 @@ class GestureStateMachine:
                 events.append(GestureEvent(Action.DRAG_START, x=sx, y=sy))
 
         elif pose == Pose.PINCH_MIDDLE:
-            self._last_two_finger_y = None
-            self._end_index_pinch(events)
+            self._reset_other_trackers(events, keep="pinch_middle")
             if not self._right_clicked:
-                events.append(GestureEvent(Action.RIGHT_CLICK, x=sx, y=sy))
+                events.append(GestureEvent(Action.RIGHT_CLICK))
                 self._right_clicked = True
+
+        elif pose == Pose.PINCH_RING:
+            self._reset_other_trackers(events, keep="pinch_ring")
+            if not self._ring_clicked:
+                events.append(GestureEvent(Action.DOUBLE_CLICK))
+                self._ring_clicked = True
+
+        elif pose == Pose.PINCH_PINKY:
+            self._reset_other_trackers(events, keep="pinch_pinky")
+            if not self._pinky_clicked:
+                events.append(GestureEvent(Action.MIDDLE_CLICK))
+                self._pinky_clicked = True
 
         return events
 
@@ -473,8 +576,9 @@ class GestureController:
                 pose = classify_pose(landmarks)
                 x_norm = landmarks[INDEX_TIP].x if landmarks else 0.0
                 y_norm = landmarks[INDEX_TIP].y if landmarks else 0.0
+                spread = _dist(landmarks[THUMB_TIP], landmarks[INDEX_TIP]) if landmarks else 0.0
 
-                for event in machine.update(pose, x_norm, y_norm):
+                for event in machine.update(pose, x_norm, y_norm, spread):
                     self._apply(gui, event, bounds)
 
                 elapsed = time.monotonic() - frame_start
@@ -509,8 +613,24 @@ class GestureController:
             gui.click()
         elif event.action == Action.RIGHT_CLICK:
             gui.click(button="right")
+        elif event.action == Action.DOUBLE_CLICK:
+            gui.doubleClick()
+        elif event.action == Action.MIDDLE_CLICK:
+            gui.click(button="middle")
         elif event.action == Action.SCROLL:
             gui.scroll(event.scroll_amount or 0)
+        elif event.action == Action.ZOOM:
+            # try/finally: one bad frame must not leak a stuck Ctrl key, the
+            # same reasoning core/gesture.py already applies to mouse buttons.
+            gui.keyDown("ctrl")
+            try:
+                gui.scroll(event.scroll_amount or 0)
+            finally:
+                gui.keyUp("ctrl")
+        elif event.action == Action.ALT_TAB:
+            gui.hotkey("alt", "tab")
+        elif event.action == Action.ALT_SHIFT_TAB:
+            gui.hotkey("alt", "shift", "tab")
 
 
 def make_controller(on_state_change=None) -> "GestureController | None":

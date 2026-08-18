@@ -241,9 +241,12 @@ tool calls, this bounds calls across turns and across the whole run.
 ## 6. Hand-gesture cursor control
 
 Point a webcam at your hand and drive the literal OS cursor with it — point to
-move, pinch to click or drag, pinch thumb-and-middle to right-click, hold up
-two fingers and move up/down to scroll. An open palm or a fist pauses
-tracking without letting go of anything mid-gesture.
+move; pinch thumb-and-index to click (hold to drag), thumb-and-middle to
+right-click, thumb-and-ring to double-click, thumb-and-pinky to middle-click;
+hold up index-and-middle and move up/down to scroll, or index-middle-and-ring
+and move your thumb in/out to zoom; swipe an open palm sideways to switch
+windows (Alt+Tab). Holding a palm still, or a fist, pauses tracking without
+letting go of anything mid-gesture.
 
 Off by default (`ENABLE_GESTURE_CONTROL=0` in `.env`) — turning it on
 activates your webcam. Once enabled, there are two ways to start it:
