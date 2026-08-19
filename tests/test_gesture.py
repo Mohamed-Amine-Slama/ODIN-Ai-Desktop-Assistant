@@ -328,30 +328,36 @@ class TestApplyDispatch:
     def test_double_click_calls_double_click(self):
         gui = _FakeGui()
         GestureController()._apply(gui, GestureEvent(Action.DOUBLE_CLICK), self.BOUNDS)
-        assert gui.calls == [("doubleClick", (), {})]
+        assert gui.calls == [("doubleClick", (), {"_pause": False})]
 
     def test_middle_click_calls_click_with_middle_button(self):
         gui = _FakeGui()
         GestureController()._apply(gui, GestureEvent(Action.MIDDLE_CLICK), self.BOUNDS)
-        assert gui.calls == [("click", (), {"button": "middle"})]
+        assert gui.calls == [("click", (), {"button": "middle", "_pause": False})]
 
     def test_alt_tab_sends_the_hotkey(self):
         gui = _FakeGui()
         GestureController()._apply(gui, GestureEvent(Action.ALT_TAB), self.BOUNDS)
-        assert gui.calls == [("hotkey", ("alt", "tab"), {})]
+        assert [(n, a) for n, a, _ in gui.calls] == [
+            ("keyDown", ("alt",)), ("keyDown", ("tab",)),
+            ("keyUp", ("tab",)), ("keyUp", ("alt",)),
+        ]
 
     def test_alt_shift_tab_sends_the_hotkey(self):
         gui = _FakeGui()
         GestureController()._apply(gui, GestureEvent(Action.ALT_SHIFT_TAB), self.BOUNDS)
-        assert gui.calls == [("hotkey", ("alt", "shift", "tab"), {})]
+        assert [(n, a) for n, a, _ in gui.calls] == [
+            ("keyDown", ("alt",)), ("keyDown", ("shift",)), ("keyDown", ("tab",)),
+            ("keyUp", ("tab",)), ("keyUp", ("shift",)), ("keyUp", ("alt",)),
+        ]
 
     def test_zoom_holds_ctrl_around_the_scroll(self):
         gui = _FakeGui()
         GestureController()._apply(gui, GestureEvent(Action.ZOOM, scroll_amount=5), self.BOUNDS)
         names = [c[0] for c in gui.calls]
         assert names == ["keyDown", "scroll", "keyUp"]
-        assert gui.calls[0] == ("keyDown", ("ctrl",), {})
-        assert gui.calls[2] == ("keyUp", ("ctrl",), {})
+        assert gui.calls[0] == ("keyDown", ("ctrl",), {"_pause": False})
+        assert gui.calls[2] == ("keyUp", ("ctrl",), {"_pause": False})
 
     def test_zoom_releases_ctrl_even_if_scroll_raises(self):
         """A bad frame mid-zoom must never leave Ctrl stuck down."""
@@ -380,14 +386,18 @@ class _FakeCapture:
 
 
 class _FakeLandmarker:
-    """Stands in for a mediapipe Tasks-API HandLandmarker. No hand is ever
-    detected, so the loop just idles."""
+    """Stands in for a mediapipe Tasks-API HandLandmarker in VIDEO running
+    mode. No hand is ever detected, so the loop just idles. Records the
+    timestamps it is handed: VIDEO mode rejects any that repeats or goes
+    backwards, so the loop has to keep them strictly increasing."""
 
     def __init__(self):
         self.closed = False
+        self.timestamps = []
 
-    def detect(self, _image):
+    def detect_for_video(self, _image, timestamp_ms):
         from types import SimpleNamespace
+        self.timestamps.append(timestamp_ms)
         return SimpleNamespace(hand_landmarks=[])
 
     def close(self):
@@ -430,15 +440,14 @@ def _install_fake_camera_stack(monkeypatch, opens=True, landmarker_error=None):
     fake_pyautogui.FAILSAFE = True
     fake_pyautogui.FailSafeException = _FailSafeException
     fake_pyautogui.size = lambda: (1920, 1080)
-    fake_pyautogui.moveTo = lambda x, y: None
-    fake_pyautogui.mouseDown = lambda: None
-    fake_pyautogui.mouseUp = lambda: None
-    fake_pyautogui.click = lambda button="left": None
-    fake_pyautogui.doubleClick = lambda: None
-    fake_pyautogui.scroll = lambda amount: None
-    fake_pyautogui.keyDown = lambda key: None
-    fake_pyautogui.keyUp = lambda key: None
-    fake_pyautogui.hotkey = lambda *keys: None
+    fake_pyautogui.moveTo = lambda x, y, **kw: None
+    fake_pyautogui.mouseDown = lambda **kw: None
+    fake_pyautogui.mouseUp = lambda **kw: None
+    fake_pyautogui.click = lambda button="left", **kw: None
+    fake_pyautogui.doubleClick = lambda **kw: None
+    fake_pyautogui.scroll = lambda amount, **kw: None
+    fake_pyautogui.keyDown = lambda key, **kw: None
+    fake_pyautogui.keyUp = lambda key, **kw: None
     monkeypatch.setitem(sys.modules, "pyautogui", fake_pyautogui)
 
     monkeypatch.setattr("core.gesture.IS_WINDOWS", False)
@@ -593,3 +602,116 @@ class TestControllerWiring:
         set_gesture_controller(None)
         assert isinstance(get_gesture_controller(), GestureController)
         set_gesture_controller(None)
+
+
+# -- latency: pyautogui's global PAUSE and MediaPipe's running mode ---------
+
+
+class _RecordingGui:
+    """Stands in for pyautogui, recording how each call was made."""
+
+    class FailSafeException(Exception):
+        pass
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        def record(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+        return record
+
+
+def _apply_action(action, **event_kwargs):
+    from core.gesture import Action, GestureController, GestureEvent
+
+    gui = _RecordingGui()
+    controller = GestureController()
+    event = GestureEvent(action=action, **event_kwargs)
+    controller._apply(gui, event, (0, 0, 1920, 1080))
+    return gui.calls
+
+
+def test_every_cursor_action_skips_pyautogui_pause():
+    """pyautogui sleeps for its global PAUSE (0.1s) after every call —
+    measured at 100.45ms per moveTo versus 0.09ms without it. One move per
+    frame capped the loop near 7fps and blocked the capture thread, so the
+    backlog compounded. Every call the loop makes must opt out."""
+    from core.gesture import Action
+
+    for action in (
+        Action.MOVE, Action.DRAG_MOVE, Action.DRAG_START, Action.DRAG_END,
+        Action.CLICK, Action.RIGHT_CLICK, Action.DOUBLE_CLICK,
+        Action.MIDDLE_CLICK, Action.SCROLL, Action.ZOOM,
+        Action.ALT_TAB, Action.ALT_SHIFT_TAB,
+    ):
+        calls = _apply_action(action, x=0.5, y=0.5, scroll_amount=3)
+        assert calls, f"{action} produced no pyautogui call"
+        for name, _args, kwargs in calls:
+            assert kwargs.get("_pause") is False, f"{action} -> {name}() still pauses"
+
+
+def test_the_global_pause_is_left_alone_for_other_skills():
+    """skills/input_skills.py drives discrete scripted actions and wants the
+    pause between them. Opting out per call rather than globally is what keeps
+    both behaviours correct."""
+    import pyautogui
+
+    before = pyautogui.PAUSE
+    _apply_action(__import__("core.gesture", fromlist=["Action"]).Action.MOVE, x=0.5, y=0.5)
+    assert pyautogui.PAUSE == before
+
+
+def test_window_switching_presses_and_releases_by_hand():
+    """pyautogui.hotkey() accepts no _pause, so it is rebuilt from keyDown/
+    keyUp — which do. Keys must be released in reverse order."""
+    from core.gesture import Action
+
+    calls = _apply_action(Action.ALT_SHIFT_TAB, x=0.0, y=0.0)
+    sequence = [(name, args[0]) for name, args, _ in calls]
+
+    assert sequence == [
+        ("keyDown", "alt"), ("keyDown", "shift"), ("keyDown", "tab"),
+        ("keyUp", "tab"), ("keyUp", "shift"), ("keyUp", "alt"),
+    ]
+
+
+def test_a_failure_mid_combo_still_releases_what_was_pressed():
+    """A stuck Alt key would leave the desktop unusable."""
+    from core.gesture import GestureController
+
+    class _FailsOnTab(_RecordingGui):
+        def keyDown(self, key, **kwargs):
+            self.calls.append(("keyDown", (key,), kwargs))
+            if key == "tab":
+                raise RuntimeError("input backend hiccup")
+
+    gui = _FailsOnTab()
+    with pytest.raises(RuntimeError):
+        GestureController._hotkey(gui, "alt", "tab")
+
+    released = [args[0] for name, args, _ in gui.calls if name == "keyUp"]
+    assert released == ["alt"]      # tab never went down, alt did and came back up
+
+
+def test_video_mode_timestamps_are_strictly_increasing(monkeypatch):
+    """MediaPipe's VIDEO running mode raises if a timestamp repeats or goes
+    backwards. Frames can easily land inside the same millisecond, so the
+    loop counts from a monotonic clock and forces a minimum 1ms step."""
+    _install_fake_camera_stack(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        "core.gesture._hand_landmarker",
+        lambda: (seen.append(_FakeLandmarker()) or seen[-1], None),
+    )
+
+    controller = GestureController()
+    controller.start()
+    try:
+        _wait_until(lambda: seen and len(seen[0].timestamps) > 5)
+    finally:
+        controller.stop()
+
+    stamps = seen[0].timestamps
+    assert len(stamps) > 5
+    assert all(b > a for a, b in zip(stamps, stamps[1:])), stamps

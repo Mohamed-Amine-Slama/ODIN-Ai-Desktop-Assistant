@@ -7,12 +7,13 @@ no display, which matters when you are debugging a skill over SSH.
 """
 import signal
 import sys
+import threading
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import config
-from core import gesture
+from core import gesture, knowledge
 from core.brain import Brain, auto_decline, friendly_error
 from core.discord_channel import DiscordChannel
 from core.scheduler import ReminderScheduler, TaskScheduler
@@ -149,6 +150,11 @@ def main() -> None:
     _place_orb(orb)
     orb.show()
     hud.show_and_activate()
+
+    # Load the vector store while the entry animation plays. Without this the
+    # very first request pays chromadb's ~2.6s import inline, between the user
+    # asking and the prompt leaving — the worst possible moment for it.
+    threading.Thread(target=knowledge.warm_up, name="knowledge-warmup", daemon=True).start()
 
     if restored:
         hud.announce(f"Picked up {restored} messages from your last session.")
