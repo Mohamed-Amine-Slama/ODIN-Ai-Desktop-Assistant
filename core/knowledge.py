@@ -53,6 +53,23 @@ def _get_collection():
     return _collection
 
 
+def warm_up() -> bool:
+    """Load the vector store now, so the first turn doesn't pay for it.
+
+    Importing chromadb costs seconds, and it used to happen inside the first
+    request — measured at ~2.6s between the user asking and the prompt going
+    out, on top of whatever the model itself takes. Called from a background
+    thread at startup (app.py), which is idle time the entry animation is
+    already using. Returns whether the store is ready; never raises, because
+    RAG is optional and a machine without it still has to start.
+    """
+    try:
+        _get_collection()
+        return True
+    except Exception:  # noqa: BLE001 - missing deps, locked db, corrupt store
+        return False
+
+
 def available() -> bool:
     """Whether the optional RAG dependencies are installed, without importing
     the (slow, ~seconds-long-on-first-load) embedding model to find out."""

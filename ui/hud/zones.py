@@ -11,7 +11,9 @@ from __future__ import annotations
 import getpass
 import random
 
-from PyQt6.QtCore import QRectF, Qt, QTimer
+import math
+
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QRadialGradient
 from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
@@ -50,6 +52,8 @@ if config.ENABLE_GESTURE_CONTROL:
     # above — an instant toggle, no LLM confirmation, mirroring the tray
     # menu's "Toggle hand control" entry. Only shown when the feature is on.
     DOCK_ITEMS.append(("HAND", "Hand Control", None))
+
+GRAPH_MAX_H = 58   # a history trace's ceiling; slack past it goes to the panel
 
 STATUS_FOR_STATE = {
     "idle": "STANDING BY",
@@ -119,6 +123,7 @@ class _CachedLayer(QWidget):
 
     def resizeEvent(self, event) -> None:
         self._cache = None
+        self._glow_cache = getattr(self, "_glow_cache", None) and None
         super().resizeEvent(event)
 
     def paintEvent(self, _event) -> None:
@@ -138,27 +143,54 @@ class _CachedLayer(QWidget):
 
 
 class _Backdrop(_CachedLayer):
-    """The background layer stack from ODIN-HUD.md §4: void fill, a radial
-    vignette pulling the eye to the orb, a faint grid mesh, and scanlines."""
+    """The background: a black hexagon field.
+
+    Rendered once into a pixmap and blitted. It is deliberately inert — it
+    encodes nothing and nothing on it moves, so it stays out of the animation
+    loop entirely. Anything that repaints here drags every translucent panel
+    above it into the same frame, which is what made the previous backdrop
+    cost ~72ms a paint.
+    """
+
+    HEX_R = 46.0   # circumradius; flat-top orientation
+
+    @classmethod
+    def _hex_points(cls, cx: float, cy: float) -> list[tuple[float, float]]:
+        return [
+            (cx + cls.HEX_R * math.cos(math.radians(60 * i)),
+             cy + cls.HEX_R * math.sin(math.radians(60 * i)))
+            for i in range(6)
+        ]
+
+    def _centres(self, width: int, height: int):
+        step_x = self.HEX_R * 1.5
+        step_y = self.HEX_R * math.sqrt(3)
+        col = 0
+        x = -self.HEX_R
+        while x < width + self.HEX_R:
+            offset = (step_y / 2) if col % 2 else 0.0
+            y = -self.HEX_R + offset
+            while y < height + self.HEX_R:
+                yield x, y
+                y += step_y
+            x += step_x
+            col += 1
 
     def _render_layers(self, painter: QPainter, width: int, height: int) -> None:
-        rect = QRectF(0, 0, width, height)
-        painter.fillRect(rect, tokens.VOID)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(QRectF(0, 0, width, height), tokens.VOID)
 
-        vignette = QRadialGradient(width * 0.5, height * 0.45, width * 0.62)
-        vignette.setColorAt(0.0, QColor(10, 60, 90, 56))
-        vignette.setColorAt(1.0, QColor(10, 60, 90, 0))
-        painter.fillRect(rect, vignette)
-
-        painter.setPen(QPen(QColor(11, 95, 135, 14), 1))
-        for x in range(0, width, 40):
-            painter.drawLine(x, 0, x, height)
-        for y in range(0, height, 40):
-            painter.drawLine(0, y, width, y)
-
-        painter.setPen(QPen(QColor(0, 0, 0, 56), 1))
-        for y in range(0, height, 3):
-            painter.drawLine(0, y, width, y)
+        rng = random.Random(7)
+        painter.setPen(QPen(tokens.HEX_EDGE, 1.2))
+        for cx, cy in self._centres(width, height):
+            shade = rng.uniform(0.55, 1.6)
+            fill = QColor(
+                min(255, int(tokens.HEX_FILL.red() * shade)),
+                min(255, int(tokens.HEX_FILL.green() * shade)),
+                min(255, int(tokens.HEX_FILL.blue() * shade)),
+            )
+            painter.setBrush(fill)
+            painter.drawPolygon(*[QPointF(x, y) for x, y in self._hex_points(cx, cy)])
 
 
 class _CircuitTraces(_CachedLayer):
@@ -337,18 +369,13 @@ class ZoneBuilderMixin:
         panel.body_layout.addWidget(self.cpu_hero)
 
         self.cpu_graph = self._register(MetricGraph(capacity=60, maximum=100.0))
-        self.cpu_graph.setFixedHeight(26)
-        panel.body_layout.addWidget(self.cpu_graph)
+        self.cpu_graph.setMaximumHeight(GRAPH_MAX_H)
+        panel.body_layout.addWidget(self.cpu_graph, 1)
 
-        self.core_strip = _CoreStrip(panel.body)
-        panel.body_layout.addWidget(self.core_strip)
-
-        self.cpu_freq = Readout("FREQ")
-        self.cpu_split = Readout("USR/SYS")
-        self.cpu_ctx = Readout("CTX/S")
-        panel.body_layout.addWidget(self._strip(panel.body, self.cpu_freq, self.cpu_split, self.cpu_ctx))
-
-        self.cpu_procs = self._register(ProcessRows(count=3, unit="%", decimals=1))
+        # One row, not three: the question a glance asks is "what's eating it",
+        # and the answer is the top entry. The per-core strip and the clock
+        # speed went with it — neither changed a decision anyone was making.
+        self.cpu_procs = self._register(ProcessRows(count=1, unit="%", decimals=1))
         panel.body_layout.addWidget(self.cpu_procs)
         panel.body_layout.addStretch(1)
         return panel
@@ -359,36 +386,18 @@ class ZoneBuilderMixin:
         panel.body_layout.addWidget(self.ram_hero)
 
         self.ram_graph = self._register(MetricGraph(capacity=60, maximum=100.0))
-        self.ram_graph.setFixedHeight(26)
-        panel.body_layout.addWidget(self.ram_graph)
-
-        self.swap_bar = BarMeter("SWAP")
-        panel.body_layout.addWidget(self.swap_bar)
-
-        self.ram_avail = Readout("AVAILABLE")
-        panel.body_layout.addWidget(self.ram_avail)
-
-        self.ram_procs = self._register(ProcessRows(count=2, unit=" GB", decimals=1))
-        panel.body_layout.addWidget(self.ram_procs)
+        self.ram_graph.setMaximumHeight(GRAPH_MAX_H)
+        panel.body_layout.addWidget(self.ram_graph, 1)
         panel.body_layout.addStretch(1)
         return panel
 
     def _build_zone_c2(self) -> QWidget:
         panel = Panel("STORAGE", self)
         self._storage_panel = panel  # update_disks() inserts one bar per mount here
-        self.disk_io_read = Readout("READ")
-        self.disk_io_write = Readout("WRITE")
-        panel.body_layout.addWidget(self._strip(panel.body, self.disk_io_read, self.disk_io_write))
-
-        # Read and write get their own traces rather than one combined line:
-        # a machine paging heavily and one writing a big file look identical
-        # summed together, and completely different apart.
-        self.disk_read_graph = self._register(MetricGraph(capacity=60))
-        self.disk_read_graph.setFixedHeight(24)
-        self.disk_write_graph = self._register(MetricGraph(capacity=60))
-        self.disk_write_graph.setFixedHeight(24)
-        panel.body_layout.addWidget(self.disk_read_graph)
-        panel.body_layout.addWidget(self.disk_write_graph)
+        # Read and write on one line, and no trace: throughput is something you
+        # check, not something you watch.
+        self.disk_io = Readout("I/O")
+        panel.body_layout.addWidget(self.disk_io)
         panel.body_layout.addStretch(1)
         return panel
 
@@ -462,12 +471,6 @@ class ZoneBuilderMixin:
         self.date_label.setStyleSheet(f"color: {tokens.CY_500.name()};")
         panel.body_layout.addWidget(self.date_label)
 
-        self.clock_uptime = Readout("UPTIME")
-        panel.body_layout.addWidget(self.clock_uptime)
-        # How far through the day it is — the panel had a clock and a lot of
-        # empty space under it, and this needs no data the HUD doesn't have.
-        self.clock_day = BarMeter("DAY")
-        panel.body_layout.addWidget(self.clock_day)
         panel.body_layout.addStretch(1)
 
         self._clock_timer = QTimer(self)
@@ -496,26 +499,18 @@ class ZoneBuilderMixin:
         self.weather_forecast.setFixedHeight(58)
         panel.body_layout.addWidget(self.weather_forecast)
 
-        self.weather_humidity_feels = Readout("HUMID/FEELS")
-        self.weather_wind_pressure = Readout("WIND/PRESS")
-        self.weather_sun = Readout("SUN")
-        for row in (self.weather_humidity_feels, self.weather_wind_pressure, self.weather_sun):
-            panel.body_layout.addWidget(row)
         panel.body_layout.addStretch(1)
         return panel
 
     def _build_zone_h(self) -> QWidget:
         panel = Panel("THERMALS · POWER", self)
+        # Two arcs, not three: GPU load is already one of the four radial
+        # gauges flanking the orb, and VRAM had a readout of its own there too.
         self.temp_arc_cpu = self._register(MiniArc("CPU", "°", minimum=20.0, maximum=100.0))
         self.temp_arc_gpu = self._register(MiniArc("GPU", "°", minimum=20.0, maximum=100.0))
-        self.temp_arc_load = self._register(MiniArc("GPU LOAD", "%", minimum=0.0, maximum=100.0))
-        arcs = self._strip(panel.body, self.temp_arc_cpu, self.temp_arc_gpu, self.temp_arc_load)
-        arcs.setFixedHeight(74)
+        arcs = self._strip(panel.body, self.temp_arc_cpu, self.temp_arc_gpu)
+        arcs.setFixedHeight(78)
         panel.body_layout.addWidget(arcs)
-
-        self.temp_vram = Readout("VRAM")
-        self.temp_fan = Readout("FAN")
-        panel.body_layout.addWidget(self._strip(panel.body, self.temp_vram, self.temp_fan))
 
         self.battery = self._register(BatteryMeter(panel.body))
         panel.body_layout.addWidget(self.battery)
@@ -525,21 +520,14 @@ class ZoneBuilderMixin:
     def _build_zone_i(self) -> QWidget:
         panel = Panel("NETWORK", self)
         self.net_ip = Readout("IP")
-        self.net_totals = Readout("SESSION")
-        panel.body_layout.addWidget(self._strip(panel.body, self.net_ip, self.net_totals))
+        panel.body_layout.addWidget(self.net_ip)
 
         self.net_hero_down = self._register(HeroValue("DOWN", "KB/S", maximum=None))
         panel.body_layout.addWidget(self.net_hero_down)
 
         self.net_graph_down = self._register(MetricGraph(capacity=60))
-        self.net_graph_down.setFixedHeight(20)
-        self.net_graph_up = self._register(MetricGraph(capacity=60))
-        self.net_graph_up.setFixedHeight(20)
-        panel.body_layout.addWidget(self.net_graph_down)
-        panel.body_layout.addWidget(self.net_graph_up)
-
-        self.net_nics = self._register(ProcessRows(count=2, unit=" KB/S", decimals=0))
-        panel.body_layout.addWidget(self.net_nics)
+        self.net_graph_down.setMaximumHeight(GRAPH_MAX_H)
+        panel.body_layout.addWidget(self.net_graph_down, 1)
         panel.body_layout.addStretch(1)
         return panel
 
@@ -565,7 +553,9 @@ class ZoneBuilderMixin:
         # out by hand (see ui/hud/widgets.py's Dock).
         self.dock = Dock(self)
         for glyph, label, preset in DOCK_ITEMS:
-            button = DockButton(glyph, label, self.dock)
+            # preset is None for the locally handled entries (§6.10), which
+            # is exactly the set that must stay live during a turn.
+            button = DockButton(glyph, label, self.dock, dispatches=preset is not None)
             button.clicked.connect(lambda checked=False, g=glyph, p=preset: self._on_dock_clicked(g, p))
             self.dock.add_button(button)
         self._register(self.dock)

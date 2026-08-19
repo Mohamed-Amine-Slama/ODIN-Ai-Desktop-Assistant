@@ -336,7 +336,7 @@ def test_cpu_panel_shows_a_hero_value_history_and_top_processes(window):
 
     assert window.cpu_graph.samples == [41.0]
     assert window.cpu_procs.rows[0] == ("chrome.exe", 18.4)
-    assert "2699" in window.cpu_freq._value
+    assert len(window.cpu_procs.rows) == 1        # the heaviest one, not a table
 
 
 def test_memory_panel_shows_the_headline_figure_and_its_history(window):
@@ -346,19 +346,17 @@ def test_memory_panel_shows_the_headline_figure_and_its_history(window):
     assert "21.4/32" in window.ram_hero._caption
 
 
-def test_network_panel_breaks_traffic_down_by_interface(window):
+def test_network_panel_shows_the_rate_and_its_history(window):
     window.telemetry_view.render_frame(_frame())
 
     assert window.net_graph_down.samples == [2463.7]
-    assert [name for name, _ in window.net_nics.rows] == ["Wi-Fi", "Ethernet"]
+    assert window.net_ip._value == "192.168.1.129"
 
 
-def test_storage_panel_traces_total_io(window):
+def test_storage_panel_reports_io_on_one_line(window):
     window.telemetry_view.render_frame(_frame())
 
-    assert window.disk_io_graph.samples == [5.9 + 10.3]
-    assert "5.9" in window.disk_io_read._value
-    assert "10.3" in window.disk_io_write._value
+    assert "5.9" in window.disk_io._value and "10.3" in window.disk_io._value
 
 
 def test_thermals_drive_arcs_and_the_battery_meter(window):
@@ -368,6 +366,7 @@ def test_thermals_drive_arcs_and_the_battery_meter(window):
     assert window.temp_arc_gpu._value == 60.0
     assert window.battery.caption == "1H 15M LEFT"
     assert not hasattr(window, "temp_arc_load")   # the GPU gauge by the orb already says this
+    assert not hasattr(window, "temp_fan")
 
 
 def test_missing_sensors_read_as_unavailable_rather_than_zero(window):
@@ -400,7 +399,7 @@ def test_the_hud_animates_a_bounded_number_of_instruments(window):
     """Every registered instrument repaints while it eases, so this count is
     the per-frame cost of the side panels. Kept deliberately small — the
     panels were trimmed back to one headline figure and one history each."""
-    assert len(window._instruments) <= 13
+    assert len(window._instruments) <= 12
 
 
 def test_every_panel_instrument_advances_with_the_shared_loop(window):
@@ -417,13 +416,12 @@ def test_every_panel_instrument_advances_with_the_shared_loop(window):
     assert window.temp_arc_cpu.fraction > 0.0
 
 
-def test_the_clock_panel_shows_progress_through_the_day(window):
-    """The panel had a clock and ninety pixels of nothing under it."""
+def test_uptime_is_reported_once_in_the_header(window):
     window.telemetry_view.render_frame(_frame(uptime_sec=98_400.0))
     window.telemetry_view.render_clock()
 
-    assert 0.0 <= window.clock_day._fraction <= 1.0
-    assert "1D 3H 20M" in window.uptime_label.text()   # the header carries it, once
+    assert "1D 3H 20M" in window.uptime_label.text()
+    assert not hasattr(window, "clock_day")     # the clock panel is a clock
 
 
 # -- the dock's states ------------------------------------------------------
@@ -436,7 +434,9 @@ def test_the_dock_dims_while_a_turn_is_in_flight(window, mock_brain):
     assert all(b.isEnabled() for b in window.dock.buttons)
 
     window._launch_preset("first command")
-    assert not any(b.isEnabled() for b in window.dock.buttons)
+    # The launchers dim; the locally handled toggles stay live (see
+    # test_local_toggles_stay_clickable_while_a_turn_is_in_flight).
+    assert not any(b.isEnabled() for b in window.dock.buttons if b.dispatches)
 
     # Wait on the turn actually ending rather than on a fixed sleep — the
     # voice workers share this event loop and the timing isn't fixed.
@@ -480,3 +480,49 @@ def test_the_hand_button_follows_gesture_control_state(window):
 
     window._on_gesture_state("stopped", "hand control off")
     assert button.is_active is False
+
+
+def test_local_toggles_stay_clickable_while_a_turn_is_in_flight(window):
+    """Reproduces the reported bug: hand control could not be activated. The
+    dock dimmed every button during a turn, including the three that are
+    handled locally and never reach the brain at all."""
+    window._process_user_turn("hello")
+    assert window.current_worker is not None
+
+    assert not window.dock.button("EXP").isEnabled()    # launchers do dim
+    for glyph in ("SET", "CON", "HAND"):
+        assert window.dock.button(glyph).isEnabled(), f"{glyph} was disabled mid-turn"
+
+    # Click it against a stub controller: the real one opens the webcam, and
+    # a test must not leave a capture thread running behind the suite.
+    import ui.hud.window as window_module
+
+    class _StubController:
+        def __init__(self):
+            self.started = False
+
+        def is_running(self):
+            return self.started
+
+        def start(self):
+            self.started = True
+            return "starting"
+
+        def stop(self):
+            self.started = False
+            return "stopped"
+
+    stub = _StubController()
+    original = window_module.get_gesture_controller
+    window_module.get_gesture_controller = lambda: stub
+    try:
+        window.dock.button("HAND").click()
+    finally:
+        window_module.get_gesture_controller = original
+
+    assert stub.started is True
+
+    for _ in range(60):
+        if window.current_worker is None:
+            break
+        QTest.qWait(50)

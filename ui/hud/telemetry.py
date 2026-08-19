@@ -43,9 +43,6 @@ class CpuSample:
     freq_mhz: float | None
     processes: int
     top: list[tuple[str, float]] = field(default_factory=list)
-    user_pct: float = 0.0        # the user/system split behind `percent`
-    system_pct: float = 0.0
-    ctx_per_sec: float = 0.0     # context switches/second, rate-diffed
 
 
 @dataclass
@@ -54,8 +51,6 @@ class MemSample:
     total_gb: float
     percent: float
     swap_percent: float
-    available_gb: float = 0.0
-    top: list[tuple[str, float]] = field(default_factory=list)  # (name, RSS GB)
 
 
 @dataclass
@@ -167,8 +162,6 @@ class TelemetryWorker(QThread):
         self._prev_disk_io_ts: float | None = None
         self._prev_nics: dict | None = None
         self._prev_nics_ts: float | None = None
-        self._prev_ctx: int | None = None
-        self._prev_ctx_ts: float | None = None
 
         # psutil.Process.cpu_percent(None) only reports a real number on the
         # *second* call against the *same* object — process_iter() hands
@@ -185,7 +178,7 @@ class TelemetryWorker(QThread):
         # answer it gives ("what's eating the machine") changes slowly — so
         # it's cached on its own cadence like disk usage above, rather than
         # making every telemetry frame wait for it.
-        self._proc_cache: tuple[int, list, list] | None = None
+        self._proc_cache: tuple[int, list] | None = None
         self._proc_cache_ts: float = 0.0
 
         # Lazily-imported optional sensor backends; None until first probed.
@@ -216,18 +209,14 @@ class TelemetryWorker(QThread):
 
     def _collect(self) -> TelemetryFrame:
         now = time.time()
-        processes, top, top_mem = self._processes(now)
+        processes, top = self._processes(now)
         freq = psutil.cpu_freq()
-        times = psutil.cpu_times_percent(interval=None)
         cpu = CpuSample(
             percent=psutil.cpu_percent(interval=None),
             per_core=_aggregate_cores(psutil.cpu_percent(interval=None, percpu=True)),
             freq_mhz=round(freq.current) if freq else None,
             processes=processes,
             top=top,
-            user_pct=round(getattr(times, "user", 0.0), 1),
-            system_pct=round(getattr(times, "system", 0.0), 1),
-            ctx_per_sec=self._ctx_rate(now),
         )
 
         vm = psutil.virtual_memory()
@@ -237,8 +226,6 @@ class TelemetryWorker(QThread):
             total_gb=round(vm.total / 1024**3, 1),
             percent=vm.percent,
             swap_percent=swap.percent,
-            available_gb=round(vm.available / 1024**3, 1),
-            top=top_mem,
         )
 
         return TelemetryFrame(
@@ -253,7 +240,7 @@ class TelemetryWorker(QThread):
             uptime_sec=now - psutil.boot_time(),
         )
 
-    def _processes(self, now: float) -> tuple[int, list[tuple[str, float]], list[tuple[str, float]]]:
+    def _processes(self, now: float) -> tuple[int, list[tuple[str, float]]]:
         """The cached process scan. Returns the previous result untouched
         until HUD_PROCESS_POLL_SECONDS has passed."""
         if self._proc_cache is not None and now - self._proc_cache_ts < config.HUD_PROCESS_POLL_SECONDS:
@@ -262,7 +249,7 @@ class TelemetryWorker(QThread):
         self._proc_cache_ts = now
         return self._proc_cache
 
-    def _collect_processes(self) -> tuple[int, list[tuple[str, float]], list[tuple[str, float]]]:
+    def _collect_processes(self) -> tuple[int, list[tuple[str, float]]]:
         current = {p.info["pid"]: p for p in psutil.process_iter(["pid"])}
 
         for pid, proc in current.items():
@@ -278,22 +265,16 @@ class TelemetryWorker(QThread):
                 del self._proc_handles[pid]
 
         top: list[tuple[str, float]] = []
-        by_memory: list[tuple[str, float]] = []
         for pid, proc in list(self._proc_handles.items()):
             try:
-                # oneshot() caches the one underlying system call all three of
-                # these read from. Without it, adding the memory reading
-                # doubled the scan (measured: 1226ms -> 2445ms over 367
-                # processes); inside it, memory costs essentially nothing.
+                # oneshot() caches the system call these readings share, so
+                # the scan pays for it once per process instead of twice.
                 with proc.oneshot():
-                    name = proc.name()
-                    top.append((name, proc.cpu_percent(None)))
-                    by_memory.append((name, proc.memory_info().rss / 1024**3))
+                    top.append((proc.name(), proc.cpu_percent(None)))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 del self._proc_handles[pid]
         top.sort(key=lambda item: item[1], reverse=True)
-        by_memory.sort(key=lambda item: item[1], reverse=True)
-        return len(current), top[:TOP_PROCESS_COUNT], by_memory[:TOP_PROCESS_COUNT]
+        return len(current), top[:TOP_PROCESS_COUNT]
 
     def _disks(self, now: float) -> list[DiskSample]:
         if self._disk_cache_ts and now - self._disk_cache_ts < config.HUD_DISK_POLL_SECONDS:
@@ -328,22 +309,6 @@ class TelemetryWorker(QThread):
             write_mbs = max((counters.write_bytes - self._prev_disk_io.write_bytes) / 1024**2 / elapsed, 0.0)
         self._prev_disk_io, self._prev_disk_io_ts = counters, now
         return DiskIoSample(read_mbs=round(read_mbs, 2), write_mbs=round(write_mbs, 2))
-
-    def _ctx_rate(self, now: float) -> float:
-        """Context switches per second. Like every counter here it's
-        cumulative, so it needs the previous reading to mean anything — and
-        it can restart (a counter reset reads as a huge negative delta), so
-        the result is floored at zero rather than reported as nonsense."""
-        try:
-            total = psutil.cpu_stats().ctx_switches
-        except (AttributeError, NotImplementedError, OSError):
-            return 0.0
-        rate = 0.0
-        if self._prev_ctx is not None and self._prev_ctx_ts is not None:
-            elapsed = max(now - self._prev_ctx_ts, 1e-6)
-            rate = max((total - self._prev_ctx) / elapsed, 0.0)
-        self._prev_ctx, self._prev_ctx_ts = total, now
-        return round(rate, 1)
 
     def _nic_samples(self, now: float) -> list[NicSample]:
         """Per-interface rates, busiest first. Interfaces that moved nothing

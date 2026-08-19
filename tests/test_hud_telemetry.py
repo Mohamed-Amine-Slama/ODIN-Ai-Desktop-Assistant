@@ -91,7 +91,7 @@ def test_process_cpu_percent_uses_the_same_persisted_handle_across_ticks(monkeyp
     assert worker._proc_handles[42] is proc  # the exact same object, not a new one
 
     proc.cpu_percent.return_value = 12.5
-    _, top, _by_memory = worker._collect_processes()
+    _, top = worker._collect_processes()
     assert proc.cpu_percent.call_count > calls_after_first_tick  # called again, same object
     assert top == [("python.exe", 12.5)]
 
@@ -191,56 +191,6 @@ def test_nic_list_is_capped(monkeypatch):
     assert nics[0].name == "if8"  # the busiest
 
 
-def test_context_switch_rate_is_diffed(monkeypatch):
-    monkeypatch.setattr(
-        "ui.hud.telemetry.psutil.cpu_stats",
-        lambda: SimpleNamespace(ctx_switches=1_000, interrupts=0, soft_interrupts=0, syscalls=0),
-    )
-    worker = TelemetryWorker()
-    assert worker._ctx_rate(now=100.0) == 0.0  # first tick has nothing to diff
-
-    monkeypatch.setattr(
-        "ui.hud.telemetry.psutil.cpu_stats",
-        lambda: SimpleNamespace(ctx_switches=3_500, interrupts=0, soft_interrupts=0, syscalls=0),
-    )
-    assert worker._ctx_rate(now=101.0) == 2500.0
-
-
-def test_context_switch_counter_wrapping_never_reports_negative(monkeypatch):
-    monkeypatch.setattr(
-        "ui.hud.telemetry.psutil.cpu_stats",
-        lambda: SimpleNamespace(ctx_switches=5_000, interrupts=0, soft_interrupts=0, syscalls=0),
-    )
-    worker = TelemetryWorker()
-    worker._ctx_rate(now=100.0)
-    monkeypatch.setattr(
-        "ui.hud.telemetry.psutil.cpu_stats",
-        lambda: SimpleNamespace(ctx_switches=10, interrupts=0, soft_interrupts=0, syscalls=0),
-    )
-    assert worker._ctx_rate(now=101.0) == 0.0
-
-
-def test_top_processes_are_reported_by_memory_as_well_as_cpu(monkeypatch):
-    def make(pid, name, cpu, rss_gb):
-        proc = MagicMock()
-        proc.info = {"pid": pid}
-        proc.name.return_value = name
-        proc.cpu_percent.return_value = cpu
-        proc.memory_info.return_value = SimpleNamespace(rss=int(rss_gb * 1024**3))
-        return proc
-
-    procs = [make(1, "hungry.exe", 2.0, 6.0), make(2, "busy.exe", 90.0, 0.2)]
-    monkeypatch.setattr("ui.hud.telemetry.psutil.process_iter", lambda attrs: procs)
-    worker = TelemetryWorker()
-    worker._collect_processes()  # prime the handles
-
-    _, top_cpu, top_mem = worker._collect_processes()
-
-    assert top_cpu[0][0] == "busy.exe"
-    assert top_mem[0][0] == "hungry.exe"
-    assert round(top_mem[0][1], 1) == 6.0
-
-
 def test_battery_reports_time_remaining(monkeypatch):
     import psutil as real_psutil
 
@@ -284,14 +234,13 @@ def test_the_process_scan_runs_on_its_own_slower_cadence(monkeypatch):
 
 
 def test_process_stats_are_read_in_one_syscall_batch(monkeypatch):
-    """psutil's oneshot() caches the underlying system call, so reading both
-    CPU and memory for a process costs the same as reading either alone —
-    without it, adding the memory reading doubled the scan."""
+    """psutil's oneshot() caches the underlying system call the name and CPU
+    readings share, so the scan pays for it once per process rather than
+    twice. It is the most expensive thing the collector does."""
     proc = MagicMock()
     proc.info = {"pid": 7}
     proc.name.return_value = "python.exe"
     proc.cpu_percent.return_value = 3.0
-    proc.memory_info.return_value = SimpleNamespace(rss=1024**3)
     monkeypatch.setattr("ui.hud.telemetry.psutil.process_iter", lambda attrs: iter([proc]))
 
     worker = TelemetryWorker()
@@ -299,3 +248,20 @@ def test_process_stats_are_read_in_one_syscall_batch(monkeypatch):
     worker._collect_processes()
 
     assert proc.oneshot.called
+
+
+def test_the_collector_reads_nothing_no_panel_displays(monkeypatch):
+    """Per-process memory was sampled for a panel that has since been trimmed
+    away. Walking every process is the collector's dominant cost, so anything
+    it reads has to be earning its place on screen."""
+    proc = MagicMock()
+    proc.info = {"pid": 7}
+    proc.name.return_value = "python.exe"
+    proc.cpu_percent.return_value = 3.0
+    monkeypatch.setattr("ui.hud.telemetry.psutil.process_iter", lambda attrs: iter([proc]))
+
+    worker = TelemetryWorker()
+    worker._collect_processes()
+    worker._collect_processes()
+
+    assert not proc.memory_info.called

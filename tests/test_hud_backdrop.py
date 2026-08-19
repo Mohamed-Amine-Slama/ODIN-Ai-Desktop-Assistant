@@ -60,3 +60,34 @@ def test_circuit_traces_are_cached_too(qapp):
 
     _render(traces)
     assert traces.cached_layers() is cached
+
+
+# -- the hexagon field ------------------------------------------------------
+
+
+def test_the_field_is_static_and_costs_nothing_per_frame(qapp):
+    """Black, tiled, and still. It carries no information and nothing on it
+    moves, so it is rendered once and blitted — it must never join the
+    animation loop, where it would drag every panel above it into each frame."""
+    backdrop = _Backdrop()
+    backdrop.resize(800, 600)
+    _render(backdrop)
+
+    assert not hasattr(backdrop, "advance")
+    assert not hasattr(backdrop, "lit_edges")
+
+
+def test_the_field_is_black(qapp):
+    from PyQt6.QtGui import QColor
+
+    backdrop = _Backdrop()
+    backdrop.resize(400, 300)
+    pixmap = QPixmap(backdrop.size())
+    pixmap.fill(QColor(255, 0, 0))     # so an unpainted pixel would be obvious
+    backdrop.render(pixmap)
+    image = pixmap.toImage()
+
+    samples = [image.pixelColor(x, y) for x in range(5, 400, 37) for y in range(5, 300, 29)]
+    assert all(c.red() < 40 and c.green() < 40 and c.blue() < 55 for c in samples)
+    # The tiling has to be visible against it, not a flat fill.
+    assert len({(c.red(), c.green(), c.blue()) for c in samples}) > 1

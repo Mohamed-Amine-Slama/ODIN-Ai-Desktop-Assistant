@@ -452,12 +452,20 @@ def _ensure_model():
 
 
 def _hand_landmarker():
-    """Build a Tasks-API hand landmark detector. Returns (landmarker,
-    error_message); the caller still needs _mediapipe() separately for
-    mp.Image/mp.ImageFormat, which don't depend on this model."""
+    """Build a Tasks-API hand landmark detector in VIDEO running mode.
+
+    VIDEO, not the default IMAGE: IMAGE re-runs full palm detection on every
+    frame, while VIDEO tracks the hand between frames and only re-detects when
+    it loses it. `min_tracking_confidence` below is silently ignored in IMAGE
+    mode, which is the giveaway that tracking was always the intent. Callers
+    must use detect_for_video() with strictly increasing timestamps.
+
+    Returns (landmarker, error_message); the caller still needs _mediapipe()
+    separately for mp.Image/mp.ImageFormat, which don't depend on this model.
+    """
     try:
         from mediapipe.tasks.python import BaseOptions
-        from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+        from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions, RunningMode
     except ImportError:
         return None, "Hand control needs the 'mediapipe' package. Run: pip install mediapipe"
     except Exception as e:
@@ -470,6 +478,7 @@ def _hand_landmarker():
     try:
         options = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.VIDEO,
             num_hands=1,
             min_hand_detection_confidence=0.6,
             min_tracking_confidence=0.5,
@@ -556,6 +565,12 @@ class GestureController:
         machine = GestureStateMachine()
         bounds = _virtual_screen_bounds()
         min_frame_seconds = 1.0 / max(1, config.GESTURE_FPS_LIMIT)
+        # VIDEO mode demands strictly increasing timestamps and raises if one
+        # ever repeats or goes backwards, so this counts from a monotonic
+        # clock (never the wall clock) and forces a minimum step of 1ms in
+        # case two frames land inside the same millisecond.
+        started_at = time.monotonic()
+        last_timestamp_ms = -1
         self.on_state_change("active", "Hand control is on.")
 
         try:
@@ -568,7 +583,11 @@ class GestureController:
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                result = landmarker.detect(image)
+                timestamp_ms = max(
+                    last_timestamp_ms + 1, int((frame_start - started_at) * 1000)
+                )
+                last_timestamp_ms = timestamp_ms
+                result = landmarker.detect_for_video(image, timestamp_ms)
                 landmarks = None
                 if result.hand_landmarks:
                     landmarks = [Landmark(p.x, p.y, p.z) for p in result.hand_landmarks[0]]
@@ -599,38 +618,60 @@ class GestureController:
             landmarker.close()
             cap.release()
 
+    @staticmethod
+    def _hotkey(gui, *keys) -> None:
+        """pyautogui.hotkey() takes no `_pause`, so it would sleep the global
+        0.1s once per call. Pressing and releasing by hand keeps the same
+        semantics (reverse-order release) at no cost, and the finally block
+        means a failure mid-combo can't leave Alt held down."""
+        pressed = []
+        try:
+            for key in keys:
+                gui.keyDown(key, _pause=False)
+                pressed.append(key)
+        finally:
+            for key in reversed(pressed):
+                gui.keyUp(key, _pause=False)
+
     def _apply(self, gui, event: GestureEvent, bounds) -> None:
+        # _pause=False on every call: pyautogui sleeps for its global PAUSE
+        # (0.1s by default) after each action, which measured at 100.45ms per
+        # moveTo against 0.09ms without it. At one move per frame that alone
+        # capped the loop near 7fps and blocked the capture thread, so frames
+        # queued behind it and the lag compounded. Passing it per call leaves
+        # the global untouched for skills/input_skills.py, which wants the
+        # pause between discrete scripted actions.
         if event.action in (Action.MOVE, Action.DRAG_MOVE):
             x, y = map_to_screen(event.x, event.y, bounds)
-            gui.moveTo(x, y)
+            gui.moveTo(x, y, _pause=False)
         elif event.action == Action.DRAG_START:
             x, y = map_to_screen(event.x, event.y, bounds)
-            gui.moveTo(x, y)
-            gui.mouseDown()
+            gui.moveTo(x, y, _pause=False)
+            gui.mouseDown(_pause=False)
         elif event.action == Action.DRAG_END:
-            gui.mouseUp()
+            gui.mouseUp(_pause=False)
         elif event.action == Action.CLICK:
-            gui.click()
+            gui.click(_pause=False)
         elif event.action == Action.RIGHT_CLICK:
-            gui.click(button="right")
+            gui.click(button="right", _pause=False)
         elif event.action == Action.DOUBLE_CLICK:
-            gui.doubleClick()
+            gui.doubleClick(_pause=False)
         elif event.action == Action.MIDDLE_CLICK:
-            gui.click(button="middle")
+            gui.click(button="middle", _pause=False)
         elif event.action == Action.SCROLL:
-            gui.scroll(event.scroll_amount or 0)
+            gui.scroll(event.scroll_amount or 0, _pause=False)
         elif event.action == Action.ZOOM:
             # try/finally: one bad frame must not leak a stuck Ctrl key, the
             # same reasoning core/gesture.py already applies to mouse buttons.
-            gui.keyDown("ctrl")
+            gui.keyDown("ctrl", _pause=False)
             try:
-                gui.scroll(event.scroll_amount or 0)
+                gui.scroll(event.scroll_amount or 0, _pause=False)
             finally:
-                gui.keyUp("ctrl")
+                gui.keyUp("ctrl", _pause=False)
         elif event.action == Action.ALT_TAB:
-            gui.hotkey("alt", "tab")
+            self._hotkey(gui, "alt", "tab")
         elif event.action == Action.ALT_SHIFT_TAB:
-            gui.hotkey("alt", "shift", "tab")
+            self._hotkey(gui, "alt", "shift", "tab")
 
 
 def make_controller(on_state_change=None) -> "GestureController | None":

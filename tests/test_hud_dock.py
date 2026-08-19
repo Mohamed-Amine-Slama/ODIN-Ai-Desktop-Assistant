@@ -220,3 +220,46 @@ def test_the_row_relaxes_on_the_next_frame_once_nothing_is_hovered(qapp):
 
     assert dock.cursor_x is None
     assert all(round(b.magnification, 3) == 1.0 for b in dock.buttons)
+
+
+def test_a_button_labels_itself_inside_the_ring(qapp):
+    """The icon alone left the dock unreadable to anyone who hadn't already
+    learned it, so the short code is drawn inside the circle under the icon.
+    Checked in pixels: paintEvent builds its own painter, so a recording
+    painter passed to render() never sees the calls."""
+    from PyQt6.QtGui import QColor
+
+    button = DockButton("TERM", "Terminal")
+    pixmap = QPixmap(button.size())
+    pixmap.fill(QColor(0, 0, 0))
+    button.render(pixmap)
+    image = pixmap.toImage()
+
+    radius = button.radius()
+    cx = button.width() / 2
+    cy = button.height() - button.BASELINE - radius
+    band_top, band_bottom = int(cy + radius * 0.30), int(cy + radius * 0.72)
+    lit = sum(
+        1
+        for y in range(band_top, band_bottom)
+        for x in range(int(cx - radius * 0.5), int(cx + radius * 0.5))
+        if image.pixelColor(x, y).blue() > 90
+    )
+
+    assert lit > 20, "no lettering drawn inside the ring"
+
+
+def test_only_buttons_that_reach_the_brain_are_dimmed_when_busy(qapp):
+    """SET, CON and HAND are handled locally and never dispatch a turn, so a
+    busy dock must leave them live. Dimming everything made hand control
+    unreachable for the length of every turn."""
+    dock = Dock()
+    launcher = DockButton("EXP", "Explorer", dock, dispatches=True)
+    toggle = DockButton("HAND", "Hand Control", dock, dispatches=False)
+    dock.add_button(launcher)
+    dock.add_button(toggle)
+
+    dock.set_available(False)
+
+    assert not launcher.isEnabled()
+    assert toggle.isEnabled()

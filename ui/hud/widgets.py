@@ -271,10 +271,14 @@ class DockButton(QAbstractButton):
     BASELINE = 24            # pixels from the cell's bottom to the circle's
     FLASH_DECAY = 2.6        # per second
 
-    def __init__(self, glyph: str, label: str, parent=None):
+    def __init__(self, glyph: str, label: str, parent=None, dispatches: bool = True):
         super().__init__(parent)
         self._glyph = glyph
         self._label = label.upper()
+        # Whether this button's action goes through the brain. The three that
+        # don't (SET, CON, HAND) are handled entirely in the window and stay
+        # live while a turn is running — see Dock.set_available.
+        self.dispatches = dispatches
         self._icon = icon_path(glyph)
         self.resize(self.CELL_W, self.CELL_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -421,6 +425,16 @@ class DockButton(QAbstractButton):
 
         self._paint_icon(painter, centre, radius, hovered)
 
+        # The short code under the icon, inside the ring. The icon alone left
+        # the dock unreadable to anyone who hadn't already learned it.
+        painter.setFont(tokens.font_label(tokens.T_MICRO, bold=True))
+        painter.setPen(tokens.CY_100 if (hovered or self._active) else tokens.CY_400)
+        painter.drawText(
+            QRectF(centre.x() - radius, centre.y() + radius * 0.30, radius * 2, radius * 0.42),
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+            self._glyph,
+        )
+
         painter.setFont(tokens.font_label(tokens.T_MICRO))
         painter.setPen(tokens.CY_100 if (hovered or self._active) else tokens.CY_500)
         painter.drawText(
@@ -438,9 +452,9 @@ class DockButton(QAbstractButton):
     def _paint_icon(self, painter: QPainter, centre: QPointF, radius: float, hovered: bool) -> None:
         """The cached 24x24 path (ui/hud/icons.py), scaled to the circle and
         stroked — never rebuilt, only transformed."""
-        span = radius * 1.05
+        span = radius * 0.95
         painter.save()
-        painter.translate(centre.x() - span / 2, centre.y() - span / 2)
+        painter.translate(centre.x() - span / 2, centre.y() - span / 2 - radius * 0.16)
         painter.scale(span / ICON_BOX, span / ICON_BOX)
         pen = QPen(tokens.CY_100 if (hovered or self._active) else tokens.CY_200, 1.7)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -492,8 +506,12 @@ class Dock(QWidget):
         return None
 
     def set_available(self, available: bool) -> None:
+        """Dim the launchers while a turn is in flight — but only those. The
+        local toggles never reach the brain, and disabling them left hand
+        control unreachable for as long as a turn took."""
         for button in self.buttons:
-            button.set_available(available)
+            if button.dispatches:
+                button.set_available(available)
 
     # -- magnification ------------------------------------------------------
 

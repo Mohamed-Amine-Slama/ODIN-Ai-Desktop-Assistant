@@ -26,6 +26,12 @@ CY_500 = QColor(0x0B, 0x5F, 0x87)  # labels, muted text
 CY_600 = QColor(0x07, 0x3B, 0x55)  # hairlines, ticks, brackets
 CY_700 = QColor(0x04, 0x21, 0x2F)  # gauge track, empty bar segments
 
+# --- The background field ------------------------------------------------
+# The hex backdrop's tiling. Near-black by design: it sits behind everything,
+# encodes nothing, and must never compete with the instruments on top of it.
+HEX_FILL = QColor(0x08, 0x0A, 0x12)
+HEX_EDGE = QColor(0x1C, 0x20, 0x30)
+
 # --- State — used sparingly, only to mean something ---------------------
 OK = QColor(0x17, 0xE9, 0xA0)
 WARN = QColor(0xFF, 0xB0, 0x20)
