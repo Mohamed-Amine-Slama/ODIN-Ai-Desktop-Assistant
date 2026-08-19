@@ -467,6 +467,65 @@ def test_text_mode_needs_no_audio_stack():
     assert session.mode == "text"
 
 
+def test_voice_mode_success_message_names_the_active_device(monkeypatch):
+    """A wrong default input device previously failed with zero visible
+    error (opened fine, just never heard anything). Naming the active
+    device in this message is the fix -- it reaches both the CLI print and
+    the HUD console (status_message -> console.echo)."""
+
+    class FakeMic:
+        def __init__(self, device=None):
+            self.device = device
+            self.device_name = "Microphone (Realtek(R) Audio)"
+
+        def start(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "core.audio",
+        SimpleNamespace(Microphone=FakeMic, resolve_device=lambda spec: None),  # noqa: ARG005
+    )
+    monkeypatch.setitem(sys.modules, "core.barge_in", SimpleNamespace(make_watcher=lambda *a, **k: None))
+    monkeypatch.setitem(
+        sys.modules, "core.speech_input", SimpleNamespace(SpeechInput=lambda *a, **k: SimpleNamespace())
+    )
+    monkeypatch.setitem(sys.modules, "core.wake", SimpleNamespace(make_detector=lambda *a, **k: None))
+
+    session = Session(SpeechOutput(engine="off"))
+    message = session.set_mode("voice")
+
+    assert "Microphone (Realtek(R) Audio)" in message
+
+
+def test_voice_mode_passes_configured_mic_device_through(monkeypatch):
+    monkeypatch.setattr(config, "MIC_DEVICE", "realtek", raising=False)
+    captured = {}
+
+    class FakeMic:
+        def __init__(self, device=None):
+            captured["device"] = device
+            self.device_name = None
+
+        def start(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "core.audio",
+        SimpleNamespace(Microphone=FakeMic, resolve_device=lambda spec: f"resolved:{spec}"),
+    )
+    monkeypatch.setitem(sys.modules, "core.barge_in", SimpleNamespace(make_watcher=lambda *a, **k: None))
+    monkeypatch.setitem(
+        sys.modules, "core.speech_input", SimpleNamespace(SpeechInput=lambda *a, **k: SimpleNamespace())
+    )
+    monkeypatch.setitem(sys.modules, "core.wake", SimpleNamespace(make_detector=lambda *a, **k: None))
+
+    Session(SpeechOutput(engine="off")).set_mode("voice")
+
+    assert captured["device"] == "resolved:realtek"
+
+
 class _FakeSpeechInput:
     """Stands in for core.speech_input.SpeechInput in wake-phrase tests: no
     mic, no Whisper model, just canned transcripts returned in order."""

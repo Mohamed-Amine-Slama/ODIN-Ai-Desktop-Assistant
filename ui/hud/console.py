@@ -88,8 +88,16 @@ class ConsoleOverlay(QWidget):
     def hide_console(self) -> None:
         self.setVisible(False)
 
+    @property
+    def is_open(self) -> bool:
+        """Whether the console has been opened, independent of whether the
+        HUD around it happens to be on screen. Qt's isVisible() is False for
+        any child of a hidden window, so keying the toggle off it made the
+        console stick open whenever the HUD wasn't showing."""
+        return not self.isHidden()
+
     def toggle(self) -> None:
-        self.hide_console() if self.isVisible() else self.show_console()
+        self.hide_console() if self.is_open else self.show_console()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:

@@ -38,3 +38,17 @@ def test_zero_level_bars_render_without_error(qapp):
     spectrum._levels = [0.0] * BAR_COUNT
     spectrum._peaks = [0.0] * BAR_COUNT
     _render(spectrum)
+
+
+def test_levels_are_published_for_the_orb_bezel(qapp):
+    """The orb's spectrum bezel reads the FFT this widget already runs once
+    per tick, rather than analysing the same audio a second time."""
+    spectrum = Spectrum()
+    for _ in range(5):
+        spectrum.advance(1 / 60)
+
+    levels = spectrum.levels
+
+    assert len(levels) == BAR_COUNT
+    assert all(0.0 <= value <= 1.0 for value in levels)
+    assert any(value > 0.0 for value in levels)  # the fake-bins fallback is alive

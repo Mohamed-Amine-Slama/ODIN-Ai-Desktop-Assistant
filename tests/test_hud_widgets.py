@@ -2,6 +2,8 @@
 from datetime import datetime
 
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QWidget
 
 from ui.hud import tokens
 from ui.hud.widgets import BarMeter, DockButton, Panel, Readout, TickRuler
@@ -77,6 +79,42 @@ def test_dock_button_hover_and_focus_paint_without_raising(qapp):
     _render(button)
     button.setFocus()
     _render(button)
+
+
+def test_dock_button_repaints_on_keyboard_focus_change(qapp):
+    """focusInEvent/focusOutEvent must trigger a repaint themselves —
+    paintEvent's hasFocus() check alone left the ring undrawn on a
+    widget's very first focus transition (Qt doesn't reliably schedule one
+    on its own there), which is exactly what happens the first time a
+    keyboard user Tabs into the dock. `_render()`'s explicit `.render()`
+    call above can't catch this — it force-repaints regardless of whether
+    a real repaint was ever scheduled. Needs a real shown/exposed window:
+    an unparented, invisible widget never dispatches real QFocusEvents at
+    all, which would make this test pass for the wrong reason."""
+    window = QWidget()
+    button = DockButton("SYS", "Task Manager", window)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+    window.activateWindow()
+    QTest.qWait(50)
+
+    # Qt auto-focuses the first tab-focusable child on window activation
+    # (see window.py's show_and_activate() comment on the same behavior)
+    # — clear it first so setFocus() below is a genuine unfocused->focused
+    # transition rather than a no-op re-assertion of already-held focus.
+    button.clearFocus()
+    assert not button.hasFocus()
+
+    calls = []
+    button.update = lambda: calls.append(True)
+
+    button.setFocus()
+    assert calls, "focusInEvent must schedule a repaint"
+
+    calls.clear()
+    button.clearFocus()
+    assert calls, "focusOutEvent must schedule a repaint"
+    window.deleteLater()
 
 
 def test_tick_ruler_caret_tracks_time_of_day(qapp):

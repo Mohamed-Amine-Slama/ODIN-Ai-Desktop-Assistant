@@ -5,7 +5,16 @@ works offline, is markedly more accurate, and doesn't ship your audio to a
 third party. Recording stops on silence rather than after a fixed timeout.
 """
 import config
-from core.audio import Microphone, MicrophoneUnavailable, rms
+from core.audio import Microphone, MicrophoneUnavailable, no_signal_message, rms
+
+# A calibrated noise floor this close to exact digital silence means the
+# active input device is producing no real signal at all — a wrong/muted/
+# disconnected device selection, not just a quiet room. A genuinely working
+# mic's calibration lands around 0.01-0.03 even in a quiet room (see the
+# comment on _FLOOR_CALIBRATION_SKIP_BLOCKS below); even the discarded
+# buffering-artifact blocks read up to ~0.0004. This sits well below both,
+# so a quiet-but-working setup should never trip it.
+_SILENT_DEVICE_THRESHOLD = 0.0002
 
 # Blocks at the start of every _record() call spent bootstrapping the noise
 # floor rather than being judged as possible speech — see _record's comment.
@@ -28,6 +37,8 @@ class SpeechInput:
         self._model = _load_model()
         # Calibrated on first listen() from the ambient floor.
         self._noise_floor: float | None = None
+        # Raised at most once per instance — see _SILENT_DEVICE_THRESHOLD.
+        self._silence_warned = False
 
         if self._owns_mic:
             self.mic.start()
@@ -101,6 +112,14 @@ class SpeechInput:
                             calibration_samples.sort()
                             mid = len(calibration_samples) // 2
                             self._noise_floor = calibration_samples[mid]
+                            if self._noise_floor < _SILENT_DEVICE_THRESHOLD and not self._silence_warned:
+                                # Surfaced once, not every retry: this loop
+                                # is entered again every few seconds while
+                                # nothing is heard (normal), and re-raising
+                                # every time would turn one real diagnostic
+                                # into log spam indistinguishable from noise.
+                                self._silence_warned = True
+                                raise MicrophoneUnavailable(no_signal_message(self.mic.device_name))
                     continue
 
                 threshold = self._threshold(level, heard_speech)

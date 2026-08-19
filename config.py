@@ -103,6 +103,10 @@ TRASH_MAX_AGE_DAYS = float(os.getenv("TRASH_MAX_AGE_DAYS", "7"))
 # --- Instrument HUD (ODIN-HUD.md) ------------------------------------------
 HUD_TELEMETRY_INTERVAL_MS = int(os.getenv("HUD_TELEMETRY_INTERVAL_MS", "1000"))
 HUD_DISK_POLL_SECONDS = float(os.getenv("HUD_DISK_POLL_SECONDS", "15"))
+# Walking every process costs ~1s on a busy Windows box (psutil's per-process
+# cpu_percent dominates), so the top-consumer lists refresh on their own
+# cadence instead of holding up the 1Hz telemetry frame.
+HUD_PROCESS_POLL_SECONDS = float(os.getenv("HUD_PROCESS_POLL_SECONDS", "3"))
 # "" lets wttr.in auto-locate from the requesting IP instead of a named city.
 WEATHER_CITY = os.getenv("WEATHER_CITY", "")
 HUD_WEATHER_POLL_SECONDS = float(os.getenv("HUD_WEATHER_POLL_SECONDS", "600"))
@@ -112,6 +116,15 @@ HUD_SPECTRUM_SOURCE = os.getenv("HUD_SPECTRUM_SOURCE", "loopback")
 HUD_REDUCED_MOTION = os.getenv("HUD_REDUCED_MOTION", "0") not in ("0", "false", "False")
 
 # --- Voice ----------------------------------------------------------------
+# Which microphone to capture from. "" (default) uses whatever Windows has
+# set as the default recording device — on a machine with several input
+# devices that isn't always the one you actually talk into, and voice mode
+# then fails silently (opens fine, just never hears you). Set this to a
+# device index or a case-insensitive substring of its name (see the
+# "Voice mode on (<device>)" message printed/echoed on startup, or
+# core/audio.py's list_input_devices) to pin a specific one.
+MIC_DEVICE = os.getenv("MIC_DEVICE", "")
+
 # Wake trigger: say ASSISTANT_NAME and "wake up" to bring Jarvis back from
 # sleep. Works with any name, no API key, no training (see core/wake.py).
 # Set WAKE_WORD=off for push-to-talk instead.

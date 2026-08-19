@@ -38,6 +38,14 @@ def _relative_time(delta_seconds: float) -> str:
     return f"{value}{unit} AGO" if overdue else f"IN {value}{unit}"
 
 
+def _compact(value: float) -> str:
+    """Thousands as `8.4K` — a five-digit context-switch rate would blow out
+    a readout that shares its line with two others."""
+    if value >= 1000:
+        return f"{value / 1000:.1f}K"
+    return f"{value:.0f}"
+
+
 class TelemetryPresenter:
     def __init__(self, window: "OdinHudWindow") -> None:  # noqa: F821 - see module docstring
         self.window = window
@@ -58,6 +66,18 @@ class TelemetryPresenter:
         self._last_tick = now
         window.orb.advance(dt)
         window.spectrum.advance(dt)
+        # One FFT per tick, drawn twice: zone K's analyser and the orb's
+        # bezel ring read the same band levels.
+        window.orb.set_bands(window.spectrum.levels)
+        window.gauge_cpu.advance(dt)
+        window.gauge_ram.advance(dt)
+        window.gauge_disk.advance(dt)
+        window.gauge_gpu.advance(dt)
+        # Every side-panel instrument, registered by its own zone builder
+        # (ui/hud/zones.py's _register) — one list, so a newly added widget
+        # can't be silently left frozen.
+        for instrument in window._instruments:
+            instrument.advance(dt)
 
     # -- telemetry -----------------------------------------------------
 
@@ -65,22 +85,25 @@ class TelemetryPresenter:
         window = self.window
         self._latest_frame = frame
 
-        window.cpu_bar.set_value(frame.cpu.percent / 100, f"{frame.cpu.percent:.0f}%")
-        window.cpu_freq.set_value("--" if frame.cpu.freq_mhz is None else f"{frame.cpu.freq_mhz} MHZ")
-        window.core_strip.set_values(frame.cpu.per_core)
-        window.cpu_processes.set_value(str(frame.cpu.processes))
-        for i, row in enumerate(window.cpu_top_rows):
-            if i < len(frame.cpu.top):
-                name, cpu = frame.cpu.top[i]
-                row.set_label(name[:18])
-                row.set_value(f"{cpu:.0f}%")
-            else:
-                row.set_label("--")
-                row.set_value("--")
+        cpu = frame.cpu
+        window.cpu_hero.set_value(cpu.percent)
+        window.cpu_hero.set_caption(f"{cpu.processes} PROC")
+        window.cpu_graph.push(cpu.percent)
+        window.cpu_graph.set_accent(tokens.threshold_color(cpu.percent / 100))
+        window.core_strip.set_values(cpu.per_core)
+        window.cpu_freq.set_value("--" if cpu.freq_mhz is None else f"{cpu.freq_mhz} MHZ")
+        window.cpu_split.set_value(f"{cpu.user_pct:.0f}/{cpu.system_pct:.0f}%")
+        window.cpu_ctx.set_value(_compact(cpu.ctx_per_sec))
+        window.cpu_procs.set_rows(cpu.top)
 
-        window.ram_bar.set_value(frame.mem.percent / 100, f"{frame.mem.percent:.0f}%")
-        window.ram_spark.push(frame.mem.percent)
-        window.swap_bar.set_value(frame.mem.swap_percent / 100, f"{frame.mem.swap_percent:.0f}%")
+        mem = frame.mem
+        window.ram_hero.set_value(mem.percent)
+        window.ram_hero.set_caption(f"{mem.used_gb:.1f}/{mem.total_gb:.0f} GB")
+        window.ram_graph.push(mem.percent)
+        window.ram_graph.set_accent(tokens.threshold_color(mem.percent / 100))
+        window.ram_avail.set_value(f"{mem.available_gb:.1f} GB FREE")
+        window.ram_procs.set_rows(mem.top)
+        window.swap_bar.set_value(mem.swap_percent / 100, f"{mem.swap_percent:.0f}%")
 
         window.gauge_cpu.set_percent(frame.cpu.percent)
         window.gauge_ram.set_percent(frame.mem.percent)
@@ -90,25 +113,35 @@ class TelemetryPresenter:
         self.update_disks(frame.disks)
         window.disk_io_read.set_value(f"{frame.disk_io.read_mbs:.1f} MB/S")
         window.disk_io_write.set_value(f"{frame.disk_io.write_mbs:.1f} MB/S")
+        window.disk_read_graph.push(frame.disk_io.read_mbs)
+        window.disk_write_graph.push(frame.disk_io.write_mbs)
 
-        window.net_ip.set_value(frame.net.ip or "--")
-        window.net_up_spark.push(frame.net.up_kbs)
-        window.net_down_spark.push(frame.net.down_kbs)
+        net = frame.net
+        window.net_ip.set_value(net.ip or "--")
+        window.net_totals.set_value(f"{net.total_down_gb:.1f}/{net.total_up_gb:.1f} GB")
+        window.net_hero_down.set_value(net.down_kbs)
+        window.net_hero_down.set_caption(f"UP {net.up_kbs:.0f}")
+        window.net_graph_down.push(net.down_kbs)
+        window.net_graph_up.push(net.up_kbs)
+        window.net_nics.set_rows([(nic.name, nic.down_kbs + nic.up_kbs) for nic in net.nics])
 
-        window.temp_cpu.set_value("--" if frame.thermals.cpu_c is None else f"{frame.thermals.cpu_c:.0f}°C")
-        window.temp_gpu.set_value("--" if frame.thermals.gpu_c is None else f"{frame.thermals.gpu_c:.0f}°C")
-        window.temp_gpu_load.set_value(
-            "--" if frame.thermals.gpu_load is None else f"{frame.thermals.gpu_load:.0f}%"
-        )
+        thermals = frame.thermals
+        window.temp_arc_cpu.set_value(thermals.cpu_c)
+        window.temp_arc_gpu.set_value(thermals.gpu_c)
+        window.temp_arc_load.set_value(thermals.gpu_load)
         window.temp_vram.set_value(
-            "--" if frame.thermals.gpu_vram_percent is None else f"{frame.thermals.gpu_vram_percent:.0f}%"
+            "--" if thermals.gpu_vram_percent is None else f"{thermals.gpu_vram_percent:.0f}%"
         )
-        window.temp_fan.set_value("--" if frame.thermals.fan_rpm is None else f"{frame.thermals.fan_rpm:.0f} RPM")
+        window.temp_fan.set_value("--" if thermals.fan_rpm is None else f"{thermals.fan_rpm:.0f} RPM")
+        window.battery.set_state(
+            frame.battery.percent, frame.battery.plugged, frame.battery.secs_left
+        )
 
         d = int(frame.uptime_sec // 86400)
         h = int((frame.uptime_sec % 86400) // 3600)
         m = int((frame.uptime_sec % 3600) // 60)
         window.uptime_label.setText(f"UP {d}D {h}H {m}M")
+        window.clock_uptime.set_value(f"{d}D {h}H {m}M")
         window.link_pip.setStyleSheet(f"color: {tokens.OK.name()}; font-size: 10px;")
 
         if window.orb.state not in ("thinking", "learning"):
@@ -139,6 +172,8 @@ class TelemetryPresenter:
         now = datetime.now()
         window.clock_label.setText(now.strftime("%H:%M:%S"))
         window.date_label.setText(now.strftime("%A · %d %b %Y").upper())
+        elapsed = now.hour * 3600 + now.minute * 60 + now.second
+        window.clock_day.set_value(elapsed / 86400, now.strftime("%H:%M"))
 
     # -- weather ---------------------------------------------------------
 
@@ -147,6 +182,7 @@ class TelemetryPresenter:
         if sample is None:
             window.weather_temp.setText("--°")
             window.weather_condition.setText("NO SIGNAL")
+            window.weather_forecast.set_forecast([])
             window.weather_humidity_feels.set_value("--")
             window.weather_wind_pressure.set_value("--")
             window.weather_sun.set_value("--")
@@ -154,6 +190,8 @@ class TelemetryPresenter:
 
         window.weather_temp.setText("--°" if sample.temp_c is None else f"{sample.temp_c:.0f}°C")
         window.weather_condition.setText((sample.condition or "--").strip().upper())
+        # The multi-day outlook has always been fetched; until now nothing drew it.
+        window.weather_forecast.set_forecast(sample.forecast or [])
 
         humidity = "--" if sample.humidity is None else f"{sample.humidity:.0f}%"
         feels = "--" if sample.feels_like_c is None else f"{sample.feels_like_c:.0f}°C"

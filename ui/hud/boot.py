@@ -1,309 +1,344 @@
-"""Boot sequence — ODIN-HUD.md §8's full orchestrated startup, at an
-unhurried, deliberately lazy pace (~4.2s):
+"""Entry animation — the HUD powering itself on (ODIN-HUD.md §8, rebuilt).
 
-  0.0s   A hairline expands across the vertical center.
-  0.65s  It splits vertically outward — an iris wipe revealing the grid
-         underneath, rather than a flat opacity fade.
-  1.15s  Every panel (and the four gauges flanking the orb) fades up with a
-         3px rise, staggered outward from screen center.
-  ~2.8s  The orb scales in from 0.85x and fades in.
-  ~3.5s  The core ignites — a flash to white settling back to the idle
-         gradient — and the rings begin rotating for the first time.
+The whole sequence is **one full-screen overlay driven by one animation**,
+painted on top of a HUD that is already fully built and visible underneath.
+The overlay's only job is to stop occluding things, in stages.
 
-Skipped entirely under `config.HUD_REDUCED_MOTION`, per §8's own escape
-hatch — the window is simply shown at its final state, nothing hidden or
-offset first.
+That structure is deliberate, and it is what the previous implementation got
+wrong. It used to hide every panel, then re-show each one from its own
+staggered `QTimer.singleShot` with a `QGraphicsOpacityEffect` attached. Two
+consequences followed. Correctness: any interruption — Esc, a re-summon, the
+window closing — left a scatter of pending timers that either popped panels
+back in later or never ran at all, leaving them invisible. Performance: an
+attached opacity effect forces its widget through an offscreen-composited
+repaint on every update, and the orb repaints continuously.
 
-Perf note: every widget involved is plain `.hide()`/`.show()`'d while
-waiting for its own turn, not kept visible-but-transparent via a
-QGraphicsOpacityEffect the whole time — an attached opacity effect forces
-that widget through an offscreen-composited repaint on every update, and
-the orb alone repaints at ~30fps (ui/hud/window.py's shared animation
-loop) for the couple of seconds it sits waiting its turn. A hidden widget
-costs Qt nothing to keep hidden; the effect is only ever attached for the
-handful of hundred milliseconds a widget is actually fading in.
+Here, nothing is ever hidden, moved, or given a graphics effect. Cancelling is
+therefore total and instant: delete one widget, and what's underneath is
+already correct. There is exactly one clock, so there is nothing to leave
+half-finished.
+
+  0.0s  Charge — black, a hairline tracing the vertical center, flickering.
+  0.8s  Iris — the cover splits outward; the grid ignites and races out from
+        center with it.
+  1.6s  Assembly — each panel is uncovered by a wipe with a bright leading
+        edge, staggered outward from the center of the screen.
+  3.0s  The orb traces itself into place, ring by ring, and the molecule
+        condenses into it mote by mote (ui/hud/voice_orb.py's bootReveal).
+  5.3s  Ignition — the core flashes and a shockwave ring bursts outward.
+
+Skipped entirely under `config.HUD_REDUCED_MOTION`, per §8's own escape hatch.
+Re-summoning the HUD later runs `run_reentry_flourish` instead: a 250ms scan
+pass that never touches the orb, so the assembly plays once per launch and
+cannot replay.
 """
 from __future__ import annotations
 
 import math
-from typing import Callable
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, Qt, QTimer, pyqtProperty
+from PyQt6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRect, QRectF, Qt, pyqtProperty
 from PyQt6.QtGui import QColor, QPainter, QPen
-from PyQt6.QtWidgets import QGraphicsOpacityEffect, QWidget
+from PyQt6.QtWidgets import QWidget
 
 import config
 from . import tokens
 
-HAIRLINE_MS = 650
-IRIS_MS = 500
-PANEL_STAGGER_MS = 65
-PANEL_REVEAL_MS = 520
-ORB_REVEAL_MS = 650
-FLASH_MS = 750
+ENTRY_MS = 6000
+REENTRY_MS = 250
+
+# Stage windows along the overlay's single 0..1 progress. They overlap: a
+# stage starts while the one before it is still finishing, which is what keeps
+# a six-second sequence from feeling like six separate events.
+CHARGE = (0.00, 0.13)
+IRIS = (0.10, 0.27)
+GRID = (0.16, 0.42)
+PANELS = (0.24, 0.60)
+PANEL_SPAN = 0.16        # how much of the reveal one panel's own wipe takes
+ORB = (0.48, 0.92)
+IGNITION = (0.86, 1.00)
+
+GRID_PITCH = 40          # matches _Backdrop's mesh in ui/hud/zones.py
 
 
-def _safe(fn: Callable) -> Callable:
-    """Swallow 'wrapped C/C++ object has been deleted' from a callback
-    whose widget can legitimately outlive it — the window closing mid-boot
-    with staggered QTimer.singleShot callbacks or animation .finished
-    signals still pending. Every stage-transition callback below runs
-    later, asynchronously, well outside the try/except a normal caller
-    could wrap this call in."""
-    def wrapper(*args, **kwargs):
-        try:
-            fn(*args, **kwargs)
-        except RuntimeError:
-            pass
-    return wrapper
+def _smoothstep(window: tuple[float, float], value: float) -> float:
+    lo, hi = window
+    if value <= lo:
+        return 0.0
+    if value >= hi:
+        return 1.0
+    t = (value - lo) / (hi - lo)
+    return t * t * (3.0 - 2.0 * t)
 
 
-class _BootCover(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._line_frac = 0.0
-        self._reveal_frac = 0.0
+class _EntryOverlay(QWidget):
+    """The entire entry animation: one widget, one property, one clock."""
+
+    def __init__(self, window: QWidget, duration_ms: int, reentry: bool = False):
+        super().__init__(window)
+        self._window = window
+        self._orb = None if reentry else getattr(window, "orb", None)
+        self._reentry = reentry
+        self._finished = False
+        self._progress = 0.0
+        self.duration_ms = duration_ms
+
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setGeometry(window.rect())
+        self._panels = self._panel_schedule()
 
-    def getLineFrac(self) -> float:
-        return self._line_frac
+        self.show()
+        self.raise_()
 
-    def setLineFrac(self, value: float) -> None:
-        self._line_frac = value
+        self._anim = QPropertyAnimation(self, b"progress", self)
+        self._anim.setDuration(duration_ms)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.Linear)
+
+    # -- schedule ----------------------------------------------------------
+
+    def _panel_schedule(self) -> list[tuple[QRect, tuple[float, float]]]:
+        """Each panel's rect in overlay coordinates plus its own slice of the
+        assembly stage, ordered outward from the center of the screen."""
+        if self._reentry:
+            return []
+        widgets = [
+            w for w in getattr(self._window, "_boot_reveal_widgets", [])
+            if w is not None and w.width() > 0 and w.height() > 0
+        ]
+        center = self._window.rect().center()
+
+        def distance(widget: QWidget) -> float:
+            middle = widget.mapTo(self._window, widget.rect().center())
+            return math.hypot(middle.x() - center.x(), middle.y() - center.y())
+
+        widgets.sort(key=distance)
+        lo, hi = PANELS
+        last_start = max(lo, hi - PANEL_SPAN)
+        step = (last_start - lo) / max(1, len(widgets) - 1)
+        schedule = []
+        for i, widget in enumerate(widgets):
+            top_left = widget.mapTo(self._window, widget.rect().topLeft())
+            rect = QRect(top_left, widget.size())
+            start = lo + i * step
+            schedule.append((rect, (start, start + PANEL_SPAN)))
+        return schedule
+
+    # -- the one clock ------------------------------------------------------
+
+    def start(self) -> None:
+        self._anim.start()
+
+    def getProgress(self) -> float:
+        return self._progress
+
+    def setProgress(self, value: float) -> None:
+        self._progress = max(0.0, min(1.0, value))
+        self._drive_orb()
         self.update()
+        if self._progress >= 1.0:
+            self.finish()
 
-    lineFrac = pyqtProperty(float, getLineFrac, setLineFrac)
+    progress = pyqtProperty(float, getProgress, setProgress)
 
-    def getRevealFrac(self) -> float:
-        return self._reveal_frac
+    def _drive_orb(self) -> None:
+        orb = self._orb
+        if orb is None:
+            return
+        reveal = _smoothstep(ORB, self._progress)
+        orb.bootReveal = reveal
+        orb.bootScale = 0.94 + 0.06 * reveal
+        # Rings hold still until the molecule has condensed — the drift
+        # starting mid-assembly would fight the arrival.
+        orb.boot_frozen = reveal < 1.0
+        # A flash that swells and falls across the ignition window rather than
+        # snapping on: sin() over the stage, not a ramp.
+        ignition = _smoothstep(IGNITION, self._progress)
+        orb.bootFlash = math.sin(math.pi * ignition) if ignition > 0.0 else 0.0
 
-    def setRevealFrac(self, value: float) -> None:
-        self._reveal_frac = value
-        self.update()
+    def finish(self) -> None:
+        """The single exit. Natural completion and cancellation both land
+        here, so there is only one definition of 'finished'."""
+        if self._finished:
+            return
+        self._finished = True
+        self._anim.stop()
 
-    revealFrac = pyqtProperty(float, getRevealFrac, setRevealFrac)
+        orb = self._orb
+        if orb is not None:
+            orb.bootReveal = 1.0
+            orb.bootScale = 1.0
+            orb.bootFlash = 0.0
+            orb.boot_frozen = False
+
+        if getattr(self._window, "_entry_overlay", None) is self:
+            self._window._entry_overlay = None
+        self.hide()
+        self.deleteLater()
+
+    # -- painting -----------------------------------------------------------
 
     def paintEvent(self, _event) -> None:
+        if self._finished:
+            return
         painter = QPainter(self)
-        rect = self.rect()
-        cy = rect.height() / 2.0
-
-        if self._reveal_frac >= 1.0:
+        if self._reentry:
+            self._paint_reentry(painter)
             painter.end()
             return
 
-        if self._reveal_frac <= 0.0:
-            painter.fillRect(rect, tokens.VOID)
-        else:
-            # The cover shrinks from one full-screen fill to two bands
-            # receding to the top/bottom edges — an iris wipe splitting
-            # outward from the hairline's seam at vertical center.
-            gap = cy * self._reveal_frac
-            painter.fillRect(QRectF(0, 0, rect.width(), cy - gap), tokens.VOID)
-            painter.fillRect(QRectF(0, cy + gap, rect.width(), cy - gap), tokens.VOID)
-            edge = QColor(tokens.CY_300)
-            edge.setAlphaF(max(0.0, 1.0 - self._reveal_frac))
-            painter.setPen(QPen(edge, 2))
-            painter.drawLine(0, int(cy - gap), rect.width(), int(cy - gap))
-            painter.drawLine(0, int(cy + gap), rect.width(), int(cy + gap))
-
-        if self._line_frac > 0 and self._reveal_frac <= 0.0:
-            half_width = rect.width() / 2 * self._line_frac
-            painter.setPen(tokens.CY_300)
-            painter.drawLine(
-                int(rect.center().x() - half_width), int(cy),
-                int(rect.center().x() + half_width), int(cy),
-            )
+        self._paint_cover(painter)
+        self._paint_grid_ignition(painter)
+        self._paint_panel_covers(painter)
+        self._paint_shockwave(painter)
         painter.end()
+
+    def _paint_cover(self, painter: QPainter) -> None:
+        """Void over everything, splitting outward from the center seam."""
+        iris = _smoothstep(IRIS, self._progress)
+        if iris >= 1.0:
+            return
+        rect = self.rect()
+        middle = rect.height() / 2.0
+        gap = middle * iris
+        painter.fillRect(QRectF(0, 0, rect.width(), middle - gap), tokens.VOID)
+        painter.fillRect(QRectF(0, middle + gap, rect.width(), middle - gap), tokens.VOID)
+
+        edge = QColor(tokens.CY_300)
+        if iris > 0.0:
+            edge.setAlphaF(max(0.0, 1.0 - iris))
+            painter.setPen(QPen(edge, 2))
+            painter.drawLine(0, int(middle - gap), rect.width(), int(middle - gap))
+            painter.drawLine(0, int(middle + gap), rect.width(), int(middle + gap))
+            return
+
+        charge = _smoothstep(CHARGE, self._progress)
+        if charge <= 0.0:
+            return
+        # Flicker: the line stutters as it charges, steadying as it completes.
+        stutter = 0.55 + 0.45 * math.sin(charge * 46.0)
+        edge.setAlphaF(min(1.0, 0.35 + 0.65 * charge) * (stutter if charge < 0.75 else 1.0))
+        half = rect.width() / 2.0 * charge
+        painter.setPen(QPen(edge, 2))
+        painter.drawLine(
+            int(rect.center().x() - half), int(middle),
+            int(rect.center().x() + half), int(middle),
+        )
+
+    def _paint_grid_ignition(self, painter: QPainter) -> None:
+        """The backdrop's own mesh, lit up brightly inside a front racing out
+        from the center, fading as it goes — the grid coming online."""
+        grid = _smoothstep(GRID, self._progress)
+        if grid <= 0.0 or grid >= 1.0:
+            return
+        rect = self.rect()
+        front = math.hypot(rect.width(), rect.height()) * 0.5 * grid
+        color = QColor(tokens.CY_400)
+        color.setAlphaF(0.5 * math.sin(math.pi * grid))
+
+        painter.save()
+        painter.setClipRect(QRectF(
+            rect.center().x() - front, rect.center().y() - front, front * 2, front * 2
+        ))
+        painter.setPen(QPen(color, 1))
+        for x in range(0, rect.width(), GRID_PITCH):
+            painter.drawLine(x, 0, x, rect.height())
+        for y in range(0, rect.height(), GRID_PITCH):
+            painter.drawLine(0, y, rect.width(), y)
+        painter.restore()
+
+    def _paint_panel_covers(self, painter: QPainter) -> None:
+        """Each panel is uncovered top-down by a retreating void, with a
+        bright edge riding the wipe and brackets snapping in behind it."""
+        for rect, window in self._panels:
+            fraction = _smoothstep(window, self._progress)
+            if fraction >= 1.0:
+                continue
+            covered = rect.height() * (1.0 - fraction)
+            top = rect.bottom() - covered
+            painter.fillRect(QRectF(rect.left(), top, rect.width(), covered), tokens.VOID)
+            if fraction > 0.0:
+                edge = QColor(tokens.CY_200)
+                edge.setAlphaF(0.85)
+                painter.setPen(QPen(edge, 1.5))
+                painter.drawLine(int(rect.left()), int(top), int(rect.right()), int(top))
+                tokens.corner_ticks(painter, rect, tokens.CY_300, alpha=int(200 * fraction))
+
+    def _paint_shockwave(self, painter: QPainter) -> None:
+        """One expanding ring out of the orb at ignition. Painted here rather
+        than by its own widget: the overlay is already on top of everything
+        and already cleans itself up, so the ring cannot outlive the entry."""
+        ignition = _smoothstep(IGNITION, self._progress)
+        if ignition <= 0.0 or ignition >= 1.0 or self._orb is None:
+            return
+        orb = self._orb
+        side = min(orb.width(), orb.height())
+        if side <= 0:
+            return
+        scale = side / orb.REF
+        center = QPointF(orb.mapTo(self._window, orb.rect().topLeft())) + QPointF(
+            (orb.width() - side) / 2 + orb.CENTER * scale,
+            (orb.height() - side) / 2 + orb.CENTER * scale,
+        )
+        radius = orb.R_OUTER * scale * (1.0 + 0.9 * ignition)
+        fade = 1.0 - ignition
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        def stroke(pen: QPen) -> None:
+            color = pen.color()
+            color.setAlphaF(color.alphaF() * fade)
+            pen.setColor(color)
+            painter.setPen(pen)
+            painter.drawEllipse(center, radius, radius)
+
+        # 2 passes, not 3: the third costs ~0.9ms of a 60fps frame on a ring
+        # this large, and it is indistinguishable on something that expands
+        # and fades out inside a second.
+        tokens.draw_glow(painter, stroke, tokens.CY_100, 2.5, passes=2)
+
+    def _paint_reentry(self, painter: QPainter) -> None:
+        """Re-summon: a bright band sweeping down over a veil that lifts. No
+        stages, no orb involvement — nothing here can rebuild the HUD."""
+        progress = self._progress
+        rect = self.rect()
+        veil = QColor(tokens.VOID)
+        veil.setAlphaF(max(0.0, 0.55 * (1.0 - progress)))
+        painter.fillRect(rect, veil)
+
+        band_y = rect.height() * progress
+        band = QColor(tokens.CY_200)
+        band.setAlphaF(0.5 * (1.0 - progress))
+        painter.setPen(QPen(band, 2))
+        painter.drawLine(0, int(band_y), rect.width(), int(band_y))
+
+
+def _start(window: QWidget, duration_ms: int, reentry: bool) -> None:
+    if config.HUD_REDUCED_MOTION:
+        return
+    if getattr(window, "_entry_overlay", None) is not None:
+        return  # already running — never stack two entries
+    overlay = _EntryOverlay(window, duration_ms, reentry=reentry)
+    window._entry_overlay = overlay
+    overlay.setProgress(0.0)
+    overlay.start()
 
 
 def run_boot_sequence(window: QWidget) -> None:
-    """`window`: the OdinHudWindow, already shown full-screen. Every
-    animation/effect object involved is kept alive in `window._boot_anims`
-    for the whole sequence, cleared only once it's fully done."""
-    if config.HUD_REDUCED_MOTION:
-        return
-
-    keepalive: list[object] = []
-    window._boot_anims = keepalive
-
-    orb = getattr(window, "orb", None)
-    if orb is not None:
-        orb.boot_frozen = True
-        orb.bootScale = 0.85
-        # Hidden outright, not shown-but-transparent — see the module
-        # docstring's perf note. _reveal_orb() attaches the opacity effect
-        # and shows it only once its own stage actually starts.
-        orb.hide()
-
-    cover = _BootCover(window)
-    cover.setGeometry(window.rect())
-    cover.show()
-    cover.raise_()
-    keepalive.append(cover)
-
-    line_anim = QPropertyAnimation(cover, b"lineFrac", cover)
-    line_anim.setDuration(HAIRLINE_MS)
-    line_anim.setStartValue(0.0)
-    line_anim.setEndValue(1.0)
-    line_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-    keepalive.append(line_anim)
-
-    reveal_anim = QPropertyAnimation(cover, b"revealFrac", cover)
-    reveal_anim.setDuration(IRIS_MS)
-    reveal_anim.setStartValue(0.0)
-    reveal_anim.setEndValue(1.0)
-    reveal_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
-    keepalive.append(reveal_anim)
-
-    def finish() -> None:
-        window._boot_anims = None
-
-    def start_ignition() -> None:
-        if orb is None:
-            finish()
-            return
-        _ignite_core(orb, keepalive, _safe(finish))
-
-    def start_orb_reveal() -> None:
-        if orb is None:
-            finish()
-            return
-        _reveal_orb(orb, keepalive, _safe(start_ignition))
-
-    def start_panel_reveal() -> None:
-        cover.hide()
-        cover.deleteLater()
-        _reveal_panels(window, keepalive, _safe(start_orb_reveal))
-
-    line_anim.finished.connect(_safe(reveal_anim.start))
-    reveal_anim.finished.connect(_safe(start_panel_reveal))
-    line_anim.start()
+    """The full power-on assembly. Runs once per launch; the window guards
+    that with its own `_shown_once`, and this guards against overlapping."""
+    _start(window, ENTRY_MS, reentry=False)
 
 
-def _reveal_panels(window: QWidget, keepalive: list[object], on_done: Callable) -> None:
-    """Every zone panel (plus the four gauges flanking the orb) fades up
-    with a small rise, staggered outward from screen center — the "panel
-    brackets draw in" / "panel contents fade up" beats of §8, merged into
-    one wave per panel since Panel itself draws its brackets and body in a
-    single paintEvent (splitting that would mean changing how every panel
-    on the HUD renders, for a boot-only flourish)."""
-    widgets = [
-        w for w in getattr(window, "_boot_reveal_widgets", [])
-        if w is not None and w.width() > 0 and w.height() > 0
-    ]
-    if not widgets:
-        on_done()
-        return
-
-    center = window.rect().center()
-
-    def distance(w: QWidget) -> float:
-        c = w.mapTo(window, w.rect().center())
-        return math.hypot(c.x() - center.x(), c.y() - center.y())
-
-    widgets.sort(key=distance)
-    for w in widgets:
-        w.hide()  # see the module docstring's perf note
-
-    remaining = len(widgets)
-
-    def one_done() -> None:
-        nonlocal remaining
-        remaining -= 1
-        if remaining <= 0:
-            on_done()
-
-    for i, widget in enumerate(widgets):
-        natural_pos = widget.pos()
-        start_pos = QPoint(natural_pos.x(), natural_pos.y() + 3)
-
-        def cleanup(w=widget) -> None:
-            w.setGraphicsEffect(None)
-            one_done()
-
-        # cleanup is passed in as a default arg, not left as a free
-        # variable start() would look up by closure — start() only runs
-        # later, via QTimer.singleShot, by which point this whole for loop
-        # has already finished and the bare name `cleanup` (like `widget`
-        # itself, which is why w/sp/np are already defaulted below) would
-        # have been rebound to the *last* iteration's copy. Every widget's
-        # opacity_anim.finished ended up wired to the same last widget's
-        # cleanup — so nothing but the last panel's own reveal ever
-        # completed, remaining never reached 0, and the boot sequence
-        # never advanced past the panel stage.
-        def start(w=widget, sp=start_pos, np=natural_pos, cleanup=cleanup) -> None:
-            effect = QGraphicsOpacityEffect(w)
-            effect.setOpacity(0.0)
-            w.setGraphicsEffect(effect)
-            keepalive.append(effect)
-
-            opacity_anim = QPropertyAnimation(effect, b"opacity", w)
-            opacity_anim.setDuration(PANEL_REVEAL_MS)
-            opacity_anim.setStartValue(0.0)
-            opacity_anim.setEndValue(1.0)
-            opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            opacity_anim.finished.connect(_safe(cleanup))
-            keepalive.append(opacity_anim)
-
-            pos_anim = QPropertyAnimation(w, b"pos", w)
-            pos_anim.setDuration(PANEL_REVEAL_MS)
-            pos_anim.setStartValue(sp)
-            pos_anim.setEndValue(np)
-            pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            keepalive.append(pos_anim)
-
-            w.move(sp)
-            w.show()
-            opacity_anim.start()
-            pos_anim.start()
-
-        QTimer.singleShot(i * PANEL_STAGGER_MS, _safe(start))
+def run_reentry_flourish(window: QWidget) -> None:
+    """The 250ms flourish for re-summoning an already-booted HUD."""
+    _start(window, REENTRY_MS, reentry=True)
 
 
-def _reveal_orb(orb, keepalive: list[object], on_done: Callable) -> None:
-    """Rings scale in 0.85 -> 1.0 from the orb's own center, fading in at
-    the same time (§8's "orb rings scale in" beat)."""
-    effect = QGraphicsOpacityEffect(orb)
-    effect.setOpacity(0.0)
-    orb.setGraphicsEffect(effect)
-    keepalive.append(effect)
-    orb.show()
-
-    opacity_anim = QPropertyAnimation(effect, b"opacity", orb)
-    opacity_anim.setDuration(ORB_REVEAL_MS)
-    opacity_anim.setStartValue(0.0)
-    opacity_anim.setEndValue(1.0)
-    opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-    keepalive.append(opacity_anim)
-
-    scale_anim = QPropertyAnimation(orb, b"bootScale", orb)
-    scale_anim.setDuration(ORB_REVEAL_MS)
-    scale_anim.setStartValue(0.85)
-    scale_anim.setEndValue(1.0)
-    scale_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-    keepalive.append(scale_anim)
-
-    def cleanup() -> None:
-        orb.setGraphicsEffect(None)
-        on_done()
-
-    opacity_anim.finished.connect(_safe(cleanup))
-    opacity_anim.start()
-    scale_anim.start()
-
-
-def _ignite_core(orb, keepalive: list[object], on_done: Callable) -> None:
-    """White flash settling back to the idle gradient; the rings start
-    rotating from here, not from frame one (§8's core-ignition beat)."""
-    orb.boot_frozen = False
-
-    flash_anim = QPropertyAnimation(orb, b"bootFlash", orb)
-    flash_anim.setDuration(FLASH_MS)
-    flash_anim.setStartValue(1.0)
-    flash_anim.setEndValue(0.0)
-    flash_anim.setEasingCurve(QEasingCurve.Type.InCubic)
-    keepalive.append(flash_anim)
-
-    flash_anim.finished.connect(_safe(on_done))
-    flash_anim.start()
+def cancel_entry_animation(window: QWidget) -> None:
+    """Stop whatever is running and jump to the finished state. Safe to call
+    when nothing is running, and safe to call twice."""
+    overlay = getattr(window, "_entry_overlay", None)
+    if overlay is not None:
+        overlay.finish()

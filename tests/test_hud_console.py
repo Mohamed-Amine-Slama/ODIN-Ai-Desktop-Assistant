@@ -82,3 +82,20 @@ def test_drag_clamps_to_the_parent_widget_bounds(qapp):
     console.eventFilter(console.panel, _move(QPointF(5000, 5000)))
 
     assert console.pos() == QPoint(parent.width() - console.width(), parent.height() - console.height())
+
+
+def test_toggle_works_even_before_the_hud_is_shown(qapp):
+    """isVisible() is False for a child of a hidden window however many times
+    you show it, so keying the toggle off it made the console stick open.
+    is_open reflects the console's own state instead."""
+    from PyQt6.QtWidgets import QWidget
+
+    parent = QWidget()          # deliberately never shown
+    console = ConsoleOverlay(parent)
+    assert console.is_open is False
+
+    console.toggle()
+    assert console.is_open is True
+
+    console.toggle()
+    assert console.is_open is False

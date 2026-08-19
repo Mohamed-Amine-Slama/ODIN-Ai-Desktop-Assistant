@@ -14,14 +14,15 @@ from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, Qt, QTimer, pyqtProperty
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, Qt, pyqtProperty
+from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget
 
 from . import tokens
 
 START_DEG = 225.0
 SWEEP_DEG = 270.0  # traversed clockwise (negative Qt span) from START_DEG
+PULSE_RATE = 1.5  # rad/s — matches the old 30ms-timer's 0.045rad/tick cadence
 
 
 class RadialGauge(QWidget):
@@ -41,9 +42,15 @@ class RadialGauge(QWidget):
         self._anim.setDuration(tokens.DUR_VAL)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
-        self._pulse_timer = QTimer(self)
-        self._pulse_timer.timeout.connect(self._pulse_tick)
+        self._is_critical = False
         self._pulse_phase = 0.0
+
+        # Perf: the track arc + all 21 tick marks/labels are fixed geometry
+        # (only the colored value arc and center text change frame to
+        # frame) — cached into a pixmap once per size, same as
+        # ui/hud/widgets.py's TickRuler._ensure_static, instead of redone
+        # via trig + drawLine/drawText on every paint.
+        self._static: QPixmap | None = None
 
     def getValue(self) -> float:
         return self._value
@@ -66,65 +73,97 @@ class RadialGauge(QWidget):
         self._anim.start()
 
         is_crit = percent is not None and percent >= tokens.CRIT_THRESHOLD * 100
-        if is_crit and not self._pulse_timer.isActive():
-            self._pulse_timer.start(30)
-        elif not is_crit and self._pulse_timer.isActive():
-            self._pulse_timer.stop()
-            self._pulse_phase = 0.0
+        if is_crit != self._is_critical:
+            self._is_critical = is_crit
+            if not is_crit:
+                self._pulse_phase = 0.0
             self.update()
 
-    def _pulse_tick(self) -> None:
-        self._pulse_phase += 0.045
+    def advance(self, dt: float) -> None:
+        """Driven by the shared ~30fps loop (ODIN-HUD.md §10,
+        TelemetryPresenter.advance_animation) rather than a private QTimer
+        — up to four gauges pulsing critical at once used to mean four
+        independent 30ms timers running outside the app's one shared
+        animation clock."""
+        if not self._is_critical:
+            return
+        self._pulse_phase += dt * PULSE_RATE
         self.update()
+
+    def resizeEvent(self, event) -> None:
+        self._static = None
+        super().resizeEvent(event)
+
+    def _ensure_static(self) -> None:
+        if self._static is not None and self._static.size() == self.size():
+            return
+        pm = QPixmap(self.size())
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        side = min(self.width(), self.height())
+        if side > 0:
+            scale = side / self.REF
+            painter.translate((self.width() - side) / 2, (self.height() - side) / 2)
+            painter.scale(scale, scale)
+
+            rect = QRectF(self.CENTER - self.R, self.CENTER - self.R, self.R * 2, self.R * 2)
+            track_pen = QPen(tokens.CY_700, 4)
+            track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(track_pen)
+            painter.drawArc(rect, int(START_DEG * 16), int(-SWEEP_DEG * 16))
+
+            painter.setFont(tokens.font_data(9))
+            for i in range(self.TICK_COUNT):
+                frac = i / (self.TICK_COUNT - 1)
+                ang = math.radians(START_DEG - SWEEP_DEG * frac)
+                major = i % 5 == 0
+                r_out = self.R + 4
+                r_in = self.R + (9 if major else 5)
+                x0, y0 = self.CENTER + r_out * math.cos(ang), self.CENTER - r_out * math.sin(ang)
+                x1, y1 = self.CENTER + r_in * math.cos(ang), self.CENTER - r_in * math.sin(ang)
+                painter.setPen(QPen(tokens.CY_400 if major else tokens.CY_600, 1))
+                painter.drawLine(int(x0), int(y0), int(x1), int(y1))
+                if major:
+                    tx = self.CENTER + (r_in + 8) * math.cos(ang)
+                    ty = self.CENTER - (r_in + 8) * math.sin(ang)
+                    painter.setPen(tokens.CY_400)
+                    painter.drawText(
+                        QRectF(tx - 10, ty - 6, 20, 12), Qt.AlignmentFlag.AlignCenter, str(int(frac * 100))
+                    )
+        painter.end()
+        self._static = pm
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        self._ensure_static()
+        painter.drawPixmap(0, 0, self._static)
+
         side = min(self.width(), self.height())
-        scale = side / self.REF
-        painter.save()
-        painter.translate((self.width() - side) / 2, (self.height() - side) / 2)
-        painter.scale(scale, scale)
+        if side > 0:
+            scale = side / self.REF
+            painter.save()
+            painter.translate((self.width() - side) / 2, (self.height() - side) / 2)
+            painter.scale(scale, scale)
 
-        rect = QRectF(self.CENTER - self.R, self.CENTER - self.R, self.R * 2, self.R * 2)
+            rect = QRectF(self.CENTER - self.R, self.CENTER - self.R, self.R * 2, self.R * 2)
+            color = tokens.threshold_color(self._value)
+            if self._is_critical:
+                alpha = 0.55 + 0.45 * abs(math.sin(self._pulse_phase))
+                color = QColor(color)
+                color.setAlphaF(alpha)
 
-        track_pen = QPen(tokens.CY_700, 4)
-        track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(track_pen)
-        painter.drawArc(rect, int(START_DEG * 16), int(-SWEEP_DEG * 16))
+            def stroke(pen) -> None:
+                painter.setPen(pen)
+                painter.drawArc(rect, int(START_DEG * 16), int(-SWEEP_DEG * self._value * 16))
 
-        painter.setFont(tokens.font_data(9))
-        for i in range(self.TICK_COUNT):
-            frac = i / (self.TICK_COUNT - 1)
-            ang = math.radians(START_DEG - SWEEP_DEG * frac)
-            major = i % 5 == 0
-            r_out = self.R + 4
-            r_in = self.R + (9 if major else 5)
-            x0, y0 = self.CENTER + r_out * math.cos(ang), self.CENTER - r_out * math.sin(ang)
-            x1, y1 = self.CENTER + r_in * math.cos(ang), self.CENTER - r_in * math.sin(ang)
-            painter.setPen(QPen(tokens.CY_400 if major else tokens.CY_600, 1))
-            painter.drawLine(int(x0), int(y0), int(x1), int(y1))
-            if major:
-                tx = self.CENTER + (r_in + 8) * math.cos(ang)
-                ty = self.CENTER - (r_in + 8) * math.sin(ang)
-                painter.setPen(tokens.CY_400)
-                painter.drawText(QRectF(tx - 10, ty - 6, 20, 12), Qt.AlignmentFlag.AlignCenter, str(int(frac * 100)))
+            if self._value > 0.002:
+                tokens.draw_glow(painter, stroke, color, 4)
 
-        color = tokens.threshold_color(self._value)
-        if self._pulse_timer.isActive():
-            alpha = 0.55 + 0.45 * abs(math.sin(self._pulse_phase))
-            color = QColor(color)
-            color.setAlphaF(alpha)
-
-        def stroke(pen) -> None:
-            painter.setPen(pen)
-            painter.drawArc(rect, int(START_DEG * 16), int(-SWEEP_DEG * self._value * 16))
-
-        if self._value > 0.002:
-            tokens.draw_glow(painter, stroke, color, 4)
-
-        painter.restore()
+            painter.restore()
 
         value_text = "--" if self._display is None else f"{self._display:.0f}"
         cx, cy = self.width() / 2, self.height() / 2

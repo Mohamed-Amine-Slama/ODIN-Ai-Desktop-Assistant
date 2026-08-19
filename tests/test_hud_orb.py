@@ -155,16 +155,217 @@ def test_outer_ring_uses_chase_wave_only_while_speaking(qapp):
     _render(orb)  # must not raise — exercises the speaking branch in _paint_outer_ring
 
 
-def test_outer_ring_pens_are_cached_per_accent_color(qapp):
+# -- the molecular field inside the orb: a cloud of freely drifting particles
+# bonded to their neighbours, steered by the same state the rings answer to ---
+
+import numpy as np  # noqa: E402
+
+
+def test_the_orb_carries_a_field_that_drifts_as_it_advances(qapp):
+    orb = VoiceOrb()
+    before = orb.field.positions.copy()
+    orb.advance(1 / 30)
+    assert not np.array_equal(orb.field.positions, before)
+
+
+def test_the_field_stays_inside_the_data_ring(qapp):
+    """The data ring is the molecule's containment shell — nothing may spill
+    across it into the tick ring and launcher labels."""
+    orb = VoiceOrb()
+    orb.state = "thinking"
+    for _ in range(120):
+        orb.advance(1 / 30)
+    xy, size, _ = orb.field.project(orb.R_FIELD)
+    assert np.max(np.linalg.norm(xy, axis=1) + size) <= orb.R_DATA
+
+
+def test_the_field_freezes_with_the_rings_during_the_error_flash(qapp):
+    orb = VoiceOrb()
+    orb.flash_error()
+    before = orb.field.positions.copy()
+    orb.advance(1 / 30)
+    assert np.array_equal(orb.field.positions, before)
+
+
+def test_the_field_holds_still_until_the_core_ignites(qapp):
+    """§8: nothing in the orb moves before ignition — and the ignition itself
+    kicks the cloud outward, so the molecule blooms with the flash."""
+    orb = VoiceOrb()
+    orb.boot_frozen = True
+    before = orb.field.positions.copy()
+    orb.advance(1 / 30)
+    assert np.array_equal(orb.field.positions, before)
+
+    orb.boot_frozen = False
+    assert orb.field.pulse_level > 0
+    orb.advance(1 / 30)
+    assert not np.array_equal(orb.field.positions, before)
+
+
+def test_thinking_agitates_the_field_more_than_idle(qapp):
     orb = VoiceOrb()
     orb.state = "idle"
-    _render(orb)
-    idle_pens = orb._outer_pens
-    assert len(idle_pens) == 32
+    orb.advance(1 / 30)
+    idle = orb.field.energy
 
-    _render(orb)
-    assert orb._outer_pens is idle_pens  # same accent -> same pen objects reused
+    orb.state = "thinking"
+    orb.advance(1 / 30)
+    assert orb.field.energy > idle
 
-    orb.state = "thinking"  # a different ring_accent (tokens.THINKING)
-    _render(orb)
-    assert orb._outer_pens is not idle_pens  # accent changed -> pens rebuilt once
+
+def test_a_louder_voice_opens_the_field(qapp):
+    orb = VoiceOrb()
+    orb.state = "listening"
+    orb.set_mic_level(0.0)
+    orb.advance(1 / 30)
+    quiet = orb.field.energy
+
+    orb.set_mic_level(0.9)
+    orb.advance(1 / 30)
+    assert orb.field.energy > quiet
+
+
+def test_each_spoken_beat_pulses_the_field(qapp):
+    """Speaking's 180ms synthetic word pulse already steps the ring chase; the
+    molecule takes the same beat as a kick outward."""
+    orb = VoiceOrb()
+    orb.state = "speaking"
+    orb.advance(0.17)  # just short of the first beat
+    assert orb.field.pulse_level == 0.0
+
+    orb.advance(0.02)  # crosses it
+    assert orb.field.pulse_level > 0.0
+
+
+# -- the outer ring as a live spectrum bezel -----------------------------
+
+
+def test_bezel_reads_the_bands_it_is_given(qapp):
+    orb = VoiceOrb()
+    orb.set_bands([0.0] * 24 + [1.0] * 24)
+    values = orb.bezel_values()
+
+    assert len(values) == orb.BEZEL_SEGMENTS
+    assert values[0] < values[-1]  # the ramp survives the resample
+    assert all(0.0 <= v <= 1.0 for v in values)
+
+
+def test_bezel_falls_back_to_a_shimmer_with_no_audio_source(qapp):
+    """HUD_SPECTRUM_SOURCE=off, or any run where nothing ever calls
+    set_bands: the ring must still breathe rather than sit dead flat."""
+    orb = VoiceOrb()
+    orb.advance(1 / 60)
+    values = orb.bezel_values()
+
+    assert len(values) == orb.BEZEL_SEGMENTS
+    assert max(values) > min(values)
+
+
+def test_a_louder_voice_lifts_the_bezel_while_listening(qapp):
+    """Loopback hears nothing while the user is talking, so listening meters
+    the mic instead — otherwise the ring goes flat exactly when it matters."""
+    orb = VoiceOrb()
+    orb.state = "listening"
+    orb.set_bands([0.0] * 48)
+
+    orb.set_mic_level(0.0)
+    quiet = max(orb.bezel_values())
+    orb.set_mic_level(0.9)
+    loud = max(orb.bezel_values())
+
+    assert loud > quiet
+
+
+def test_bands_do_not_leak_into_other_states(qapp):
+    """Idle shows the audio, but the mic gain is a listening-only behaviour."""
+    orb = VoiceOrb()
+    orb.set_bands([0.5] * 48)
+    orb.set_mic_level(1.0)
+    orb.state = "idle"
+
+    assert max(orb.bezel_values()) < 1.0
+
+
+def test_the_bezel_paints_in_a_handful_of_batched_calls(qapp):
+    """48 bars must not be 48 native stroke calls a frame: they're bucketed by
+    level into at most BEZEL_TIERS paths, the same trick the bond layer uses."""
+    from PyQt6.QtGui import QColor, QPainter, QPixmap
+
+    class Recorder(QPainter):
+        def __init__(self, device):
+            super().__init__(device)
+            self.paths = 0
+            self.lines = 0
+
+        def drawPath(self, path):
+            self.paths += 1
+            super().drawPath(path)
+
+        def drawLine(self, *args):
+            self.lines += 1
+            super().drawLine(*args)
+
+    orb = VoiceOrb()
+    orb.set_bands([i / 48 for i in range(48)])
+    pixmap = QPixmap(440, 440)
+    pixmap.fill(QColor(0, 0, 0))
+    painter = Recorder(pixmap)
+
+    orb._paint_bezel(painter, QColor(53, 200, 245))
+    painter.end()
+
+    assert 0 < painter.paths <= orb.BEZEL_TIERS
+    assert painter.lines == 0
+
+
+# -- the entry animation's orb stage: rings sweeping closed one by one, then
+# the molecule condensing into them (driven by ui/hud/boot.py) --------------
+
+
+def test_the_orb_is_fully_assembled_by_default(qapp):
+    """Nothing about normal running should depend on the entry animation."""
+    orb = VoiceOrb()
+    assert orb.bootReveal == 1.0
+    assert orb.field.assemble == 1.0
+
+
+def test_boot_reveal_condenses_the_molecule_last(qapp):
+    orb = VoiceOrb()
+    orb.bootReveal = 0.0
+    assert orb.field.assemble == 0.0
+
+    orb.bootReveal = 0.8
+    partly = orb.field.assemble
+    orb.bootReveal = 1.0
+
+    assert 0.0 < partly < orb.field.assemble == 1.0
+
+
+def test_rings_arrive_in_order_rather_than_all_at_once(qapp):
+    """Each ring owns a slice of the reveal, so the orb builds outside-in
+    instead of every circle fading up together."""
+    orb = VoiceOrb()
+    early = orb.ring_reveals(0.2)
+    late = orb.ring_reveals(0.7)
+
+    assert early["dash"] > early["data"]        # the outermost lands first
+    assert late["data"] > early["data"]
+    assert all(0.0 <= v <= 1.0 for v in early.values())
+
+
+def test_every_reveal_fraction_renders(qapp):
+    """A partial wedge clip is easy to get wrong at the 0 and 1 ends."""
+    orb = VoiceOrb()
+    for reveal in (0.0, 0.05, 0.33, 0.5, 0.9, 1.0):
+        orb.bootReveal = reveal
+        _render(orb)
+
+
+def test_the_assembling_molecule_never_paints_outside_the_orb(qapp):
+    """Particles fly in from beyond the rings — but not beyond the widget,
+    where they'd be sliced off against its rectangle."""
+    orb = VoiceOrb()
+    for reveal in (0.55, 0.65, 0.75, 0.9, 1.0):
+        orb.bootReveal = reveal
+        xy, size, _ = orb.field.project(orb.R_FIELD)
+        assert np.max(np.linalg.norm(xy, axis=1) + size) <= orb.CENTER

@@ -41,6 +41,18 @@ DUR_FAST = 140
 DUR_VAL = 600
 DUR_SLOW = 1200
 
+# Widgets fed at one rate and drawn at another (telemetry lands ~1/s, the HUD
+# paints at frame rate) ease toward their target instead of snapping. One
+# definition, so everything on the HUD moves at the same pace.
+EASE_RATE = 7.0        # per second, exponential approach
+EASE_EPSILON = 0.001   # close enough to a target to land on it
+
+
+def ease_toward(current: float, target: float, dt: float) -> float:
+    moved = current + (target - current) * min(1.0, EASE_RATE * dt)
+    return target if abs(target - moved) < EASE_EPSILON else moved
+
+
 # --- Type scale (px, fixed — this is a fixed-resolution HUD) -------------
 T_MICRO = 9
 T_LABEL = 11
