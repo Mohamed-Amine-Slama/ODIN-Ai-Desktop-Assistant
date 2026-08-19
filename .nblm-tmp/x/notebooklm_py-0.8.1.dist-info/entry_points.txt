@@ -1,0 +1,4 @@
+[console_scripts]
+notebooklm = notebooklm.notebooklm_cli:main
+notebooklm-mcp = notebooklm.mcp.__main__:main
+notebooklm-server = notebooklm.server.__main__:main

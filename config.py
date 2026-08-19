@@ -111,6 +111,28 @@ BROWSER_ACTION_TIMEOUT_SECONDS = float(os.getenv("BROWSER_ACTION_TIMEOUT_SECONDS
 # downscaling a screenshot: enough to act on, few enough not to bury the turn.
 BROWSER_MAX_ELEMENTS = int(os.getenv("BROWSER_MAX_ELEMENTS", "60"))
 
+# Publishing deep_learn's research into NotebookLM (core/notebooklm.py). Off by
+# default for the same reasons as browser automation above: it needs a setup
+# step pip alone doesn't cover (a one-time `notebooklm login` browser sign-in),
+# and it pushes research out to Google rather than keeping it on this machine.
+ENABLE_NOTEBOOKLM = os.getenv("ENABLE_NOTEBOOKLM", "0") not in ("0", "false", "False")
+# How many primary-source URLs one publish uploads. Free NotebookLM caps a
+# notebook at 50 sources, and re-learning a topic appends more later, so this
+# leaves headroom instead of filling the notebook on the first run.
+NOTEBOOKLM_MAX_URL_SOURCES = int(os.getenv("NOTEBOOKLM_MAX_URL_SOURCES", "20"))
+# Which signed-in session to publish as. notebooklm-py owns this state itself
+# (`notebooklm login` writes it under ~/.notebooklm/profiles/<name>/), so ODIN
+# points at it rather than relocating it: an empty profile means "whichever one
+# the CLI considers active", which is what a user who just ran `notebooklm
+# login` expects. NOTEBOOKLM_AUTH_PATH overrides with an explicit
+# storage_state.json — the escape hatch for a headless or multi-account setup.
+NOTEBOOKLM_PROFILE = os.getenv("NOTEBOOKLM_PROFILE", "")
+NOTEBOOKLM_AUTH_PATH = os.getenv("NOTEBOOKLM_AUTH_PATH", "")
+# How long one upload may take before ODIN stops waiting on it. Publishing runs
+# inline at the end of a deep_learn turn, so a wedged call must not hold the
+# conversation open indefinitely.
+NOTEBOOKLM_TIMEOUT_SECONDS = float(os.getenv("NOTEBOOKLM_TIMEOUT_SECONDS", "120"))
+
 # HUD only: how long a confirmation banner waits before it defaults to "no".
 # Text mode blocks on input() and cannot honour a timeout, so this has no
 # effect there.
