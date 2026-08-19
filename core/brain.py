@@ -59,6 +59,7 @@ _CAPABILITY_LINES = {
     "see_screen": "- look at the screen",
     "system_info": "- read system stats and control volume and power",
     "read_email": "- read and send email, and manage calendar events",
+    "browser_navigate": "- drive websites directly — search them, click through them, fill them in",
 }
 
 # Guidance for tools that are not always present. The tool set differs by
@@ -84,6 +85,22 @@ _TOOL_GUIDANCE = {
         "  happened; adjust and retry if it didn't."
     ),
     "clipboard": "- clipboard to read what was just copied, or hand back a result to paste.",
+    "browser_navigate": (
+        "- browser_navigate, then browser_read / browser_click /\n"
+        "  browser_type / browser_scroll, for anything you need to DO\n"
+        "  inside a website — searching it, opening a conversation,\n"
+        "  filling something in. Prefer these over see_screen plus a\n"
+        "  pixel click: they name elements by ref instead of guessing\n"
+        "  coordinates, and they cost a fraction of a screenshot. Fall\n"
+        "  back to see_screen only for what the page draws rather than\n"
+        "  describes — video, canvas, an image with no alt text.\n"
+        "  Refs go stale the moment the page moves, so read again after\n"
+        "  every click or typed entry rather than reusing an old ref,\n"
+        "  and before you report anything with a real effect (sent,\n"
+        "  posted, submitted) done, browser_read and confirm it actually\n"
+        "  happened. Use open_website instead when the user just wants a\n"
+        "  page put in front of them in their own browser."
+    ),
     "memory": "- memory to save durable facts about the user and recall them in later sessions.",
     "search_files": "- search_files to find things on disk — faster and safer than run_command's dir/find.",
     "run_command": "- run_command only for what no other skill covers. Cannot be undone.",

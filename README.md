@@ -38,14 +38,15 @@ native Anthropic API when `MODEL` names a Claude, and Amazon Bedrock when
 4. [Project layout](#4-project-layout)
 5. [Safety](#5-safety)
 6. [Hand-gesture cursor control](#6-hand-gesture-cursor-control)
-7. [Adding a new skill](#7-adding-a-new-skill)
-8. [Tests](#8-tests)
-9. [Configuration reference](#9-configuration-reference)
-10. [Email and calendar setup](#10-email-and-calendar-setup)
-11. [Scheduled proactive tasks](#11-scheduled-proactive-tasks)
-12. [Remote control: Telegram and Discord](#12-remote-control-telegram-and-discord)
-13. [Roadmap ideas](#13-roadmap-ideas)
-14. [License](#14-license)
+7. [Browser automation](#7-browser-automation)
+8. [Adding a new skill](#8-adding-a-new-skill)
+9. [Tests](#9-tests)
+10. [Configuration reference](#10-configuration-reference)
+11. [Email and calendar setup](#11-email-and-calendar-setup)
+12. [Scheduled proactive tasks](#12-scheduled-proactive-tasks)
+13. [Remote control: Telegram and Discord](#13-remote-control-telegram-and-discord)
+14. [Roadmap ideas](#14-roadmap-ideas)
+15. [License](#15-license)
 
 ## 1. Install
 
@@ -72,7 +73,7 @@ degrades that one feature instead of failing to start. Notably:
   affected.
 - Email and calendar (`read_email`, `send_email`, `list_events`,
   `create_event`, `delete_event`) still need one Google or Microsoft account
-  connected before they do anything — see section 10 below.
+  connected before they do anything — see section 11 below.
 
 `web_search` needs no setup at all — it runs on DuckDuckGo via the `ddgs`
 package (already in `requirements.txt`), with no API key, signup, or billing.
@@ -226,6 +227,7 @@ Jarvis/
     speech_input.py       microphone -> text (faster-whisper, local)
     speech_output.py      text -> speech (edge-tts, SAPI fallback)
     gesture.py             hand-gesture cursor control: camera, tracking, GestureController
+    browser.py             DOM-driven browser automation: Playwright thread, element refs
   skills/
     base_skill.py         base class every skill implements
     skill_manager.py      registers skills, exposes them as tools
@@ -235,6 +237,7 @@ Jarvis/
     window_skills.py      list, focus, minimise/maximise, close windows
     input_skills.py       type text, press keys, click, scroll
     gesture_skills.py      hand_control: voice/text on/off for hand-gesture cursor control
+    browser_skills.py      browser_navigate/read/click/type/scroll/close: drive web pages by element
     web_skills.py         open website (optionally in a specific browser), browser search, fetch a page, weather, web_search, call REST APIs/webhooks, get_news (RSS/Atom)
     vision_skills.py      screenshot -> the model can see your screen
     knowledge_skills.py    deep_learn, list_learned_topics
@@ -255,7 +258,7 @@ Deleted and overwritten files are backed up to Jarvis's local trash first, makin
 `close_app` matches process names exactly and refuses to touch critical
 Windows processes (`lsass`, `csrss`, `winlogon`, …).
 
-A scheduled task (section 11) or a message over Telegram/Discord (section 12)
+A scheduled task (section 12) or a message over Telegram/Discord (section 13)
 runs with nobody there to answer a confirmation prompt, so all three
 auto-decline every DANGEROUS action instead of asking — the same "default to
 no" rule the interactive prompts already use for silence or an unparsable
@@ -264,7 +267,7 @@ depends on a confirmation going through; do it locally instead.
 
 `read_file`, `run_command`, `web_fetch`, `http_request`, and `get_news`
 results are also scanned for things that look like API keys, passwords, or
-tokens before they reach the model — see `SECURITY_SCAN_MODE` in section 9.
+tokens before they reach the model — see `SECURITY_SCAN_MODE` in section 10.
 
 Content that came from outside the machine (`web_fetch`, `http_request`,
 `get_news` — never a local file or `run_command`'s own output) gets a second
@@ -276,7 +279,7 @@ follow — but a warning note is prepended and the match is logged the same
 way a secret match is.
 
 `web_fetch`, `http_request`, and `get_news` also share a token-bucket rate
-limit (`RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_BURST` in section 9) so a
+limit (`RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_BURST` in section 10) so a
 runaway loop or a page whose injected text says "fetch this 50 times" can't
 hammer a target unattended — `MAX_TOOL_ITERATIONS` already bounds one turn's
 tool calls, this bounds calls across turns and across the whole run.
@@ -308,7 +311,64 @@ never touches the LLM. `pyautogui`'s corner failsafe stays on, so slamming the
 cursor into a screen corner still aborts everything, exactly as it does for
 the ordinary `click`/`type_text` skills in section 5.
 
-## 7. Adding a new skill
+## 7. Browser automation
+
+The README's own opening example — *"open Instagram in Opera GX, find
+so-and-so in my DMs, and message them"* — used to run entirely through the
+vision loop: screenshot the screen, send the image to the model, get pixel
+coordinates back, click them, screenshot again. It worked, and it took about
+five minutes, because that one request needs 10–20 sequential round trips and
+every one of them carries a full screenshot.
+
+This does the same job by talking to the page instead of looking at it.
+`browser_navigate` opens a site and returns a compact text list of its
+interactive elements, each with a ref:
+
+```
+[1:0] link "Home"
+[1:4] searchbox "Search"
+[1:9] button "Send message"
+```
+
+`browser_click`, `browser_type`, and `browser_scroll` take those refs.
+No image tokens, no vision reasoning, and no coordinate guessed off a
+screenshot that may already be stale. `browser_read` re-lists the page after
+anything changes it — refs carry a generation tag, so one remembered from an
+earlier listing fails cleanly rather than clicking whatever now sits in that
+slot.
+
+It does **not** replace the vision path. Native apps still need pixels, and so
+does anything a page draws rather than describes — video, canvas, an image
+with no alt text. The browser it drives is a real window, so `see_screen` and
+the pixel `click` from section 5 work on it as a fallback.
+
+**Setup.** Off by default (`ENABLE_BROWSER_AUTOMATION=0`), and it needs a step
+`pip install -r requirements.txt` does not cover:
+
+```bash
+pip install playwright
+playwright install chrome
+```
+
+The tools stay unregistered unless the flag is on **and** the package imports,
+so turning the flag on before installing anything can't put a
+guaranteed-to-fail tool in front of the model.
+
+**Logging in.** The browser is visible, not headless, and keeps its own
+profile under `data/browser_profile/`. The first time you go somewhere that
+needs an account, log in yourself in that window — 2FA, CAPTCHA, whatever the
+site asks. The session persists across ODIN restarts. Nothing here handles or
+stores credentials; that window is yours.
+
+**Risk.** `browser_click` / `browser_type` / `browser_scroll` sit at
+`MODERATE`, the same tier as the `click` / `type_text` / `scroll` skills they
+mirror, and for the same reason: you cannot un-send a message, so none of them
+record an undo token and all three say so. `browser_close` is never gated,
+whatever `CONFIRM_DESTRUCTIVE` says — the one thing this must never do is
+refuse to shut itself off. Closing keeps the profile, so reopening doesn't ask
+you to sign in again.
+
+## 8. Adding a new skill
 
 1. Subclass `BaseSkill` in a file under `skills/`:
 
@@ -335,7 +395,7 @@ class MyNewSkill(BaseSkill):
 That's it. A skill can also return image content blocks instead of a string —
 see `vision_skills.py` — and they're converted correctly for both providers.
 
-## 8. Tests
+## 9. Tests
 
 ```bat
 python -m pytest tests/ -v
@@ -345,7 +405,7 @@ python -m pytest tests/ -v
 which is useful because the voice stack won't. The HUD tests use Qt's offscreen
 platform, so they need no display either.
 
-## 9. Configuration reference
+## 10. Configuration reference
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -361,12 +421,17 @@ platform, so they need no display either.
 | `GESTURE_FPS_LIMIT` | `30` | Caps how often frames are processed |
 | `GESTURE_SMOOTHING` | `0.5` | Cursor-position smoothing factor |
 | `GESTURE_CLICK_HOLD_MS` | `250` | Pinch-tap (click) vs. pinch-and-hold (drag) threshold |
+| `ENABLE_BROWSER_AUTOMATION` | `0` | Master switch for DOM-driven browser automation (section 7). Off by default, and inert until `playwright install chrome` has been run |
+| `BROWSER_CHANNEL` | `chrome` | Which Chromium build to drive. `""` or an uninstalled channel falls back to the Chromium Playwright bundles |
+| `BROWSER_NAV_TIMEOUT_SECONDS` | `30` | How long a page load may take before the call gives up |
+| `BROWSER_ACTION_TIMEOUT_SECONDS` | `15` | How long a click/type/scroll may wait for its element |
+| `BROWSER_MAX_ELEMENTS` | `60` | How many interactive elements one `browser_read` lists |
 | `MAX_HISTORY_MESSAGES` | `80` | Live request context cap. Full history stays in SQLite |
 | `MEMORY_CONTEXT_LIMIT` | `5` | Durable facts injected alongside the newest turn |
 | `KNOWLEDGE_CONTEXT_RESULTS` | `4` | deep_learn notes chunks injected per turn when relevant. `0` disables retrieval |
 | `HUD_HOTKEY` | `ctrl+alt+j` | Global summon key (needs the `keyboard` package). `off` to disable |
 | `CONFIRM_TIMEOUT_SECONDS` | `120` | HUD only: an unanswered confirmation counts as no |
-| `MS_OAUTH_CLIENT_ID` | — | Enables the Microsoft-backed email/calendar skills once connected. See section 10 |
+| `MS_OAUTH_CLIENT_ID` | — | Enables the Microsoft-backed email/calendar skills once connected. See section 11 |
 | `MS_OAUTH_TENANT_ID` | `common` | Azure tenant for the Microsoft OAuth app; `common` covers both personal and work/school accounts |
 | `UNDO_WINDOW_SECONDS` | `900` | How long an action stays undoable |
 | `TRASH_MAX_ENTRIES` | `200` | Deleted-file backups kept, by count |
@@ -382,14 +447,14 @@ platform, so they need no display either.
 | `SECURITY_SCAN_MODE` | `redact` | Scans `read_file`/`run_command`/`web_fetch`/`http_request`/`get_news` output for secrets, and web-sourced content for prompt injection, before either reaches the model. `off`, `warn` (log only), `redact`, or `block` (secrets only — injection only ever warns) |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Throttle on `web_fetch`/`http_request`/`get_news`, shared across every caller. `0` disables it |
 | `RATE_LIMIT_BURST` | `10` | Token-bucket burst capacity paired with `RATE_LIMIT_PER_MINUTE` |
-| `TELEGRAM_BOT_TOKEN` | — | Enables the Telegram bridge (section 12) once set |
-| `TELEGRAM_CHAT_ID` | — | Locks the Telegram bridge to one chat. Left to the bot's first reply to tell you — see section 12 |
-| `DISCORD_BOT_TOKEN` | — | Enables the Discord bridge (section 12) once set. Needs the optional `discord.py` package |
-| `DISCORD_CHANNEL_ID` | — | Locks the Discord bridge to one channel. Left to the bot's first reply to tell you — see section 12 |
+| `TELEGRAM_BOT_TOKEN` | — | Enables the Telegram bridge (section 13) once set |
+| `TELEGRAM_CHAT_ID` | — | Locks the Telegram bridge to one chat. Left to the bot's first reply to tell you — see section 13 |
+| `DISCORD_BOT_TOKEN` | — | Enables the Discord bridge (section 13) once set. Needs the optional `discord.py` package |
+| `DISCORD_CHANNEL_ID` | — | Locks the Discord bridge to one channel. Left to the bot's first reply to tell you — see section 13 |
 | `RSS_FEEDS` | — | Comma-separated default feed URLs for `get_news` when no feed is named |
 | `DEBUG` | `0` | Print token usage and cache hit rates |
 
-## 10. Email and calendar setup
+## 11. Email and calendar setup
 
 `read_email`, `send_email`, `list_events`, `create_event`, and `delete_event`
 need one connected account (the packages are already in `requirements.txt`).
@@ -417,7 +482,7 @@ Both accounts can be connected at once — Jarvis asks which one to use for a
 given request only when it's genuinely ambiguous. Tokens live under
 `data/oauth/`, which is already covered by `.gitignore`.
 
-## 11. Scheduled proactive tasks
+## 12. Scheduled proactive tasks
 
 Beyond one-off reminders, Jarvis can run a full turn on a recurring schedule —
 "every weekday at 8am, check my email and calendar and give me a morning
@@ -439,7 +504,7 @@ tasks" or "remove scheduled task #2" to manage them. As with any unattended
 run, confirmations are auto-declined (see section 5) — don't schedule
 anything that depends on one going through.
 
-## 12. Remote control: Telegram and Discord
+## 13. Remote control: Telegram and Discord
 
 Text Jarvis from your phone and get replies back, with every skill available
 exactly as in text mode. Both bridges are off unless their bot token is set,
@@ -472,7 +537,7 @@ Replies come back as text on that channel only; nothing is spoken on the
 desktop. Confirmations are always auto-declined over both bridges (section
 5) — do anything destructive locally instead.
 
-## 13. Roadmap ideas
+## 14. Roadmap ideas
 
 - **Smart home**: skills hitting Home Assistant / Hue / Govee APIs.
 - **Scheduled re-learning**: periodically re-run `deep_learn` on stored
@@ -482,6 +547,6 @@ desktop. Confirmations are always auto-declined over both bridges (section
 - **More remote channels**: Slack and WhatsApp follow the same
   `on_message(text) -> str` shape as Telegram/Discord above.
 
-## 14. License
+## 15. License
 
 [MIT](LICENSE) — use it, fork it, ship it.

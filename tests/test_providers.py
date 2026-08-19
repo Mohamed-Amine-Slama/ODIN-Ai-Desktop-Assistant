@@ -34,6 +34,20 @@ def test_prompt_omits_vision_guidance_without_the_skill():
     assert "see_screen" not in prompt
 
 
+def test_prompt_prefers_the_dom_path_when_the_browser_tools_are_present():
+    prompt = build_system_prompt({"browser_navigate", "see_screen"})
+    assert "browser_navigate, then browser_read" in prompt
+    assert "drive websites directly" in prompt
+
+
+def test_prompt_omits_browser_guidance_when_the_feature_is_off():
+    """Off by default, and off again on a machine without playwright. Telling
+    the model to prefer a tool it wasn't given just produces a hallucinated
+    call."""
+    prompt = build_system_prompt({"see_screen", "clipboard"})
+    assert "browser_navigate" not in prompt
+
+
 def test_prompt_is_stable_for_the_same_tool_set():
     """A prompt that varies between turns invalidates the whole cached prefix."""
     tools = {"web_search", "see_screen", "clipboard", "memory"}
