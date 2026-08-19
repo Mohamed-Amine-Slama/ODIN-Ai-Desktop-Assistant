@@ -113,6 +113,36 @@ if getattr(config, "ENABLE_GESTURE_CONTROL", False):
 
     SKILL_CLASSES.append(HandControlSkill)
 
+# Browser automation needs both halves: the flag on, AND the playwright package
+# actually importable. Unlike pyautogui (near-universal, usually already
+# there), "flag on, `pip install playwright` not run yet" is the expected state
+# right after following the README in order — and since the prompt tells the
+# model to *prefer* these tools for web work, registering them anyway would
+# make every web request start with a guaranteed-fail call, burning exactly the
+# round trips this feature exists to save.
+from core.browser import browser_automation_available
+
+if getattr(config, "ENABLE_BROWSER_AUTOMATION", False) and browser_automation_available():
+    from .browser_skills import (
+        BrowserClickSkill,
+        BrowserCloseSkill,
+        BrowserNavigateSkill,
+        BrowserReadSkill,
+        BrowserScrollSkill,
+        BrowserTypeSkill,
+    )
+
+    SKILL_CLASSES.extend(
+        [
+            BrowserNavigateSkill,
+            BrowserReadSkill,
+            BrowserClickSkill,
+            BrowserTypeSkill,
+            BrowserScrollSkill,
+            BrowserCloseSkill,
+        ]
+    )
+
 # Email/calendar skills need one interactive /connect (main.py) per account
 # before they're any use, so they're gated on either account already being
 # connected, or a client-secrets file / client ID being in place so /connect

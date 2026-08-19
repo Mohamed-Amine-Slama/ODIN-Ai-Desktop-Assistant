@@ -55,6 +55,18 @@ pyautogui>=0.9.54
 opencv-python>=4.9.0
 mediapipe>=0.10.14
 
+# DOM-driven browser automation (core/browser.py, ENABLE_BROWSER_AUTOMATION):
+# optional. NOTE THE SECOND STEP — unlike every other dependency in this file,
+# pip only installs the Python driver here, not a browser for it to drive:
+#
+#     pip install playwright
+#     playwright install chrome
+#
+# Without that second command the browser tools stay registered but every call
+# reports what's missing. Without the package at all they aren't registered,
+# so the model is never told to prefer a tool it hasn't got.
+playwright>=1.48.0
+
 # Desktop HUD. `keyboard` is only for the global summon hotkey — everything
 # else works without it.
 PyQt6>=6.6.0

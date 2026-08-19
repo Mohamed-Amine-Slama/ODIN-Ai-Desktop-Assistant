@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 import config
 from core import gesture, knowledge
 from core.brain import Brain, auto_decline, friendly_error
+from core.browser import get_browser_controller
 from core.discord_channel import DiscordChannel
 from core.scheduler import ReminderScheduler, TaskScheduler
 from core.speech_output import SpeechOutput
@@ -179,6 +180,10 @@ def main() -> None:
         hud.weather.wait(2000)
         if gesture_controller is not None:
             gesture_controller.stop()
+        # Lazily constructed, so this may be a controller that never launched
+        # anything — close() on an idle one is a no-op. No startup wiring to
+        # match it: unlike the camera, a browser window is its own indicator.
+        get_browser_controller().close()
         bridge.release()  # let a worker parked on a confirmation fall through
         scheduler.stop()
         task_scheduler.stop()

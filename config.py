@@ -93,6 +93,24 @@ GESTURE_FPS_LIMIT = int(os.getenv("GESTURE_FPS_LIMIT", "30"))
 GESTURE_SMOOTHING = float(os.getenv("GESTURE_SMOOTHING", "0.5"))
 GESTURE_CLICK_HOLD_MS = float(os.getenv("GESTURE_CLICK_HOLD_MS", "250"))
 
+# DOM-driven browser automation (core/browser.py). Off by default for the same
+# reason as gesture control above: it's new, it drives a real logged-in browser
+# session, and it needs an install step pip alone doesn't cover
+# (`playwright install chrome`). The tools stay unregistered unless this flag
+# is on AND the playwright package imports, so turning the flag on before
+# installing the package can't put a guaranteed-to-fail tool in the prompt.
+ENABLE_BROWSER_AUTOMATION = os.getenv("ENABLE_BROWSER_AUTOMATION", "0") not in ("0", "false", "False")
+# Which Chromium build to drive. "chrome" means the real Chrome the user
+# already has (better site compatibility, and the profile behaves like a
+# normal browser); "" or an uninstalled channel falls back to the Chromium
+# Playwright bundles.
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
+BROWSER_NAV_TIMEOUT_SECONDS = float(os.getenv("BROWSER_NAV_TIMEOUT_SECONDS", "30"))
+BROWSER_ACTION_TIMEOUT_SECONDS = float(os.getenv("BROWSER_ACTION_TIMEOUT_SECONDS", "15"))
+# How many interactive elements one browser_read lists. The DOM analogue of
+# downscaling a screenshot: enough to act on, few enough not to bury the turn.
+BROWSER_MAX_ELEMENTS = int(os.getenv("BROWSER_MAX_ELEMENTS", "60"))
+
 # HUD only: how long a confirmation banner waits before it defaults to "no".
 # Text mode blocks on input() and cannot honour a timeout, so this has no
 # effect there.
