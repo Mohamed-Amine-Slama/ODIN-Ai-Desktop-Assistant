@@ -24,9 +24,11 @@ class Microphone:
     """A single shared input stream. Consumers pull frames off their own queue,
     so the wake detector and the recorder never contend for the device."""
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, block_size: int = BLOCK_SIZE):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, block_size: int = BLOCK_SIZE, device: int | None = None):
         self.sample_rate = sample_rate
         self.block_size = block_size
+        self.device = device
+        self.device_name: str | None = None
         self._sd = _import_sounddevice()
         self._np = _import_numpy()
         self._stream = None
@@ -42,11 +44,21 @@ class Microphone:
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=self.block_size,
+                device=self.device,
                 callback=self._on_block,
             )
             self._stream.start()
         except Exception as e:
             raise MicrophoneUnavailable(str(e)) from e
+        # Best-effort only: naming the active device is a diagnostic nicety
+        # (surfaced in the "voice mode on" message so a wrong default device
+        # is visible without digging through Windows Sound settings first),
+        # never worth failing an otherwise-successful stream start over.
+        try:
+            idx = self.device if self.device is not None else self._sd.default.device[0]
+            self.device_name = self._sd.query_devices(idx)["name"]
+        except Exception:
+            self.device_name = None
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -98,6 +110,51 @@ def _import_numpy():
     except ImportError as e:
         raise MicrophoneUnavailable("numpy is required for audio capture") from e
     return numpy
+
+
+def resolve_device(spec: str) -> int | None:
+    """MIC_DEVICE setting -> a sounddevice input-device index, or None to use
+    the system default. Accepts a numeric index or a case-insensitive
+    substring of the device name (e.g. "realtek"). Blank, "auto", and a
+    setting that matches nothing all fall back to the default silently
+    rather than raising — a stale or misspelled override should degrade to
+    "works like before," not stop Jarvis from starting."""
+    spec = (spec or "").strip()
+    if not spec or spec.lower() == "auto":
+        return None
+    if spec.isdigit():
+        return int(spec)
+    try:
+        sd = _import_sounddevice()
+        spec_lower = spec.lower()
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0 and spec_lower in d["name"].lower():
+                return i
+    except MicrophoneUnavailable:
+        pass
+    return None
+
+
+def list_input_devices() -> list[str]:
+    """Every input-capable device sounddevice can see, as '[index] name'
+    strings — for a diagnostic message when the active device turns out to
+    be producing no signal at all (see SpeechInput._record)."""
+    try:
+        sd = _import_sounddevice()
+        return [f"[{i}] {d['name']}" for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+    except MicrophoneUnavailable:
+        return []
+
+
+def no_signal_message(device_name: str | None) -> str:
+    name = device_name or "the selected device"
+    devices = list_input_devices()
+    hint = f" Other input devices found: {'; '.join(devices)}." if devices else ""
+    return (
+        f"No audio is coming from the microphone ({name}) — check it's the "
+        f"right device in Windows Sound settings and isn't muted.{hint} "
+        "Set MIC_DEVICE in .env (index or a name substring) to switch which one Jarvis uses."
+    )
 
 
 def rms(block, np) -> float:

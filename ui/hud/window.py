@@ -25,7 +25,7 @@ from core.gesture import get_gesture_controller
 from core.store import get_store
 from core.undo import get_journal
 from ui.hud import tokens
-from ui.hud.boot import run_boot_sequence
+from ui.hud.boot import cancel_entry_animation, run_boot_sequence, run_reentry_flourish
 from ui.hud.confirm import ConfirmationBannerWidget
 from ui.hud.telemetry import TelemetryFrame, TelemetryWorker
 from ui.hud.telemetry_view import TelemetryPresenter
@@ -68,7 +68,7 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
         self._odin_reply_parts: list[str] = []
         self._knowledge_rows: list[QWidget] = []
         self._active_learning: tuple[str, str, float] | None = None
-        self._boot_anims = None
+        self._entry_overlay = None  # the entry animation, while it runs
         self._shown_once = False
 
         self.setWindowTitle(f"{config.ASSISTANT_NAME} HUD")
@@ -223,8 +223,15 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
             self.transcript_odin.setText(f"{config.ASSISTANT_NAME} is waking up…")
             run_boot_sequence(self)
             self.voice.start_on_boot()
+        else:
+            # Summoning an already-booted HUD gets its own short flourish —
+            # never the assembly again (ui/hud/boot.py).
+            run_reentry_flourish(self)
 
     def dismiss(self) -> None:
+        # Anything still animating is finished off here rather than left to
+        # fire against a hidden window and reappear on the next summon.
+        cancel_entry_animation(self)
         self.telemetry.stop()
         self.telemetry.wait(2000)
         self.weather.stop()
@@ -263,6 +270,9 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
         if self.tray_icon is not None:
             self.tray_icon.setToolTip(f"{config.ASSISTANT_NAME} — hand control: {state}")
         self.console.echo(message)
+        button = self.dock.button("HAND")
+        if button is not None:
+            button.set_active(state == "running")
 
     def closeEvent(self, event) -> None:
         if self.tray_icon is not None and self.tray_icon.isVisible():
@@ -413,6 +423,9 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
     # -- commands ------------------------------------------------------
 
     def _on_dock_clicked(self, glyph: str, preset: str | None) -> None:
+        button = self.dock.button(glyph)
+        if button is not None:
+            button.flash_launch()
         if glyph == "SET":
             from ui.panels import SettingsDialog
 
@@ -420,6 +433,8 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
             return
         if glyph == "CON":
             self.console.toggle()
+            if button is not None:
+                button.set_active(self.console.is_open)
             return
         if glyph == "HAND":
             self._toggle_gesture_control()
@@ -499,6 +514,10 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
 
         worker = BrainWorker(self.brain, text, parent=self)
         self.current_worker = worker
+        # Every dock launcher funnels through _launch_preset, which drops
+        # clicks while a turn is in flight — so the dock says so instead of
+        # swallowing them.
+        self.dock.set_available(False)
         worker.turn_finished.connect(self._on_turn_finished)
         worker.error_occurred.connect(self._on_turn_error)
         worker.start()
@@ -522,6 +541,7 @@ class OdinHudWindow(ZoneBuilderMixin, QMainWindow):
 
     def _finish_turn(self) -> None:
         self.current_worker = None
+        self.dock.set_available(True)
         self.set_status("idle")
         self.voice.notify_turn_finished()
 

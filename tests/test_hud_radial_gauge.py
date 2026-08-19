@@ -48,12 +48,21 @@ def test_threshold_recolor_matches_tokens(qapp):
     assert tokens.threshold_color(gauge._value) == tokens.CRIT
 
 
-def test_critical_value_starts_a_pulse_timer(qapp):
+def test_critical_value_pulses_via_the_shared_animation_loop(qapp):
+    """No private QTimer (ui/hud/radial_gauge.py) — the pulse rides the
+    same shared advance(dt) loop as the orb/spectrum, one call per tick
+    instead of up to four independent 30ms timers."""
     gauge = RadialGauge()
     gauge.set_percent(95)
-    assert gauge._pulse_timer.isActive()
+    assert gauge._is_critical
+    gauge.advance(0.1)
+    assert gauge._pulse_phase > 0.0
+
     gauge.set_percent(50)
-    assert not gauge._pulse_timer.isActive()
+    assert not gauge._is_critical
+    assert gauge._pulse_phase == 0.0
+    gauge.advance(0.1)  # a no-op once not critical
+    assert gauge._pulse_phase == 0.0
 
 
 def test_renders_at_every_percent_without_raising(qapp):

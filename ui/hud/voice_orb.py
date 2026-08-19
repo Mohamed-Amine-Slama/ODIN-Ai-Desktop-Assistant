@@ -19,9 +19,60 @@ from PyQt6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRectF, Qt, 
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QRadialGradient
 from PyQt6.QtWidgets import QWidget
 
+from ui.molecule import MoleculeField
+
 from . import tokens
 
 STATES = ("idle", "listening", "thinking", "speaking", "learning", "error")
+
+# The molecular field inside the orb (ui/molecule.py). One energy per state is
+# the whole state mapping: it sets how hard the particles are kicked about and
+# how far the cloud opens up, so a glance at the molecule reads as activity
+# before the caption below the orb does. `listening` is computed from the mic
+# level instead, since there the orb is metering something real.
+FIELD_COUNT = 300
+FIELD_ENERGY = {
+    "idle": 0.16,
+    "thinking": 0.95,
+    "speaking": 0.60,
+    "learning": 0.50,
+    "error": 0.85,
+}
+FIELD_LISTENING_BASE = 0.34
+FIELD_LISTENING_GAIN = 0.55
+SPEAK_BEAT_PULSE = 0.55   # one word-beat's kick outward
+IGNITION_PULSE = 1.2      # the core-ignition bloom (§8)
+
+# The spectrum bezel — the outer ring, driven by the same band levels zone K's
+# analyser draws (ui/hud/spectrum.py, forwarded each tick by TelemetryPresenter
+# .advance_animation). Loopback hears system audio, so the ring dances with
+# ODIN's own speech; while listening it meters the mic instead, since loopback
+# is silent exactly when the user is talking.
+# The entry animation's orb stage (ui/hud/boot.py): each ring owns a slice of
+# the 0..1 reveal, so the orb assembles outside-in — one circle sweeping closed,
+# then the next — instead of everything fading up together. The molecule's slice
+# overlaps the last rings, so it condenses into an orb that's already there.
+RING_REVEAL_WINDOWS = {
+    "dash": (0.00, 0.20),
+    "bezel": (0.12, 0.38),
+    "launcher": (0.30, 0.58),
+    "tick": (0.48, 0.72),
+    "data": (0.62, 0.82),
+    "molecule": (0.55, 1.00),
+}
+
+
+def _smoothstep(lo: float, hi: float, value: float) -> float:
+    if value <= lo:
+        return 0.0
+    if value >= hi:
+        return 1.0
+    t = (value - lo) / (hi - lo)
+    return t * t * (3.0 - 2.0 * t)
+
+
+BEZEL_MIC_GAIN = 0.85
+BEZEL_FLOOR = 0.06        # bars never fully disappear, even in dead silence
 
 _STATUS_LABELS = {
     "idle": "IDLE",
@@ -48,10 +99,17 @@ class VoiceOrb(QWidget):
     REF = 440.0
     CENTER = 220.0
     R_OUTER = 200.0
+    R_BEZEL = 186.0   # the spectrum bezel's baseline; bars grow outward from it
+    R_DASH = 209.0    # the one ring that still turns, outside everything else
     R_LAUNCHER = 170.0
     R_TICK = 145.0
     R_DATA = 118.0
-    R_CORE = 78.0
+    R_FIELD = 114.0  # the molecule's shell, just inside the data ring
+    R_CORE = 34.0  # the nucleus: small, so the molecule reads as the subject
+
+    BEZEL_SEGMENTS = 48   # matches ui/hud/spectrum.py's BAR_COUNT: no resampling loss
+    BEZEL_TIERS = 8       # brightness buckets, and so draw calls, for the bars
+    BEZEL_EXTENT = 18.0   # a full-scale bar's length, reaching R_OUTER
 
     LAUNCHER_LABELS = ("SYS", "FILES", "WEB", "CODE", "MUSIC", "VOL", "LEARN", "PWR")  # §6.7
 
@@ -62,6 +120,11 @@ class VoiceOrb(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._state = "idle"
+        # The molecule: a few hundred particles drifting freely inside the
+        # data ring, bonded to whichever neighbours they happen to be near.
+        # Advanced from this widget's own advance(), so it freezes with the
+        # rings during the error flash and the pre-ignition boot hold.
+        self.field = MoleculeField(FIELD_COUNT)
         self._phase = 0.0       # outer-ring rotation, degrees
         self._tick_phase = 0.0  # tick-ring counter-rotation, degrees
         self._breathe_phase = 0.0  # seconds accumulator for sinusoidal motion
@@ -80,6 +143,7 @@ class VoiceOrb(QWidget):
         self._speak_peak = 0.0     # degrees, current ripple origin
 
         self._mic_level = 0.0
+        self._bands: list[float] | None = None
         self._data_value = 0.0
         self._learning_subtopic = ""
         self._hover_index: int | None = None
@@ -91,7 +155,8 @@ class VoiceOrb(QWidget):
         # bootScale/bootFlash are separate from the state-driven properties
         # above so the boot animation never has to fight the idle breathing
         # or state-color logic — it's a pure multiply/blend on top.
-        self.boot_frozen = False
+        self._boot_frozen = False
+        self._boot_reveal = 1.0
         self._boot_scale = 1.0
         self._boot_flash = 0.0
 
@@ -111,12 +176,9 @@ class VoiceOrb(QWidget):
         # transform at paint time — 120 drawLine calls become one drawPath.
         self._tick_path = self._build_tick_path()
 
-        # Perf: the outer ring's 32 segments each need a fresh alpha every
-        # frame (a breathing sine wave), but the QColor/QPen objects
-        # themselves don't need to be reconstructed from scratch each
-        # time — they're built once per accent color and mutated in place.
-        self._outer_pens: list[QPen] = []
-        self._outer_pens_accent: tuple[int, int, int] | None = None
+        # Perf: the bezel's per-segment angles are fixed, so their trig is
+        # computed once (see _bezel_geometry) rather than 48 times a frame.
+        self._bezel_trig: list[tuple[float, float]] = []
 
     # -- state ---------------------------------------------------------
 
@@ -150,6 +212,44 @@ class VoiceOrb(QWidget):
         """0..1 smoothed RMS amplitude, ~20Hz while state == 'listening'."""
         self._mic_level = max(0.0, min(1.0, level))
         self.update()
+
+    def set_bands(self, values) -> None:
+        """Per-band audio levels (0..1) for the bezel — Spectrum.levels,
+        handed over by the window's shared tick. No update() call: the same
+        tick advances and repaints this widget anyway."""
+        self._bands = list(values) if values else None
+
+    def bezel_values(self) -> list[float]:
+        """0..1 per bezel segment, whatever the audio situation.
+
+        With bands, the ring is a meter. Without any audio source at all it
+        falls back to the pre-bezel shimmer (and, while speaking, the §5.3
+        word-beat chase) rather than sitting dead flat — the same rule
+        ui/hud/spectrum.py follows for its own analyser.
+        """
+        n = self.BEZEL_SEGMENTS
+        bands = self._bands
+        if bands:
+            count = len(bands)
+            values = [
+                max(0.0, min(1.0, bands[min(count - 1, i * count // n)]))
+                for i in range(n)
+            ]
+        elif self._state == "speaking":
+            values = [self._speak_wave(i * 360.0 / n) for i in range(n)]
+        else:
+            values = [
+                0.5 + 0.5 * math.sin(math.radians(i * 360.0 / n) * 3 + self._breathe_phase)
+                for i in range(n)
+            ]
+
+        if self._state == "listening" and self._mic_level > 0.0:
+            floor = self._mic_level * BEZEL_MIC_GAIN
+            values = [
+                max(v, floor * (0.55 + 0.45 * math.sin(math.radians(i * 360.0 / n) * 4 + self._breathe_phase)))
+                for i, v in enumerate(values)
+            ]
+        return [max(BEZEL_FLOOR, v) for v in values]
 
     def set_system_load(self, fraction: float) -> None:
         """0.5*cpu + 0.3*ram + 0.2*disk_io, from the latest TelemetryFrame —
@@ -191,6 +291,36 @@ class VoiceOrb(QWidget):
 
     dataValue = pyqtProperty(float, getDataValue, setDataValue)
 
+    @property
+    def boot_frozen(self) -> bool:
+        return self._boot_frozen
+
+    @boot_frozen.setter
+    def boot_frozen(self, value: bool) -> None:
+        value = bool(value)
+        if self._boot_frozen and not value:
+            # Core ignition (ui/hud/boot.py): the molecule blooms outward with
+            # the flash rather than just quietly starting to drift.
+            self.field.pulse(IGNITION_PULSE)
+        self._boot_frozen = value
+
+    def ring_reveals(self, reveal: float) -> dict[str, float]:
+        """0..1 per ring for a given point in the entry animation."""
+        return {
+            name: _smoothstep(lo, hi, reveal)
+            for name, (lo, hi) in RING_REVEAL_WINDOWS.items()
+        }
+
+    def getBootReveal(self) -> float:
+        return self._boot_reveal
+
+    def setBootReveal(self, value: float) -> None:
+        self._boot_reveal = max(0.0, min(1.0, value))
+        self.field.set_assemble(_smoothstep(*RING_REVEAL_WINDOWS["molecule"], self._boot_reveal))
+        self.update()
+
+    bootReveal = pyqtProperty(float, getBootReveal, setBootReveal)
+
     def getBootScale(self) -> float:
         return self._boot_scale
 
@@ -224,8 +354,15 @@ class VoiceOrb(QWidget):
                     self._sweep_phase = (self._sweep_phase + dt * 360.0) % 360.0
                 elif self._state == "speaking":
                     self._advance_speak_pulse(dt)
+                self.field.set_energy(self._field_energy())
+                self.field.advance(dt)
         self._breathe_phase += dt
         self.update()
+
+    def _field_energy(self) -> float:
+        if self._state == "listening":
+            return FIELD_LISTENING_BASE + FIELD_LISTENING_GAIN * self._mic_level
+        return FIELD_ENERGY.get(self._state, 0.2)
 
     def _ring_speed(self) -> float:
         if self._state == "listening":
@@ -238,6 +375,7 @@ class VoiceOrb(QWidget):
         if self._speak_elapsed >= pulse_s:
             self._speak_elapsed %= pulse_s
             self._speak_peak = (self._speak_peak + 45.0) % 360.0  # one launcher-segment step per word beat
+            self.field.pulse(SPEAK_BEAT_PULSE)  # the molecule takes the same beat
 
     def _speak_wave(self, seg_angle: float) -> float:
         """0..1 brightness for one outer-ring segment under the speaking
@@ -300,7 +438,7 @@ class VoiceOrb(QWidget):
 
     def _core_radius(self) -> float:
         if self._state == "listening":
-            return self.R_CORE + self._mic_level * 22  # §5.3: 78 + amp*22
+            return self.R_CORE + self._mic_level * 12  # §5.3's amp swell, to scale
         if self._flashing:
             return self.R_CORE
         breathe = 0.5 + 0.5 * math.sin(self._breathe_phase * (2 * math.pi / 4.0))
@@ -315,11 +453,6 @@ class VoiceOrb(QWidget):
             blink = abs(math.sin(self._breathe_phase * 2 * math.pi * 5))
             return QColor(tokens.CRIT) if blink > 0.4 else QColor(tokens.CY_300)
         return tokens.orb_accent(self._state)
-
-    def _triangle_angle(self) -> float:
-        if self._state == "thinking":
-            return (self._breathe_phase * (360.0 / 3.0)) % 360.0  # §5.3: 360deg over 3s
-        return 0.0
 
     # -- painting ----------------------------------------------------------
 
@@ -345,22 +478,73 @@ class VoiceOrb(QWidget):
         accent = self._core_color()
         ring_accent = tokens.THINKING if self._state == "thinking" else tokens.CY_300
 
-        self._paint_halo(painter, accent)
-        self._paint_outer_ring(painter, ring_accent)
-        self._paint_listening_sweep(painter)
-        self._paint_launcher_ring(painter)
-        self._paint_tick_ring(painter)
-        self._paint_data_ring(painter, accent)
-        self._paint_core(painter, accent)
+        if self._boot_reveal >= 1.0:
+            self._paint_halo(painter, accent)
+            self._paint_dash_ring(painter, ring_accent)
+            self._paint_bezel(painter, ring_accent)
+            self._paint_listening_sweep(painter)
+            self._paint_launcher_ring(painter)
+            self._paint_tick_ring(painter)
+            self._paint_data_ring(painter, accent)
+            self._paint_core(painter, accent)
+            self.field.paint(painter, QPointF(self.CENTER, self.CENTER), self.R_FIELD, accent)
+        else:
+            self._paint_assembling(painter, accent, ring_accent)
 
         painter.restore()
         painter.end()
+
+    def _paint_assembling(self, painter: QPainter, accent: QColor, ring_accent: QColor) -> None:
+        """Entry animation only (bootReveal < 1). Each ring is drawn inside a
+        pie wedge that grows from the top clockwise, so it reads as being
+        traced into place; the core and halo come up with the molecule."""
+        reveals = self.ring_reveals(self._boot_reveal)
+
+        def stage(fraction: float, draw) -> None:
+            if fraction <= 0.0:
+                return
+            if fraction >= 1.0:
+                draw()
+                return
+            painter.save()
+            painter.setClipPath(self._reveal_wedge(fraction))
+            painter.setOpacity(0.35 + 0.65 * fraction)
+            draw()
+            painter.restore()
+
+        stage(reveals["dash"], lambda: self._paint_dash_ring(painter, ring_accent))
+        stage(reveals["bezel"], lambda: self._paint_bezel(painter, ring_accent))
+        stage(reveals["launcher"], lambda: self._paint_launcher_ring(painter))
+        stage(reveals["tick"], lambda: self._paint_tick_ring(painter))
+        stage(reveals["data"], lambda: self._paint_data_ring(painter, accent))
+
+        molecule = reveals["molecule"]
+        if molecule > 0.0:
+            painter.save()
+            painter.setOpacity(molecule)
+            self._paint_halo(painter, accent)
+            self._paint_core(painter, accent)
+            painter.restore()
+        # The field fades itself in through set_assemble, so it needs no
+        # opacity of its own — its motes arrive individually.
+        self.field.paint(painter, QPointF(self.CENTER, self.CENTER), self.R_FIELD, accent)
+
+    def _reveal_wedge(self, fraction: float) -> QPainterPath:
+        span = 360.0 * max(0.0, min(1.0, fraction))
+        rect = QRectF(0.0, 0.0, self.REF, self.REF)
+        path = QPainterPath()
+        path.moveTo(self.CENTER, self.CENTER)
+        path.arcTo(rect, 90.0, -span)
+        path.closeSubpath()
+        return path
 
     def _paint_halo(self, painter: QPainter, accent: QColor) -> None:
         r = self._core_radius() * 2.6
         glow = QRadialGradient(QPointF(self.CENTER, self.CENTER), r)
         near = QColor(accent)
-        near.setAlpha(70)
+        # Dimmer than the pre-molecule orb's halo: the glow used to be the
+        # centerpiece, and at its old strength it washed the particle field out.
+        near.setAlpha(44)
         far = QColor(accent)
         far.setAlpha(0)
         glow.setColorAt(0.0, near)
@@ -369,40 +553,63 @@ class VoiceOrb(QWidget):
         painter.setBrush(glow)
         painter.drawEllipse(QPointF(self.CENTER, self.CENTER), r, r)
 
-    def _outer_ring_pens(self, accent: QColor, n: int) -> list[QPen]:
-        """Perf: n QColor + n QPen objects were reconstructed from scratch
-        every single frame here (only the alpha actually changes frame to
-        frame) — now built once per accent color and reused, only their
-        alpha mutated in place."""
-        key = (accent.red(), accent.green(), accent.blue())
-        if self._outer_pens_accent != key or len(self._outer_pens) != n:
-            self._outer_pens = []
-            for _ in range(n):
-                pen = QPen(QColor(accent), 3.0)
-                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-                self._outer_pens.append(pen)
-            self._outer_pens_accent = key
-        return self._outer_pens
+    def _bezel_geometry(self) -> list[tuple[float, float]]:
+        """(cos, sin) per bezel segment, computed once. Trig for 48 segments
+        every frame at 60fps is pure waste — the angles never change."""
+        if not self._bezel_trig:
+            n = self.BEZEL_SEGMENTS
+            self._bezel_trig = [
+                (math.cos(math.radians(90 - i * 360.0 / n)), math.sin(math.radians(90 - i * 360.0 / n)))
+                for i in range(n)
+            ]
+        return self._bezel_trig
 
-    def _paint_outer_ring(self, painter: QPainter, accent: QColor) -> None:
-        n = 32
-        gap_deg = 4.0
-        seg_span = 360.0 / n - gap_deg
-        rect = QRectF(self.CENTER - self.R_OUTER, self.CENTER - self.R_OUTER, self.R_OUTER * 2, self.R_OUTER * 2)
-        pens = self._outer_ring_pens(accent, n)
-        speaking = self._state == "speaking"
-        for i in range(n):
-            start = self._phase + i * (360.0 / n)
-            if speaking:
-                wave = self._speak_wave(start + seg_span / 2)
-            else:
-                wave = 0.5 + 0.5 * math.sin(math.radians(start) + self._breathe_phase)
-            pen = pens[i]
-            color = pen.color()
-            color.setAlphaF(0.25 + 0.75 * wave)
+    def _paint_bezel(self, painter: QPainter, accent: QColor) -> None:
+        """The outer ring as a meter: one radial bar per audio band, growing
+        outward from a fixed baseline. Anchored rather than rotating — a
+        turning scale can't be read — with the rotation moved out to the
+        dashed hairline beyond it."""
+        center = QPointF(self.CENTER, self.CENTER)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(tokens.CY_700, 1.4))
+        painter.drawEllipse(center, self.R_BEZEL, self.R_BEZEL)
+
+        values = self.bezel_values()
+        tiers = self.BEZEL_TIERS
+        paths: list[QPainterPath | None] = [None] * tiers
+        for (cos_a, sin_a), value in zip(self._bezel_geometry(), values):
+            tier = min(tiers - 1, int(value * tiers))
+            path = paths[tier]
+            if path is None:
+                path = paths[tier] = QPainterPath()
+            outer = self.R_BEZEL + value * self.BEZEL_EXTENT
+            path.moveTo(self.CENTER + self.R_BEZEL * cos_a, self.CENTER - self.R_BEZEL * sin_a)
+            path.lineTo(self.CENTER + outer * cos_a, self.CENTER - outer * sin_a)
+
+        pen = QPen(QColor(accent), 3.4)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        for tier, path in enumerate(paths):
+            if path is None:
+                continue
+            color = QColor(accent)
+            color.setAlphaF(0.30 + 0.70 * (tier + 0.5) / tiers)
             pen.setColor(color)
             painter.setPen(pen)
-            painter.drawArc(rect, int(start * 16), int(-seg_span * 16))
+            painter.drawPath(path)
+
+    def _paint_dash_ring(self, painter: QPainter, accent: QColor) -> None:
+        """The one element that still turns at §5.3's 60s revolution, kept
+        outside the bezel so the meter itself can stay still."""
+        pen = QPen(QColor(accent.red(), accent.green(), accent.blue(), 130), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        pen.setDashPattern([5.0, 3.5])
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(pen)
+        painter.save()
+        painter.translate(self.CENTER, self.CENTER)
+        painter.rotate(-self._phase)
+        painter.drawEllipse(QPointF(0, 0), self.R_DASH, self.R_DASH)
+        painter.restore()
 
     def _paint_listening_sweep(self, painter: QPainter) -> None:
         """§5.3: "a second bright arc sweeps the ring once per second" — an
@@ -511,16 +718,3 @@ class VoiceOrb(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(gradient)
         painter.drawEllipse(QPointF(self.CENTER, self.CENTER), r, r)
-
-        tri_r = self.R_CORE * 0.62
-        base = math.radians(90 + self._triangle_angle())
-        points = [
-            QPointF(
-                self.CENTER + tri_r * math.cos(base + 2 * math.pi * i / 3),
-                self.CENTER - tri_r * math.sin(base + 2 * math.pi * i / 3),
-            )
-            for i in range(3)
-        ]
-        painter.setPen(QPen(QColor(255, 255, 255, 140), 1.6))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPolygon(*points)

@@ -75,13 +75,13 @@ class Session:
         # reading typed input when the listener was None.
         if self.listener is None:
             try:
-                from core.audio import Microphone
+                from core.audio import Microphone, resolve_device
                 from core.barge_in import make_watcher
                 from core.speech_input import SpeechInput
                 from core.wake import make_detector
 
                 print("Starting microphone and loading speech models...")
-                self.mic = Microphone()
+                self.mic = Microphone(device=resolve_device(config.MIC_DEVICE))
                 self.mic.start()
                 self.listener = SpeechInput(mic=self.mic)
                 self.wake = make_detector(self.mic, self.listener)
@@ -91,9 +91,15 @@ class Session:
                 return f"I couldn't start voice mode ({e}). Staying in text mode."
 
         self.mode = "voice"
+        # Named every time voice mode turns on, not just logged once at
+        # startup — a wrong default input device otherwise fails silently
+        # (opens fine, just never hears you), and this is the one message
+        # guaranteed to reach both the CLI and the HUD console (see
+        # ui/hud/voice_loop.py's status_message -> console.echo wiring).
+        device = f" — mic: {self.mic.device_name}" if self.mic and self.mic.device_name else ""
         if self.wake is not None:
-            return f"Voice mode on. Say '{config.ASSISTANT_NAME}, wake up' to wake me."
-        return "Voice mode on (push-to-talk — press Enter, then speak)."
+            return f"Voice mode on{device}. Say '{config.ASSISTANT_NAME}, wake up' to wake me."
+        return f"Voice mode on{device} (push-to-talk — press Enter, then speak)."
 
     def _teardown_audio(self) -> None:
         if self.barge_in is not None:

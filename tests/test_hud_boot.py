@@ -1,180 +1,195 @@
-"""ui/hud/boot.py — the full staged startup sequence (ODIN-HUD.md §8):
-hairline -> iris wipe -> staggered panel reveal -> orb scale-in -> core
-ignition. Uses a lightweight standalone window rather than the full
-OdinHudWindow (Brain/Session/UiBridge and 15 real zone panels) so this
-stays fast and isolated."""
+"""ui/hud/boot.py — the power-on entry animation.
+
+The whole sequence is one full-screen overlay painted on top of an already
+complete HUD, driven by one `progress` property. These tests lean on that:
+they set progress directly instead of waiting out six seconds of wall clock.
+
+The load-bearing test here is `test_panels_are_never_touched_during_the_entry`.
+The previous implementation hid every panel and re-showed it from a staggered
+QTimer.singleShot, which meant any interruption — Esc, a re-summon, the window
+closing — left panels to pop back in later, or not at all. Nothing is hidden,
+moved, or given a graphics effect any more, so that failure mode cannot occur.
+"""
 import config
-from PyQt6.QtTest import QTest
+import pytest
 from PyQt6.QtWidgets import QLabel, QWidget
 
 from ui.hud.boot import (
-    FLASH_MS, HAIRLINE_MS, IRIS_MS, ORB_REVEAL_MS, PANEL_REVEAL_MS,
-    PANEL_STAGGER_MS, _BootCover, run_boot_sequence,
+    ENTRY_MS,
+    REENTRY_MS,
+    cancel_entry_animation,
+    run_boot_sequence,
+    run_reentry_flourish,
 )
 from ui.hud.voice_orb import VoiceOrb
 
+SAMPLES = (0.0, 0.05, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 0.99, 1.0)
 
-def _make_window(panel_count=4, with_orb=True):
+
+@pytest.fixture(autouse=True)
+def _motion_on(monkeypatch):
+    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
+
+
+def _make_window(panel_count=5, with_orb=True):
     window = QWidget()
-    window.resize(800, 600)
+    window.resize(1200, 800)
     window.show()
 
     panels = []
     for i in range(panel_count):
         panel = QLabel(f"panel {i}", window)
-        panel.setGeometry(20 + i * 60, 20 + i * 40, 100, 50)
+        panel.setGeometry(40 + i * 120, 60 + i * 90, 160, 70)
         panel.show()
         panels.append(panel)
     window._boot_reveal_widgets = panels
 
     if with_orb:
         orb = VoiceOrb(window)
-        orb.setGeometry(300, 200, 220, 220)
+        orb.setGeometry(480, 250, 300, 300)
         orb.show()
         window.orb = orb
-
-    QTest.qWaitForWindowExposed(window)
     return window
 
 
-def test_reduced_motion_skips_the_sequence_entirely(qapp, monkeypatch):
+def test_reduced_motion_skips_the_entry_entirely(qapp, monkeypatch):
     monkeypatch.setattr(config, "HUD_REDUCED_MOTION", True)
     window = _make_window()
 
     run_boot_sequence(window)
 
-    assert not hasattr(window, "_boot_anims")
+    assert getattr(window, "_entry_overlay", None) is None
+    assert window.orb.bootReveal == 1.0
     assert window.orb.boot_frozen is False
-    assert window.orb.graphicsEffect() is None
     window.deleteLater()
 
 
-def test_cover_paints_without_raising_across_reveal_states(qapp):
-    cover = _BootCover()
-    cover.resize(400, 300)
-    for line_frac in (0.0, 0.5, 1.0):
-        cover.lineFrac = line_frac
-        assert not cover.grab().isNull()
-    for reveal_frac in (0.0, 0.3, 0.7, 1.0):
-        cover.revealFrac = reveal_frac
-        assert not cover.grab().isNull()
-
-
-def test_full_sequence_ends_with_everything_cleaned_up_and_orb_unfrozen(qapp, monkeypatch):
-    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
-    window = _make_window(panel_count=6)
-    orb = window.orb
+def test_panels_are_never_touched_during_the_entry(qapp):
+    """No hiding, no moving, no graphics effects — the overlay occludes them
+    instead. An interrupted entry therefore cannot leave a panel missing or
+    make one reappear later."""
+    window = _make_window()
+    before = [(w.isVisible(), w.pos(), w.graphicsEffect()) for w in window._boot_reveal_widgets]
 
     run_boot_sequence(window)
+    overlay = window._entry_overlay
+    for progress in SAMPLES:
+        overlay.progress = progress
+        for widget, (visible, pos, effect) in zip(window._boot_reveal_widgets, before):
+            assert widget.isVisible() is visible
+            assert widget.pos() == pos
+            assert widget.graphicsEffect() is effect is None
 
-    # Immediately after kicking off: orb held still, scaled down, hidden
-    # outright (cheaper than shown-but-transparent — see boot.py's perf
-    # note) until its own reveal stage.
-    assert orb.boot_frozen is True
-    assert orb.bootScale == 0.85
-    assert orb.isVisible() is False
-    assert orb.graphicsEffect() is None
+    cancel_entry_animation(window)
+    window.deleteLater()
 
-    last_stagger = 5 * PANEL_STAGGER_MS  # 6 panels -> indexes 0..5
-    total_ms = HAIRLINE_MS + IRIS_MS + last_stagger + PANEL_REVEAL_MS + ORB_REVEAL_MS + FLASH_MS
-    QTest.qWait(total_ms + 2000)  # generous margin past the last stage
 
-    assert window._boot_anims is None
-    assert orb.boot_frozen is False
+def test_a_second_call_does_not_start_a_second_entry(qapp):
+    window = _make_window()
+
+    run_boot_sequence(window)
+    first = window._entry_overlay
+    run_boot_sequence(window)
+
+    assert window._entry_overlay is first
+    cancel_entry_animation(window)
+    window.deleteLater()
+
+
+def test_the_orb_assembles_in_step_with_the_overlay(qapp):
+    window = _make_window()
+    run_boot_sequence(window)
+    overlay = window._entry_overlay
+
+    overlay.progress = 0.0
+    assert window.orb.bootReveal == 0.0
+    assert window.orb.boot_frozen is True
+
+    seen = []
+    for progress in SAMPLES:
+        overlay.progress = progress
+        seen.append(window.orb.bootReveal)
+
+    assert seen == sorted(seen)          # never runs backwards
+    assert seen[-1] == 1.0
+    cancel_entry_animation(window)
+    window.deleteLater()
+
+
+def test_cancelling_mid_entry_leaves_the_hud_in_its_finished_state(qapp):
+    window = _make_window()
+    run_boot_sequence(window)
+    window._entry_overlay.progress = 0.35
+
+    cancel_entry_animation(window)
+
+    assert getattr(window, "_entry_overlay", None) is None
+    orb = window.orb
+    assert orb.bootReveal == 1.0
     assert orb.bootScale == 1.0
     assert orb.bootFlash == 0.0
-    assert orb.graphicsEffect() is None
-    for panel in window._boot_reveal_widgets:
-        assert panel.graphicsEffect() is None
-
+    assert orb.boot_frozen is False
+    assert orb.field.assemble == 1.0
+    assert all(w.isVisible() for w in window._boot_reveal_widgets)
     window.deleteLater()
 
 
-def test_widgets_waiting_their_turn_are_hidden_not_opacity_effected(qapp, monkeypatch):
-    """A QGraphicsOpacityEffect forces its widget through an offscreen-
-    composited repaint on every update — cheap to pay for the few hundred
-    ms a widget is actually fading in, wasteful to pay for the whole
-    multi-second sequence while it's just sitting there invisible waiting
-    its turn. A plain hide() costs nothing until shown again."""
-    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
-    window = QWidget()
-    window.resize(800, 600)
-    window.show()
-
-    near = QLabel("near", window)
-    near.setGeometry(390, 290, 20, 20)  # right at center -> starts first (delay 0)
-    near.show()
-    far = QLabel("far", window)
-    far.setGeometry(0, 0, 20, 20)  # far corner -> starts several stagger steps later
-    far.show()
-    window._boot_reveal_widgets = [near, far]
-    window.orb = None
-
-    QTest.qWaitForWindowExposed(window)
-
+def test_reaching_the_end_finishes_the_same_way_cancelling_does(qapp):
+    window = _make_window()
     run_boot_sequence(window)
 
-    # Before _reveal_panels() has even run (still mid hairline+iris), both
-    # widgets are exactly as constructed — untouched.
-    assert near.isVisible() is True
-    assert far.isVisible() is True
+    window._entry_overlay.progress = 1.0
 
-    # Just past the cover finishing: _reveal_panels() has hidden both, and
-    # the nearest one (delay 0) has already picked its opacity effect back
-    # up and started revealing — the far one hasn't reached its turn yet.
-    QTest.qWait(HAIRLINE_MS + IRIS_MS + 30)
-    assert near.isVisible() is True
-    assert near.graphicsEffect() is not None
-    assert far.isVisible() is False
-    assert far.graphicsEffect() is None
-
+    assert getattr(window, "_entry_overlay", None) is None
+    assert window.orb.bootReveal == 1.0
+    assert window.orb.boot_frozen is False
     window.deleteLater()
 
 
-def test_panels_are_staggered_outward_from_center(qapp, monkeypatch):
-    """A panel far from center must still be earlier in its reveal than
-    one right at the center, regardless of the order they're listed in —
-    _reveal_panels sorts by distance itself."""
-    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
-    window = QWidget()
-    window.resize(800, 600)
-    window.show()
+def test_the_overlay_paints_at_every_stage(qapp):
+    window = _make_window()
+    run_boot_sequence(window)
+    overlay = window._entry_overlay
 
-    near = QLabel("near", window)
-    near.setGeometry(390, 290, 20, 20)  # right at center
-    near.show()
-    far = QLabel("far", window)
-    far.setGeometry(0, 0, 20, 20)  # top-left corner, far from center
-    far.show()
-    window._boot_reveal_widgets = [far, near]  # deliberately out of distance order
+    for progress in SAMPLES[:-1]:
+        overlay.progress = progress
+        assert not overlay.grab().isNull()
 
-    QTest.qWaitForWindowExposed(window)
+    cancel_entry_animation(window)
+    window.deleteLater()
+
+
+def test_reentry_is_short_and_leaves_the_orb_alone(qapp):
+    """Re-summoning after Esc gets its own quick flourish — it must never
+    replay the assembly, which would mean the HUD rebuilding itself every
+    time you bring it back."""
+    window = _make_window()
+
+    run_reentry_flourish(window)
+    overlay = window._entry_overlay
+
+    assert overlay.duration_ms == REENTRY_MS < ENTRY_MS
+    assert window.orb.bootReveal == 1.0   # untouched: nothing to assemble
+    overlay.progress = 0.5
+    assert window.orb.bootReveal == 1.0
+    assert not overlay.grab().isNull()
+
+    overlay.progress = 1.0
+    assert getattr(window, "_entry_overlay", None) is None
+    window.deleteLater()
+
+
+def test_cancelling_without_an_entry_running_is_harmless(qapp):
+    window = _make_window()
+    cancel_entry_animation(window)
+    window.deleteLater()
+
+
+def test_a_window_with_no_orb_still_completes(qapp):
+    window = _make_window(with_orb=False)
 
     run_boot_sequence(window)
-    QTest.qWait(HAIRLINE_MS + IRIS_MS + PANEL_STAGGER_MS + 60)
+    window._entry_overlay.progress = 1.0
 
-    near_opacity = near.graphicsEffect().opacity() if near.graphicsEffect() else 1.0
-    far_opacity = far.graphicsEffect().opacity() if far.graphicsEffect() else 1.0
-    assert near_opacity > far_opacity
-
+    assert getattr(window, "_entry_overlay", None) is None
     window.deleteLater()
-
-
-def test_window_deleted_mid_sequence_does_not_raise(qapp, monkeypatch):
-    """The staggered reveal's QTimer.singleShot callbacks and animation
-    .finished signals fire well after run_boot_sequence() returns — if the
-    window (and its panels) are torn down first, those callbacks must not
-    raise into the event loop."""
-    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
-    window = _make_window(panel_count=5)
-    run_boot_sequence(window)
-
-    QTest.qWait(50)
-    window.deleteLater()
-    QTest.qWait(50)  # let deleteLater() actually run
-
-    # Pump the event loop past every remaining stage's timers/animations —
-    # must not raise or print an unhandled exception.
-    last_stagger = 4 * PANEL_STAGGER_MS
-    total_ms = HAIRLINE_MS + IRIS_MS + last_stagger + PANEL_REVEAL_MS + ORB_REVEAL_MS + FLASH_MS
-    QTest.qWait(total_ms + 500)

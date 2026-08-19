@@ -57,8 +57,8 @@ def test_all_named_zones_exist(window):
     # A spot check across the grid — one attribute per zone builder, not
     # every widget — enough to catch a zone silently failing to build.
     for attr in (
-        "ruler", "cpu_bar", "ram_bar", "gauge_cpu", "orb", "transcript_odin",
-        "clock_label", "weather_temp", "temp_cpu", "net_ip", "spectrum",
+        "ruler", "cpu_hero", "ram_hero", "gauge_cpu", "orb", "transcript_odin",
+        "clock_label", "weather_temp", "temp_arc_cpu", "net_ip", "spectrum",
     ):
         assert hasattr(window, attr), f"zone widget '{attr}' was not built"
 
@@ -245,3 +245,238 @@ def test_console_echoes_the_reply_it_triggered(window, mock_brain):
     window.console._on_submit()
     QTest.qWait(300)
     assert "Hello from ODIN!" in window.console._scrollback.text()
+
+
+def test_each_animation_tick_feeds_the_spectrum_bands_to_the_orb(window):
+    """The orb's bezel and zone K's analyser share one FFT per tick."""
+    from ui.hud.spectrum import BAR_COUNT
+
+    received = []
+    window.orb.set_bands = received.append
+
+    window.telemetry_view.advance_animation()
+
+    assert received and len(received[0]) == BAR_COUNT
+
+
+def test_the_entry_plays_once_and_re_summoning_gets_the_short_flourish(window, monkeypatch):
+    """The assembly is a launch event, not a summon event — bringing the HUD
+    back after Esc must never rebuild it."""
+    import config
+    from ui.hud.boot import ENTRY_MS, REENTRY_MS
+
+    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
+
+    window.show_and_activate()
+    first = window._entry_overlay
+    assert first is not None
+    assert first.duration_ms == ENTRY_MS
+
+    first.finish()
+    window.show_and_activate()
+
+    assert window._entry_overlay is not None
+    assert window._entry_overlay.duration_ms == REENTRY_MS
+
+
+def test_dismissing_mid_entry_cancels_it_and_leaves_the_orb_whole(window, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "HUD_REDUCED_MOTION", False)
+    window.show_and_activate()
+    assert window._entry_overlay is not None
+
+    window.dismiss()
+
+    assert window._entry_overlay is None
+    assert window.orb.bootReveal == 1.0
+    assert window.orb.boot_frozen is False
+
+
+# -- the rebuilt side panels ------------------------------------------------
+#
+# These assert on what a reading actually puts on screen, not just that the
+# presenter ran: the panels' whole job is turning one TelemetryFrame into
+# something scannable, and every one of these fields was either invisible or
+# absent before the rebuild.
+
+
+def _frame(**overrides):
+    from ui.hud.telemetry import (
+        BatterySample, CpuSample, DiskIoSample, DiskSample, MemSample,
+        NetSample, NicSample, TelemetryFrame, ThermalSample,
+    )
+
+    base = dict(
+        ts=1000.0,
+        cpu=CpuSample(
+            percent=41.0, per_core=[30.0] * 8, freq_mhz=2699, processes=386,
+            top=[("chrome.exe", 18.4), ("python.exe", 9.1), ("code.exe", 4.0)],
+        ),
+        mem=MemSample(used_gb=21.4, total_gb=32.0, percent=67.0, swap_percent=18.0),
+        disks=[DiskSample(mount="C:", used_gb=447.0, total_gb=460.0, percent=97.2)],
+        disk_io=DiskIoSample(read_mbs=5.9, write_mbs=10.3),
+        net=NetSample(
+            up_kbs=938.7, down_kbs=2463.7, total_up_gb=12.4, total_down_gb=88.1,
+            ip="192.168.1.129",
+            nics=[NicSample(name="Wi-Fi", up_kbs=900.0, down_kbs=2400.0),
+                  NicSample(name="Ethernet", up_kbs=38.7, down_kbs=63.7)],
+        ),
+        battery=BatterySample(percent=76.0, plugged=False, secs_left=4500),
+        thermals=ThermalSample(cpu_c=63.0, gpu_c=60.0, gpu_load=11.0,
+                               gpu_vram_percent=44.0, fan_rpm=1915.0),
+        uptime_sec=98_400.0,
+    )
+    base.update(overrides)
+    return TelemetryFrame(**base)
+
+
+def test_cpu_panel_shows_a_hero_value_history_and_top_processes(window):
+    window.telemetry_view.render_frame(_frame())
+
+    assert window.cpu_graph.samples == [41.0]
+    assert window.cpu_procs.rows[0] == ("chrome.exe", 18.4)
+    assert "2699" in window.cpu_freq._value
+
+
+def test_memory_panel_shows_the_headline_figure_and_its_history(window):
+    window.telemetry_view.render_frame(_frame())
+
+    assert window.ram_graph.samples == [67.0]
+    assert "21.4/32" in window.ram_hero._caption
+
+
+def test_network_panel_breaks_traffic_down_by_interface(window):
+    window.telemetry_view.render_frame(_frame())
+
+    assert window.net_graph_down.samples == [2463.7]
+    assert [name for name, _ in window.net_nics.rows] == ["Wi-Fi", "Ethernet"]
+
+
+def test_storage_panel_traces_total_io(window):
+    window.telemetry_view.render_frame(_frame())
+
+    assert window.disk_io_graph.samples == [5.9 + 10.3]
+    assert "5.9" in window.disk_io_read._value
+    assert "10.3" in window.disk_io_write._value
+
+
+def test_thermals_drive_arcs_and_the_battery_meter(window):
+    window.telemetry_view.render_frame(_frame())
+
+    assert window.temp_arc_cpu._value == 63.0
+    assert window.temp_arc_gpu._value == 60.0
+    assert window.battery.caption == "1H 15M LEFT"
+    assert not hasattr(window, "temp_arc_load")   # the GPU gauge by the orb already says this
+
+
+def test_missing_sensors_read_as_unavailable_rather_than_zero(window):
+    """§10's never-fabricate rule: an arc with no backend must not sit at the
+    bottom of its scale looking like a real reading of zero."""
+    from ui.hud.telemetry import ThermalSample
+
+    window.telemetry_view.render_frame(_frame(
+        thermals=ThermalSample(cpu_c=None, gpu_c=None, gpu_load=None,
+                               gpu_vram_percent=None, fan_rpm=None),
+    ))
+
+    assert window.temp_arc_cpu._value is None
+    assert window.temp_arc_gpu._value is None
+
+
+def test_the_forecast_that_was_being_thrown_away_is_drawn(window):
+    from ui.hud.weather import WeatherSample
+
+    window.telemetry_view.render_weather(WeatherSample(
+        temp_c=24.0, condition="Partly cloudy", humidity=58.0, feels_like_c=25.0,
+        wind_kph=11.0, pressure_mb=1014.0, sunrise="06:12", sunset="19:44",
+        forecast=[("2026-08-20", 19.0, 29.0), ("2026-08-21", 20.0, 31.0)],
+    ))
+
+    assert len(window.weather_forecast.days) == 2
+
+
+def test_the_hud_animates_a_bounded_number_of_instruments(window):
+    """Every registered instrument repaints while it eases, so this count is
+    the per-frame cost of the side panels. Kept deliberately small — the
+    panels were trimmed back to one headline figure and one history each."""
+    assert len(window._instruments) <= 13
+
+
+def test_every_panel_instrument_advances_with_the_shared_loop(window):
+    """One loop drives them all (§10) — a widget left out would freeze at
+    whatever it happened to be showing."""
+    window.telemetry_view.render_frame(_frame())
+    before = window.cpu_hero.displayed
+
+    for _ in range(30):
+        window.telemetry_view.advance_animation()
+
+    assert window.cpu_hero.displayed > before
+    assert window.ram_hero.displayed > 0.0
+    assert window.temp_arc_cpu.fraction > 0.0
+
+
+def test_the_clock_panel_shows_progress_through_the_day(window):
+    """The panel had a clock and ninety pixels of nothing under it."""
+    window.telemetry_view.render_frame(_frame(uptime_sec=98_400.0))
+    window.telemetry_view.render_clock()
+
+    assert 0.0 <= window.clock_day._fraction <= 1.0
+    assert "1D 3H 20M" in window.uptime_label.text()   # the header carries it, once
+
+
+# -- the dock's states ------------------------------------------------------
+
+
+def test_the_dock_dims_while_a_turn_is_in_flight(window, mock_brain):
+    """_launch_preset drops clicks while a turn runs. The dock used to look
+    completely live through all of it."""
+    window.show_and_activate()
+    assert all(b.isEnabled() for b in window.dock.buttons)
+
+    window._launch_preset("first command")
+    assert not any(b.isEnabled() for b in window.dock.buttons)
+
+    # Wait on the turn actually ending rather than on a fixed sleep — the
+    # voice workers share this event loop and the timing isn't fixed.
+    for _ in range(60):
+        if window.current_worker is None:
+            break
+        QTest.qWait(50)
+
+    assert window.current_worker is None
+    assert all(b.isEnabled() for b in window.dock.buttons)
+
+
+def test_launching_from_the_dock_flashes_the_button_that_did_it(window):
+    window.show_and_activate()
+    button = next(b for b in window.dock.buttons if b.glyph == "WEB")
+
+    window._on_dock_clicked("WEB", "open my default browser")
+
+    assert button.launch_flash > 0.0
+    QTest.qWait(300)
+
+
+def test_the_console_button_lights_while_the_console_is_open(window):
+    button = next(b for b in window.dock.buttons if b.glyph == "CON")
+    assert button.is_active is False
+
+    window._on_dock_clicked("CON", None)
+    assert button.is_active is True
+
+    window._on_dock_clicked("CON", None)
+    assert button.is_active is False
+
+
+def test_the_hand_button_follows_gesture_control_state(window):
+    """Hand control runs off-screen; the dock is the only place its state is
+    visible at a glance."""
+    button = next(b for b in window.dock.buttons if b.glyph == "HAND")
+
+    window._on_gesture_state("running", "hand control on")
+    assert button.is_active is True
+
+    window._on_gesture_state("stopped", "hand control off")
+    assert button.is_active is False

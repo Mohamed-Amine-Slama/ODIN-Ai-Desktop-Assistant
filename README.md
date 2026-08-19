@@ -141,8 +141,9 @@ python main.py       REM terminal only
 
 The HUD opens full-screen and leaves an orb on your desktop when you press
 **Esc**. Click the orb, double-click the tray icon, or press **Ctrl+Alt+J** to
-bring it back. The orb shows what Jarvis is doing: its particle swarm holds a
-tight ring when idle and scatters while it's working or speaking.
+bring it back. The orb shows what Jarvis is doing: a molecular field of
+particles drifts inside it, bonding to whichever neighbours they're near —
+calm and slow when idle, stirred up and open while it's working or speaking.
 
 Voice is the main way to talk to the HUD: on launch, Jarvis speaks a greeting
 and listens right away for your first request — no wake phrase needed yet,
@@ -180,19 +181,21 @@ Jarvis/
   main.py                 terminal run loop, voice state machine, confirmations
   config.py               loads .env settings
   ui/
-    orb.py                the small ambient orb: rings, core, reactive particle swarm
+    molecule.py           the 3D particle-and-bond field both orbs float inside them
+    orb.py                the small ambient orb: rings, nucleus, molecular field
     app_window.py         OrbWindow, the always-on-top desktop orb that summons the HUD
     panels.py             settings/skills dialog and the knowledge browser
     workers.py            Qt <-> brain threading seam
     hud/                  the full-screen instrument HUD (native PyQt6, built to ODIN-HUD.md)
       window.py             OdinHudWindow: assembles the zones, owns the one shared ~30fps animation tick
-      voice_orb.py          VoiceOrb, the HUD's centerpiece: rings + launcher ring + reactive core
+      voice_orb.py          VoiceOrb, the HUD's centerpiece: rings + launcher ring + molecular field
       zones.py              one builder per grid zone (telemetry panels, transcript, dock, launcher)
       layout.py             the CSS-grid-style zone geometry the HUD is assembled from
       tokens.py             every color/glow/font/duration used under ui/hud/ — the one design-tokens file
       widgets.py            Panel, Readout, BarMeter, DockButton, TickRuler
       radial_gauge.py       the four gauges flanking the orb (CPU/RAM/DISK/GPU)
-      sparkline.py          rolling history line for network/CPU
+      instruments.py        the side panels' widgets: scrolling history graphs, hero
+                            numerals, arc gauges, process rows, forecast strip, battery
       spectrum.py           zone K's live audio-loopback analyser
       telemetry.py          QThread sampling CPU/RAM/disk/network into one frame per tick
       telemetry_view.py     renders telemetry/weather onto the HUD's zone widgets

@@ -12,17 +12,24 @@ import getpass
 import random
 
 from PyQt6.QtCore import QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPen, QRadialGradient
+from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QRadialGradient
 from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 import config
 from . import layout, tokens
 from .console import ConsoleOverlay
+from .instruments import (
+    BatteryMeter,
+    ForecastStrip,
+    HeroValue,
+    MetricGraph,
+    MiniArc,
+    ProcessRows,
+)
 from .radial_gauge import RadialGauge
-from .sparkline import Sparkline
 from .spectrum import Spectrum
 from .voice_orb import VoiceOrb
-from .widgets import BarMeter, DockButton, Panel, Readout, TickRuler
+from .widgets import BarMeter, Dock, DockButton, Panel, Readout, TickRuler
 
 # (glyph, label, preset command) — None means "handled locally", never sent
 # to Brain.ask() (ODIN-HUD.md §6.10).
@@ -88,41 +95,73 @@ class _CoreStrip(QWidget):
         painter.end()
 
 
-class _Backdrop(QWidget):
-    """The background layer stack from ODIN-HUD.md §4: void fill, a radial
-    vignette pulling the eye to the orb, a faint grid mesh, and scanlines.
-    Previously only the flat void fill was implemented (a plain stylesheet
-    background-color) — the missing three layers are most of what makes the
-    reference imagery read as a dense instrument rather than flat black."""
+class _CachedLayer(QWidget):
+    """A background layer whose content depends only on its size.
+
+    Painted once into a pixmap and blitted thereafter. Every widget on the
+    HUD is translucent, so any one of them repainting dirties the background
+    beneath it — which meant these layers were being redrawn twice a frame.
+    The backdrop alone measured ~72ms per paint at 1920x1080 (a full-screen
+    radial gradient plus ~360 scanline drawLine calls), which was the real
+    cost behind the HUD feeling heavy.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._cache: QPixmap | None = None
+
+    def cached_layers(self) -> QPixmap | None:
+        return self._cache
+
+    def _render_layers(self, painter: QPainter, width: int, height: int) -> None:
+        raise NotImplementedError
+
+    def resizeEvent(self, event) -> None:
+        self._cache = None
+        super().resizeEvent(event)
 
     def paintEvent(self, _event) -> None:
+        width, height = self.width(), self.height()
+        if width <= 0 or height <= 0:
+            return
+        if self._cache is None or self._cache.size() != self.size():
+            cache = QPixmap(self.size())
+            cache.fill(Qt.GlobalColor.transparent)
+            builder = QPainter(cache)
+            self._render_layers(builder, width, height)
+            builder.end()
+            self._cache = cache
         painter = QPainter(self)
-        rect = self.rect()
+        painter.drawPixmap(0, 0, self._cache)
+        painter.end()
 
+
+class _Backdrop(_CachedLayer):
+    """The background layer stack from ODIN-HUD.md §4: void fill, a radial
+    vignette pulling the eye to the orb, a faint grid mesh, and scanlines."""
+
+    def _render_layers(self, painter: QPainter, width: int, height: int) -> None:
+        rect = QRectF(0, 0, width, height)
         painter.fillRect(rect, tokens.VOID)
 
-        vignette = QRadialGradient(rect.width() * 0.5, rect.height() * 0.45, rect.width() * 0.62)
+        vignette = QRadialGradient(width * 0.5, height * 0.45, width * 0.62)
         vignette.setColorAt(0.0, QColor(10, 60, 90, 56))
         vignette.setColorAt(1.0, QColor(10, 60, 90, 0))
         painter.fillRect(rect, vignette)
 
         painter.setPen(QPen(QColor(11, 95, 135, 14), 1))
-        for x in range(0, rect.width(), 40):
-            painter.drawLine(x, 0, x, rect.height())
-        for y in range(0, rect.height(), 40):
-            painter.drawLine(0, y, rect.width(), y)
+        for x in range(0, width, 40):
+            painter.drawLine(x, 0, x, height)
+        for y in range(0, height, 40):
+            painter.drawLine(0, y, width, y)
 
         painter.setPen(QPen(QColor(0, 0, 0, 56), 1))
-        for y in range(0, rect.height(), 3):
-            painter.drawLine(0, y, rect.width(), y)
-        painter.end()
+        for y in range(0, height, 3):
+            painter.drawLine(0, y, width, y)
 
 
-class _CircuitTraces(QWidget):
+class _CircuitTraces(_CachedLayer):
     """The background circuit-trace layer (§4 background stack, layer 5):
     ~12 hairline 45deg/90deg polylines, purely graphic. Positions are
     seeded-random rather than snapped to actual panel corners — the spec
@@ -131,38 +170,45 @@ class _CircuitTraces(QWidget):
 
     SEGMENT_COUNT = 12
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._segments: list[tuple[float, float, float, float]] = []
-
-    def resizeEvent(self, event) -> None:
+    def _render_layers(self, painter: QPainter, width: int, height: int) -> None:
         rng = random.Random(11)
-        w, h = self.width(), self.height()
-        self._segments = []
+        painter.setPen(QPen(tokens.CY_600, 1))
         for _ in range(self.SEGMENT_COUNT):
-            x0, y0 = rng.uniform(0.05, 0.95) * w, rng.uniform(0.08, 0.92) * h
+            x0, y0 = rng.uniform(0.05, 0.95) * width, rng.uniform(0.08, 0.92) * height
             length = rng.uniform(40, 140)
             sign = rng.choice((-1, 1))
             if rng.random() < 0.5:
                 x1, y1 = x0 + sign * length, y0
             else:
                 x1, y1 = x0, y0 + sign * length
-            self._segments.append((x0, y0, x1, y1))
-        super().resizeEvent(event)
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setPen(QPen(tokens.CY_600, 1))
-        for x0, y0, x1, y1 in self._segments:
             painter.drawLine(int(x0), int(y0), int(x1), int(y1))
-        painter.end()
 
 
 class ZoneBuilderMixin:
     """Mixed into OdinHudWindow — see module docstring."""
 
+    def _register(self, *instruments):
+        """Collect everything the shared loop has to advance (§10). Panels
+        register their own instruments as they build them, so adding a widget
+        can't silently leave it frozen — there's one list, not a hand-written
+        call per widget in the presenter."""
+        self._instruments.extend(instruments)
+        return instruments[0] if len(instruments) == 1 else instruments
+
+    @staticmethod
+    def _strip(parent, *widgets) -> QWidget:
+        """One horizontal line of readouts, evenly shared — panels are short
+        on vertical space, and three facts on one line beats three lines."""
+        row = QWidget(parent)
+        box = QHBoxLayout(row)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(10)
+        for widget in widgets:
+            box.addWidget(widget, 1)
+        return row
+
     def _build_ui(self) -> None:
+        self._instruments: list[QWidget] = []
         root = QWidget(self)
         self.setCentralWidget(root)
 
@@ -287,37 +333,62 @@ class ZoneBuilderMixin:
 
     def _build_zone_b(self) -> QWidget:
         panel = Panel("CPU", self)
-        self.cpu_bar = BarMeter("CPU")
-        panel.body_layout.addWidget(self.cpu_bar)
-        self.cpu_freq = Readout("FREQ")
-        panel.body_layout.addWidget(self.cpu_freq)
+        self.cpu_hero = self._register(HeroValue("LOAD", "%"))
+        panel.body_layout.addWidget(self.cpu_hero)
+
+        self.cpu_graph = self._register(MetricGraph(capacity=60, maximum=100.0))
+        self.cpu_graph.setFixedHeight(26)
+        panel.body_layout.addWidget(self.cpu_graph)
+
         self.core_strip = _CoreStrip(panel.body)
         panel.body_layout.addWidget(self.core_strip)
-        self.cpu_processes = Readout("PROCESSES")
-        panel.body_layout.addWidget(self.cpu_processes)
-        self.cpu_top_rows = [Readout("--") for _ in range(1)]
-        for row in self.cpu_top_rows:
-            panel.body_layout.addWidget(row)
+
+        self.cpu_freq = Readout("FREQ")
+        self.cpu_split = Readout("USR/SYS")
+        self.cpu_ctx = Readout("CTX/S")
+        panel.body_layout.addWidget(self._strip(panel.body, self.cpu_freq, self.cpu_split, self.cpu_ctx))
+
+        self.cpu_procs = self._register(ProcessRows(count=3, unit="%", decimals=1))
+        panel.body_layout.addWidget(self.cpu_procs)
         panel.body_layout.addStretch(1)
         return panel
 
     def _build_zone_c(self) -> QWidget:
         panel = Panel("MEMORY", self)
-        self.ram_bar = BarMeter("RAM")
-        panel.body_layout.addWidget(self.ram_bar)
-        self.ram_spark = Sparkline("%")
-        panel.body_layout.addWidget(self.ram_spark, 1)
+        self.ram_hero = self._register(HeroValue("USED", "%"))
+        panel.body_layout.addWidget(self.ram_hero)
+
+        self.ram_graph = self._register(MetricGraph(capacity=60, maximum=100.0))
+        self.ram_graph.setFixedHeight(26)
+        panel.body_layout.addWidget(self.ram_graph)
+
         self.swap_bar = BarMeter("SWAP")
         panel.body_layout.addWidget(self.swap_bar)
+
+        self.ram_avail = Readout("AVAILABLE")
+        panel.body_layout.addWidget(self.ram_avail)
+
+        self.ram_procs = self._register(ProcessRows(count=2, unit=" GB", decimals=1))
+        panel.body_layout.addWidget(self.ram_procs)
+        panel.body_layout.addStretch(1)
         return panel
 
     def _build_zone_c2(self) -> QWidget:
         panel = Panel("STORAGE", self)
-        self._storage_panel = panel
+        self._storage_panel = panel  # update_disks() inserts one bar per mount here
         self.disk_io_read = Readout("READ")
         self.disk_io_write = Readout("WRITE")
-        panel.body_layout.addWidget(self.disk_io_read)
-        panel.body_layout.addWidget(self.disk_io_write)
+        panel.body_layout.addWidget(self._strip(panel.body, self.disk_io_read, self.disk_io_write))
+
+        # Read and write get their own traces rather than one combined line:
+        # a machine paging heavily and one writing a big file look identical
+        # summed together, and completely different apart.
+        self.disk_read_graph = self._register(MetricGraph(capacity=60))
+        self.disk_read_graph.setFixedHeight(24)
+        self.disk_write_graph = self._register(MetricGraph(capacity=60))
+        self.disk_write_graph.setFixedHeight(24)
+        panel.body_layout.addWidget(self.disk_read_graph)
+        panel.body_layout.addWidget(self.disk_write_graph)
         panel.body_layout.addStretch(1)
         return panel
 
@@ -391,6 +462,14 @@ class ZoneBuilderMixin:
         self.date_label.setStyleSheet(f"color: {tokens.CY_500.name()};")
         panel.body_layout.addWidget(self.date_label)
 
+        self.clock_uptime = Readout("UPTIME")
+        panel.body_layout.addWidget(self.clock_uptime)
+        # How far through the day it is — the panel had a clock and a lot of
+        # empty space under it, and this needs no data the HUD doesn't have.
+        self.clock_day = BarMeter("DAY")
+        panel.body_layout.addWidget(self.clock_day)
+        panel.body_layout.addStretch(1)
+
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._on_clock_tick)
         self._clock_timer.start(1000)
@@ -413,6 +492,10 @@ class ZoneBuilderMixin:
         # — five separate Readouts didn't fit this panel's real budget
         # (§4's zone table gives it one row's worth of pixels; see
         # ui/hud/layout.py's rebalancing note).
+        self.weather_forecast = ForecastStrip(panel.body)
+        self.weather_forecast.setFixedHeight(58)
+        panel.body_layout.addWidget(self.weather_forecast)
+
         self.weather_humidity_feels = Readout("HUMID/FEELS")
         self.weather_wind_pressure = Readout("WIND/PRESS")
         self.weather_sun = Readout("SUN")
@@ -422,24 +505,42 @@ class ZoneBuilderMixin:
         return panel
 
     def _build_zone_h(self) -> QWidget:
-        panel = Panel("THERMALS", self)
-        self.temp_cpu = Readout("CPU TEMP")
-        self.temp_gpu = Readout("GPU TEMP")
-        self.temp_gpu_load = Readout("GPU LOAD")
-        self.temp_vram = Readout("GPU VRAM")
+        panel = Panel("THERMALS · POWER", self)
+        self.temp_arc_cpu = self._register(MiniArc("CPU", "°", minimum=20.0, maximum=100.0))
+        self.temp_arc_gpu = self._register(MiniArc("GPU", "°", minimum=20.0, maximum=100.0))
+        self.temp_arc_load = self._register(MiniArc("GPU LOAD", "%", minimum=0.0, maximum=100.0))
+        arcs = self._strip(panel.body, self.temp_arc_cpu, self.temp_arc_gpu, self.temp_arc_load)
+        arcs.setFixedHeight(74)
+        panel.body_layout.addWidget(arcs)
+
+        self.temp_vram = Readout("VRAM")
         self.temp_fan = Readout("FAN")
-        for row in (self.temp_cpu, self.temp_gpu, self.temp_gpu_load, self.temp_vram, self.temp_fan):
-            panel.body_layout.addWidget(row)
+        panel.body_layout.addWidget(self._strip(panel.body, self.temp_vram, self.temp_fan))
+
+        self.battery = self._register(BatteryMeter(panel.body))
+        panel.body_layout.addWidget(self.battery)
+        panel.body_layout.addStretch(1)
         return panel
 
     def _build_zone_i(self) -> QWidget:
         panel = Panel("NETWORK", self)
         self.net_ip = Readout("IP")
-        panel.body_layout.addWidget(self.net_ip)
-        self.net_up_spark = Sparkline("KB/S")
-        panel.body_layout.addWidget(self.net_up_spark, 1)
-        self.net_down_spark = Sparkline("KB/S")
-        panel.body_layout.addWidget(self.net_down_spark, 1)
+        self.net_totals = Readout("SESSION")
+        panel.body_layout.addWidget(self._strip(panel.body, self.net_ip, self.net_totals))
+
+        self.net_hero_down = self._register(HeroValue("DOWN", "KB/S", maximum=None))
+        panel.body_layout.addWidget(self.net_hero_down)
+
+        self.net_graph_down = self._register(MetricGraph(capacity=60))
+        self.net_graph_down.setFixedHeight(20)
+        self.net_graph_up = self._register(MetricGraph(capacity=60))
+        self.net_graph_up.setFixedHeight(20)
+        panel.body_layout.addWidget(self.net_graph_down)
+        panel.body_layout.addWidget(self.net_graph_up)
+
+        self.net_nics = self._register(ProcessRows(count=2, unit=" KB/S", decimals=0))
+        panel.body_layout.addWidget(self.net_nics)
+        panel.body_layout.addStretch(1)
         return panel
 
     def _build_zone_j(self) -> QWidget:
@@ -459,14 +560,13 @@ class ZoneBuilderMixin:
         return panel
 
     def _build_zone_m(self) -> QWidget:
-        row = QWidget(self)
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(20)
-        h.addStretch(1)
+        # A Dock rather than a QHBoxLayout of buttons: the magnifier sizes
+        # each button from the cursor's distance, so the row has to be laid
+        # out by hand (see ui/hud/widgets.py's Dock).
+        self.dock = Dock(self)
         for glyph, label, preset in DOCK_ITEMS:
-            button = DockButton(glyph, label, row)
+            button = DockButton(glyph, label, self.dock)
             button.clicked.connect(lambda checked=False, g=glyph, p=preset: self._on_dock_clicked(g, p))
-            h.addWidget(button)
-        h.addStretch(1)
-        return row
+            self.dock.add_button(button)
+        self._register(self.dock)
+        return self.dock

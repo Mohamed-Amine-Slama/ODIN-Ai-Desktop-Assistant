@@ -120,6 +120,15 @@ class Spectrum(QWidget):
         self._fake_phase = 0.0
         self._capture: _AudioCapture | None = None
 
+    @property
+    def levels(self) -> list[float]:
+        """The smoothed per-band levels behind this frame's bars, 0..1.
+
+        Published so VoiceOrb's spectrum bezel can render the same audio
+        without running a second FFT over the same samples — one analysis per
+        tick, two widgets drawing it."""
+        return list(self._levels)
+
     def start_capture(self) -> None:
         if config.HUD_SPECTRUM_SOURCE == "off":
             return

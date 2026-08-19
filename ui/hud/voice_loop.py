@@ -147,7 +147,15 @@ class VoiceLoopController(QObject):
         self._loop_worker = worker
         worker.heard.connect(self.heard.emit)
         worker.state_changed.connect(self.state_changed.emit)
+        # Previously unconnected: a real capture/transcription error (e.g. the
+        # selected microphone producing no signal at all) was emitted into
+        # the void and the loop just kept silently retrying forever, with
+        # nothing on screen to say why voice mode "wasn't working."
+        worker.error.connect(self._on_loop_error)
         worker.start()
+
+    def _on_loop_error(self, message: str) -> None:
+        self.status_message.emit(f"Voice error: {message}")
 
     def stop_loop(self) -> None:
         if self._loop_worker is not None:

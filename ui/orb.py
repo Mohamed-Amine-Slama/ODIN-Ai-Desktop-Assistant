@@ -1,29 +1,35 @@
 """The arc reactor: a hand-painted orb that shows what Jarvis is doing.
 
 Everything here is drawn with QPainter rather than assembled from images, so it
-scales to any size and recolours with the palette. The particle swarm is the
-part that carries meaning: it holds a tight ring when idle and scatters while
-Jarvis is thinking or talking, which reads as activity from across the room in
-a way a spinner does not.
+scales to any size and recolours with the palette. The molecular field inside
+it is the part that carries meaning: a few hundred particles drifting freely,
+bonded to whichever neighbours they're near, calm when idle and stirred up
+while Jarvis is thinking or working — activity you can read from across the
+room in a way a spinner cannot.
+
+The field itself lives in ui/molecule.py, shared with the full HUD's much
+larger VoiceOrb (ui/hud/voice_orb.py); only the size, palette and per-state
+energy differ between the two.
 """
 import math
-import random
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QConicalGradient, QPainter, QPen, QRadialGradient
 from PyQt6.QtWidgets import QWidget
 
-# States, and how the swarm behaves in each: (inner, outer) radius band as a
-# fraction of the orb radius, angular speed multiplier, and core brightness.
+from ui.molecule import MoleculeField
+
+# States, and how the field behaves in each: how agitated the molecule is
+# (0..1, see ui/molecule.py) and how bright the core burns.
 STATE_STYLE = {
-    "idle": {"band": (0.74, 0.86), "speed": 0.35, "glow": 0.55, "jitter": 0.10},
-    "listening": {"band": (0.60, 0.94), "speed": 0.85, "glow": 0.80, "jitter": 0.35},
-    "thinking": {"band": (0.42, 1.18), "speed": 1.90, "glow": 1.00, "jitter": 0.85},
+    "idle": {"energy": 0.14, "glow": 0.55},
+    "listening": {"energy": 0.45, "glow": 0.80},
+    "thinking": {"energy": 0.90, "glow": 1.00},
     # A hands-on-the-machine state, distinct from "thinking" (waiting on the
-    # model) — the tightest, fastest band of the set, so a tool call reads as
-    # a sharp burst of activity rather than more of the same churn.
-    "acting": {"band": (0.35, 0.98), "speed": 2.6, "glow": 1.00, "jitter": 1.10},
-    "speaking": {"band": (0.55, 1.05), "speed": 1.25, "glow": 0.95, "jitter": 0.55},
+    # model) — the most agitated of the set, so a tool call reads as a sharp
+    # burst of activity rather than more of the same churn.
+    "acting": {"energy": 1.00, "glow": 1.00},
+    "speaking": {"energy": 0.60, "glow": 0.95},
 }
 
 STATE_COLOR = {
@@ -35,35 +41,8 @@ STATE_COLOR = {
 }
 
 PARTICLE_COUNT = 130
+FIELD_SPAN = 1.0  # the molecule's shell, just inside the thin sheen ring
 FRAME_MS = 16  # ~60fps
-
-
-class _Particle:
-    """One mote in the swarm. Radius eases toward a per-state target rather than
-    snapping, so a state change looks like the swarm reacting, not teleporting."""
-
-    __slots__ = ("angle", "radius", "target", "speed", "size", "phase", "seed")
-
-    def __init__(self, rng: random.Random):
-        self.angle = rng.uniform(0, math.tau)
-        self.seed = rng.random()
-        self.radius = rng.uniform(0.7, 0.9)
-        self.target = self.radius
-        self.speed = rng.uniform(0.6, 1.6) * (1 if rng.random() < 0.75 else -1)
-        self.size = rng.uniform(1.1, 3.0)
-        self.phase = rng.uniform(0, math.tau)
-
-    def retarget(self, band: tuple[float, float], rng: random.Random) -> None:
-        low, high = band
-        self.target = low + (high - low) * self.seed
-
-    def step(self, style: dict, dt: float) -> None:
-        self.angle += self.speed * style["speed"] * dt
-        self.phase += dt * 2.0
-        # Ease 12% of the remaining distance per frame: fast enough to feel
-        # reactive, slow enough that the scatter reads as motion.
-        self.radius += (self.target - self.radius) * 0.12
-        self.radius += math.sin(self.phase) * 0.0035 * style["jitter"] * 10
 
 
 class ReactorOrb(QWidget):
@@ -73,8 +52,7 @@ class ReactorOrb(QWidget):
 
     def __init__(self, parent=None, seed: int = 7):
         super().__init__(parent)
-        self._rng = random.Random(seed)
-        self._particles = [_Particle(self._rng) for _ in range(PARTICLE_COUNT)]
+        self.field = MoleculeField(PARTICLE_COUNT, seed=seed)
         self._state = "idle"
         self._phase = 0.0
         self._level = 0.0  # 0..1 audio-ish energy, drives the core pulse
@@ -102,9 +80,7 @@ class ReactorOrb(QWidget):
         self._retarget()
 
     def _retarget(self) -> None:
-        band = STATE_STYLE[self._state]["band"]
-        for particle in self._particles:
-            particle.retarget(band, self._rng)
+        self.field.set_energy(STATE_STYLE[self._state]["energy"])
 
     def stop(self) -> None:
         """Halt the animation. Called when the orb is hidden so an idle Jarvis
@@ -122,8 +98,7 @@ class ReactorOrb(QWidget):
         self._phase += 0.016
         target_level = style["glow"]
         self._level += (target_level - self._level) * 0.08
-        for particle in self._particles:
-            particle.step(style, 0.016)
+        self.field.advance(FRAME_MS / 1000)
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -144,8 +119,8 @@ class ReactorOrb(QWidget):
 
         self._paint_halo(painter, centre, radius, accent)
         self._paint_rings(painter, centre, radius, accent)
-        self._paint_particles(painter, centre, radius, accent)
         self._paint_core(painter, centre, radius, accent)
+        self.field.paint(painter, centre, radius * FIELD_SPAN, accent)
         painter.end()
 
     def _paint_halo(self, painter, centre, radius, accent) -> None:
@@ -195,23 +170,9 @@ class ReactorOrb(QWidget):
             painter.drawEllipse(inner, radius * 0.055, radius * 0.055)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
-    def _paint_particles(self, painter, centre, radius, accent) -> None:
-        painter.setPen(Qt.PenStyle.NoPen)
-        for particle in self._particles:
-            distance = radius * particle.radius
-            point = QPointF(centre.x() + math.cos(particle.angle) * distance,
-                            centre.y() + math.sin(particle.angle) * distance)
-            # Fade the ones that have drifted furthest out, so the scatter
-            # dissolves at its edge instead of ending in a hard rim.
-            fade = max(0.0, min(1.0, 1.35 - particle.radius))
-            alpha = int(40 + 190 * fade)
-            painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), alpha))
-            size = particle.size * (0.6 + 0.4 * fade)
-            painter.drawEllipse(point, size, size)
-
     def _paint_core(self, painter, centre, radius, accent) -> None:
         pulse = 0.88 + 0.12 * math.sin(self._phase * 3.1)
-        core_radius = radius * 0.42 * pulse
+        core_radius = radius * 0.34 * pulse  # a nucleus, not the whole show
         core = QRadialGradient(centre, core_radius)
         core.setColorAt(0.0, QColor(255, 255, 255, 240))
         core.setColorAt(0.35, QColor(
@@ -221,14 +182,3 @@ class ReactorOrb(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(core)
         painter.drawEllipse(centre, core_radius, core_radius)
-
-        # Triangular reactor plate, the detail that says "arc reactor".
-        painter.setPen(QPen(QColor(255, 255, 255, 110), max(1.0, radius * 0.018)))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for turn in (0, math.pi / 3):
-            points = [
-                QPointF(centre.x() + math.cos(turn + math.tau * i / 3) * radius * 0.3,
-                        centre.y() + math.sin(turn + math.tau * i / 3) * radius * 0.3)
-                for i in range(3)
-            ]
-            painter.drawPolygon(*points)
