@@ -129,6 +129,15 @@ sentence-transformers>=3.0.0
 # Local vector store, persisted under data/knowledge_db and data/memory_db.
 chromadb>=0.5.0
 
+# --- NotebookLM publishing: optional -----------------------------------------
+# Lets deep_learn mirror what it researched into a NotebookLM notebook. Google
+# publishes no consumer NotebookLM API, so this is an unofficial client driving
+# the same endpoints the web app uses; it can break when Google changes them,
+# and ODIN degrades to "publishing is unavailable" when it does. Needs a
+# one-time `notebooklm login` after install. Jarvis runs fine without it — the
+# publish tools simply never register.
+notebooklm-py>=0.8.1
+
 # --- Voice: optional hands-free pipeline ------------------------------------
 # Pulls ~1GB of ML wheels and model weights. Jarvis runs fine in text mode
 # without any of it.
