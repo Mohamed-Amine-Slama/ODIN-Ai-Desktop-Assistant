@@ -24,7 +24,7 @@ import json
 import re
 
 import config
-from core import knowledge, learning_status
+from core import knowledge, learning_status, notebooklm
 from core.store import get_store
 from skills.web_skills import web_search, web_search_available
 
@@ -170,8 +170,32 @@ def _research_and_store(topic: str, subtopic: str) -> int:
 
     if not parts:
         return 0
+
     notes = "\n\n".join(parts)
-    return knowledge.store_notes(topic, subtopic, notes, _dedupe(sources))
+    urls = _dedupe(sources)
+    stored = knowledge.store_notes(topic, subtopic, notes, urls)
+    if stored:
+        # Chroma keeps 180-word chunks and at most five joined URLs per chunk —
+        # right for retrieval, lossy for anything that wants the notes whole.
+        # Keep the raw material too, but only after store_notes succeeded:
+        # SQLite must never claim material the vector store rejected.
+        _record_sources(topic, subtopic, notes, urls)
+    return stored
+
+
+def _record_sources(topic: str, subtopic: str, notes: str, urls: list[str]) -> None:
+    """Persist one research step's material so it can be published later.
+
+    Never raises: the notes are already safely in the vector store by the time
+    this runs, and a research run must not fail over bookkeeping for a feature
+    the user may not even have switched on.
+    """
+    try:
+        store = get_store()
+        store.record_knowledge_sources(topic, subtopic, notebooklm.NOTE_KIND, [notes])
+        store.record_knowledge_sources(topic, subtopic, notebooklm.URL_KIND, urls)
+    except Exception as e:  # noqa: BLE001 - bookkeeping must not break research
+        print(f"[research] couldn't record sources for publishing: {e}")
 
 
 def _find_gaps(topic: str, covered_subtopics: list[str]) -> list[str]:
