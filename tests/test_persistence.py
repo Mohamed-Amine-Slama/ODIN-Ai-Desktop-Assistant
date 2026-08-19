@@ -398,3 +398,81 @@ def test_reset_clears_saved_history(store, make_brain):
 
     assert store.recent_messages() == []
     assert brain.history == []
+
+
+# -- knowledge sources and notebooks ---------------------------------------
+
+def test_recording_the_same_source_twice_stores_it_once(store):
+    assert store.record_knowledge_sources("Rust", "ownership", "url", ["https://a.example"]) == 1
+    assert store.record_knowledge_sources("Rust", "traits", "url", ["https://a.example"]) == 0
+    assert len(store.pending_knowledge_sources("Rust")) == 1
+
+
+def test_the_same_url_under_a_different_topic_is_a_separate_row(store):
+    store.record_knowledge_sources("Rust", "ownership", "url", ["https://a.example"])
+    store.record_knowledge_sources("Go", "slices", "url", ["https://a.example"])
+    assert len(store.pending_knowledge_sources("Go")) == 1
+
+
+def test_a_note_and_a_url_with_the_same_text_are_separate_rows(store):
+    store.record_knowledge_sources("Rust", "ownership", "note", ["https://a.example"])
+    store.record_knowledge_sources("Rust", "ownership", "url", ["https://a.example"])
+    assert len(store.pending_knowledge_sources("Rust")) == 2
+
+
+def test_blank_bodies_are_not_stored(store):
+    assert store.record_knowledge_sources("Rust", "ownership", "note", ["", "   "]) == 0
+    assert store.pending_knowledge_sources("Rust") == []
+
+
+def test_pending_sources_are_the_unpublished_ones_oldest_first(store):
+    store.record_knowledge_sources("Rust", "ownership", "note", ["First note."])
+    store.record_knowledge_sources("Rust", "traits", "note", ["Second note."])
+    rows = store.pending_knowledge_sources("Rust")
+    assert [r["body"] for r in rows] == ["First note.", "Second note."]
+
+
+def test_marking_published_takes_rows_out_of_the_queue(store):
+    store.record_knowledge_sources("Rust", "ownership", "note", ["A note."])
+    rows = store.pending_knowledge_sources("Rust")
+    store.mark_knowledge_sources_published([r["id"] for r in rows])
+    assert store.pending_knowledge_sources("Rust") == []
+
+
+def test_marking_nothing_published_is_harmless(store):
+    store.mark_knowledge_sources_published([])
+    store.mark_knowledge_sources_published([None])
+
+
+def test_relearning_after_publishing_only_queues_what_is_new(store):
+    store.record_knowledge_sources("Rust", "ownership", "url", ["https://a.example"])
+    store.mark_knowledge_sources_published(
+        [r["id"] for r in store.pending_knowledge_sources("Rust")]
+    )
+    store.record_knowledge_sources(
+        "Rust", "ownership", "url", ["https://a.example", "https://b.example"]
+    )
+    assert [r["body"] for r in store.pending_knowledge_sources("Rust")] == ["https://b.example"]
+
+
+def test_notebook_row_roundtrips(store):
+    store.record_knowledge_notebook("Rust", "nb-1", "https://notebooklm.google.com/notebook/nb-1")
+    row = store.get_knowledge_notebook("Rust")
+    assert row["notebook_id"] == "nb-1"
+    assert row["notebook_url"].endswith("nb-1")
+
+
+def test_recording_a_notebook_again_updates_it_in_place(store):
+    store.record_knowledge_notebook("Rust", "nb-1", "https://x/1")
+    store.record_knowledge_notebook("Rust", "nb-2", "https://x/2")
+    assert store.get_knowledge_notebook("Rust")["notebook_id"] == "nb-2"
+
+
+def test_forgetting_a_notebook_removes_it(store):
+    store.record_knowledge_notebook("Rust", "nb-1", "https://x/1")
+    store.forget_knowledge_notebook("Rust")
+    assert store.get_knowledge_notebook("Rust") is None
+
+
+def test_an_unknown_topic_has_no_notebook(store):
+    assert store.get_knowledge_notebook("Nothing") is None

@@ -4,6 +4,7 @@ Everything Jarvis should still know after a restart lives here. One connection
 per Store, guarded by a lock, because the reminder scheduler runs on its own
 thread.
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -47,6 +48,35 @@ CREATE TABLE IF NOT EXISTS knowledge_topics (
     subtopics   TEXT NOT NULL,          -- JSON list of strings
     chunk_count INTEGER NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL
+);
+
+-- What deep_learn actually found, kept so it can be published elsewhere. The
+-- vector store holds 180-word chunks and at most five joined URLs per chunk,
+-- which is right for retrieval and lossy for anything wanting whole notes and
+-- every source. published_at doubles as the publish work queue: NULL means
+-- "not in a notebook yet", so a failed upload simply stays queued.
+CREATE TABLE IF NOT EXISTS knowledge_sources (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic        TEXT NOT NULL,
+    subtopic     TEXT NOT NULL,
+    kind         TEXT NOT NULL,          -- 'note' | 'url'
+    body         TEXT NOT NULL,          -- the note text, or the URL
+    fingerprint  TEXT NOT NULL,          -- sha256(kind + body)
+    ts           REAL NOT NULL,
+    published_at REAL,
+    UNIQUE (topic, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_sources_pending
+    ON knowledge_sources (topic, published_at);
+
+-- Which notebook belongs to which topic, so re-learning a topic adds to the
+-- notebook it already has instead of making a second one.
+CREATE TABLE IF NOT EXISTS knowledge_notebooks (
+    topic        TEXT PRIMARY KEY,
+    notebook_id  TEXT NOT NULL,
+    notebook_url TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -269,6 +299,87 @@ class Store:
                 (topic,),
             ).fetchone()
 
+    # -- knowledge sources (raw material for publishing) ---------------------
+
+    def record_knowledge_sources(
+        self, topic: str, subtopic: str, kind: str, bodies: list[str]
+    ) -> int:
+        """Store one research step's material, skipping anything already
+        recorded for this topic. Returns how many new rows landed, so a
+        re-learn can tell what was actually new."""
+        now = time.time()
+        rows = []
+        for body in bodies:
+            body = (body or "").strip()
+            if not body:
+                continue
+            rows.append((topic, subtopic, kind, body, _fingerprint(kind, body), now))
+        if not rows:
+            return 0
+
+        with self._lock:
+            before = self._conn.total_changes
+            self._conn.executemany(
+                """INSERT OR IGNORE INTO knowledge_sources
+                       (topic, subtopic, kind, body, fingerprint, ts)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+            self._conn.commit()
+            return self._conn.total_changes - before
+
+    def pending_knowledge_sources(self, topic: str) -> list[sqlite3.Row]:
+        """Everything for a topic that hasn't made it into a notebook yet,
+        oldest first."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, topic, subtopic, kind, body FROM knowledge_sources "
+                "WHERE topic = ? AND published_at IS NULL ORDER BY id",
+                (topic,),
+            ).fetchall()
+
+    def mark_knowledge_sources_published(self, row_ids) -> None:
+        """Take rows out of the publish queue. Only the ones that actually
+        uploaded are passed in, so a partial upload leaves the rest queued."""
+        ids = [(time.time(), int(i)) for i in row_ids if i is not None]
+        if not ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE knowledge_sources SET published_at = ? WHERE id = ?", ids
+            )
+            self._conn.commit()
+
+    def get_knowledge_notebook(self, topic: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT topic, notebook_id, notebook_url, created_at, updated_at "
+                "FROM knowledge_notebooks WHERE topic = ?",
+                (topic,),
+            ).fetchone()
+
+    def record_knowledge_notebook(self, topic: str, notebook_id: str, notebook_url: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO knowledge_notebooks
+                       (topic, notebook_id, notebook_url, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(topic) DO UPDATE SET
+                       notebook_id = excluded.notebook_id,
+                       notebook_url = excluded.notebook_url,
+                       updated_at = excluded.updated_at""",
+                (topic, notebook_id, notebook_url, now, now),
+            )
+            self._conn.commit()
+
+    def forget_knowledge_notebook(self, topic: str) -> None:
+        """Drop the mapping — used when the notebook turns out to be gone,
+        deleted by hand in NotebookLM since the last publish."""
+        with self._lock:
+            self._conn.execute("DELETE FROM knowledge_notebooks WHERE topic = ?", (topic,))
+            self._conn.commit()
+
     # -- scheduled tasks -----------------------------------------------------
 
     def add_scheduled_task(self, prompt: str, schedule: str) -> int:
@@ -380,6 +491,13 @@ def _escape_like(text: str) -> str:
     matches literally instead of acting as a wildcard. Paired with an
     ESCAPE '\\' clause at each call site."""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _fingerprint(kind: str, body: str) -> str:
+    """Stable identity for a stored source. Hashed rather than indexing the
+    body itself: URLs are short but note bodies run to kilobytes, and the
+    UNIQUE index only ever has to answer "have I stored this already?"."""
+    return hashlib.sha256(f"{kind}\x00{body}".encode("utf-8")).hexdigest()
 
 
 def _encode_block(obj):
